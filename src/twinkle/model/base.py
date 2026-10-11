@@ -355,6 +355,66 @@ class TrainableModel(ABC):
             trainable_names=trainable_names,
             trainable_regex=trainable_regex)
 
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
+    def attach_profiler(self, *, spec: Optional[Dict[str, Any]] = None) -> None:
+        """Attach a forward-hook profiler to this rank's real model.
+
+        ``@remote_function`` is what makes the handle reach the workers: under Ray
+        the model on the driver is a proxy with no ``self.model`` of its own, so an
+        undecorated method would hook nothing. ``dispatch='all'`` runs it on every
+        rank (each profiles its own shard) and ``lazy_collect=False`` blocks until
+        the hooks are registered, so training cannot start before profiling is live.
+
+        ``self.model`` is unwrapped through the strategy (as :meth:`freeze_parameters`
+        does) and may be a list of chunks on Megatron; ``ModuleProfiler.attach``
+        accepts both a single module and a list.
+
+        ``spec`` must be serializable (no lambdas / live objects) because it crosses
+        the process boundary: ``select`` and the profiler class travel as strings and
+        are resolved worker-side by :func:`twinkle.perf.build_module_profiler`.
+        """
+        from twinkle.perf import build_module_profiler
+        model = self.strategy.unwrap_model(self.model)
+        self._profiler = build_module_profiler(spec).attach(model)
+
+    @remote_function(dispatch='all', collect='none')
+    def advance_profiler_step(self) -> None:
+        """Advance the profiler's step counter on every rank (once per training step).
+
+        Left non-blocking (no ``lazy_collect=False``): it runs on the SAME actor as
+        the next ``forward_backward``, and Ray's per-actor FIFO ordering guarantees
+        the increment lands before that forward reads the step, so no cross-actor
+        sync -- and no per-step ``ray.get`` -- is needed. No-op when no profiler is
+        attached, so calling it unconditionally is safe.
+        """
+        profiler = getattr(self, '_profiler', None)
+        if profiler is not None:
+            profiler.advance_step()
+
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
+    def collect_perf_summary(self) -> Dict[str, float]:
+        """Return each rank's profiler summary to the driver.
+
+        ``collect='none'`` (NOT ``'flatten'``) is deliberate: ``flatten`` concatenates
+        per-rank LISTS by iterating each result, so on a dict it would iterate the
+        keys and fail to rebuild -- it cannot carry dict results. ``none`` returns the
+        per-rank dicts as a list, or a single unwrapped dict when there is one rank,
+        which the caller tags by rank and merges. ``lazy_collect=False`` materializes
+        it (blocking) so the caller can fold it into step metrics immediately. Each
+        rank returns an empty dict when no profiler is attached, so calling this
+        unconditionally is safe.
+        """
+        profiler = getattr(self, '_profiler', None)
+        return profiler.flat_summary() if profiler is not None else {}
+
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
+    def detach_profiler(self) -> None:
+        """Remove all profiler hooks on every rank; blocking so hooks are gone on return."""
+        profiler = getattr(self, '_profiler', None)
+        if profiler is not None:
+            profiler.detach()
+            self._profiler = None
+
     def _should_bind_device_id_for_process_group(self, backend: str) -> bool:
         return backend in ('nccl', 'hccl')
 
