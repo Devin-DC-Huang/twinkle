@@ -1,7 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Backend-neutral application of an optimizer param-group *spec*.
 
-dev's ``swift.dev.optimizer.build_param_groups_spec`` emits a serializable, ordered list of rules --
+dev's ``swift.dev.builders.optimizer.build_param_groups_spec`` emits a serializable, ordered list of rules --
 first match wins, most specific first -- and hands it to ``set_optimizer`` as ``param_groups_spec``.
 This module is the shared kernel both twinkle backends use to turn that spec into their local
 param-group form, so the two stay equivalent and twinkle hardcodes no model / tuner / tower naming:

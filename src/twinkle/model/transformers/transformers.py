@@ -326,6 +326,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             memory_efficient_init: bool = False,
             deepspeed_config: Dict[str, Any] = None,
             model_loader: Optional[ModelLoaderProtocol] = None,
+            gradient_checkpointing: bool = True,
             gradient_checkpointing_kwargs: Optional[Dict[str, Any]] = None,
             vit_gradient_checkpointing: Optional[bool] = None,
             vit_gradient_checkpointing_kwargs: Optional[Dict[str, Any]] = None,
@@ -404,7 +405,10 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         logger.info_once(
             f'[TransformersModel] attn_implementation: requested={kwargs.get("attn_implementation")!r}, '
             f'resolved={getattr(self.model.config, "_attn_implementation", None)!r}')
-        self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gradient_checkpointing_kwargs)
+        # Gated worker-side so the flag is honored under Ray too, where a driver-side post-construction
+        # reach into ``model.model`` only touches the proxy stub and silently no-ops.
+        if gradient_checkpointing:
+            self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gradient_checkpointing_kwargs)
         vision_tower_names = self.model_arch.get('vision_tower')
         if vit_gradient_checkpointing is not None and vision_tower_names:
             from twinkle.utils import deep_getattr
@@ -2088,6 +2092,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
                 freeze_llm=freeze_llm,
                 freeze_vit=freeze_vit,
                 freeze_aligner=freeze_aligner)
+            self._expand_modules_to_save(config, unwrapped_model)
             if not isinstance(unwrapped_model, PeftModel):
                 assert unwrapped_model is self.model, 'Cannot wrap model with peft after DDP/FSDP!'
                 self.model = get_peft_model(unwrapped_model, config, adapter_name=adapter_name)
@@ -2136,6 +2141,40 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             freeze_vit=freeze_vit,
             freeze_aligner=freeze_aligner,
             include_embedding=include_embedding)
+
+    def _expand_modules_to_save(self, config, model) -> None:
+        """Expand the ``'all-norm'`` / ``'all-embedding'`` shorthands in ``modules_to_save``, in place.
+
+        PEFT keeps ``modules_to_save`` entries as full-precision trainable copies and matches each by
+        ``name.endswith(entry)`` -- a shorthand like ``'all-norm'`` matches no module and is silently
+        ignored (``_set_trainable``, ``strict_module_check=False``), so it has to be resolved to concrete
+        module names here first. The expansion needs the real modules, so it runs on the worker, not the
+        driver's PROXY -- the same reason the ``'all-linear'`` target expansion lives here. Unlike that
+        target expansion, ``modules_to_save`` is NOT tower / freeze filtered: every norm / embedding the
+        shorthand names is saved, regardless of which towers are LoRA-adapted (legacy does the same).
+        """
+        modules_to_save = getattr(config, 'modules_to_save', None)
+        if not modules_to_save:
+            return
+        shorthands = ('all-norm', 'all-embedding')
+        if not any(name in shorthands for name in modules_to_save):
+            return
+        from twinkle.model.transformers.target_modules import find_embedding, find_norm
+        # Walk to the base model: when an adapter is added to an already-peft model the real modules
+        # live under the wrapped base, not the PeftModel.
+        base_model = model
+        while isinstance(base_model, PeftModel):
+            base_model = base_model.get_base_model()
+        expanded = [name for name in modules_to_save if name not in shorthands]
+        for shorthand, finder in (('all-embedding', find_embedding), ('all-norm', find_norm)):
+            if shorthand not in modules_to_save:
+                continue
+            found = finder(base_model)
+            if not found:
+                logger.warning(f'modules_to_save {shorthand!r} matched no module on this model; ignored.')
+            expanded += found
+        # de-dup while preserving order (a shorthand may overlap an explicitly-named module).
+        config.modules_to_save = list(dict.fromkeys(expanded))
 
     @remote_function()
     def add_adapter_to_model(self, adapter_name: str, config_or_dir: Union[PeftConfig, str], **kwargs):

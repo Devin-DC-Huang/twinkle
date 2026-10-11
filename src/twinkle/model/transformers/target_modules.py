@@ -27,7 +27,7 @@ from twinkle.utils import deep_getattr, get_logger
 
 logger = get_logger()
 
-__all__ = ['get_multimodal_target_regex', 'find_all_linears', 'find_layers']
+__all__ = ['get_multimodal_target_regex', 'find_all_linears', 'find_layers', 'find_norm', 'find_embedding']
 
 
 def find_layers(model: nn.Module,
@@ -103,6 +103,25 @@ def find_all_linears(model: nn.Module,
         return False
 
     return find_layers(model, _cond, sub_module=sub_module)
+
+
+def find_norm(model: nn.Module) -> List[str]:
+    """Every normalization leaf under ``model``, by class identity / name heuristic.
+
+    Used to expand the ``'all-norm'`` shorthand in ``modules_to_save``: PEFT keeps those modules as
+    full-precision trainable copies, so the norm layers have to be named explicitly. Matching
+    ``nn.LayerNorm`` plus a ``'rmsnorm'`` class-name check (rather than ``isinstance`` alone) also
+    catches the fused RMSNorm a family defines in remote code -- the same rule legacy swift uses.
+    """
+    return find_layers(
+        model,
+        lambda name, module: isinstance(module, nn.LayerNorm) or 'rmsnorm' in module.__class__.__name__.lower())
+
+
+def find_embedding(model: nn.Module) -> List[str]:
+    """Every ``nn.Embedding`` leaf under ``model``, to expand the ``'all-embedding'`` shorthand in
+    ``modules_to_save``."""
+    return find_layers(model, lambda name, module: isinstance(module, nn.Embedding))
 
 
 def get_multimodal_target_regex(model: nn.Module,
