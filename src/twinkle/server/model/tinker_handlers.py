@@ -12,6 +12,7 @@ from __future__ import annotations
 import traceback
 from collections.abc import Callable
 from fastapi import Depends, FastAPI, Request
+from functools import partial
 from tinker import types
 from typing import TYPE_CHECKING
 
@@ -257,17 +258,13 @@ def _register_model_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManag
             try:
                 adapter_name = self.get_adapter_name(adapter_name=body.model_id)
                 self.assert_resource_exists(adapter_name)
-                model_adapter = self.resolve_model_adapter_name(adapter_name)
                 checkpoint_manager = create_checkpoint_manager(token, client_type='tinker')
-                checkpoint_name = checkpoint_manager.get_ckpt_name(body.path)
-                save_dir = checkpoint_manager.get_save_dir(model_id=body.model_id, is_sampler=False)
-                await self.call_backend(
+                save_weights = partial(
+                    self.call_backend,
                     self.model.save,
-                    name=checkpoint_name,
-                    output_dir=save_dir,
-                    adapter_name=model_adapter,
+                    adapter_name=self.resolve_model_adapter_name(adapter_name),
                     save_optimizer=True)
-                tinker_path = checkpoint_manager.save(body.model_id, name=checkpoint_name, is_sampler=False)
+                tinker_path, _ = await checkpoint_manager.save_training(body.model_id, body.path, save_weights)
                 return types.SaveWeightsResponse(path=tinker_path, type='save_weights')
             except Exception:
                 logger.error(traceback.format_exc())
@@ -289,13 +286,11 @@ def _register_model_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManag
                 self.assert_resource_exists(adapter_name)
                 checkpoint_manager = create_checkpoint_manager(token, client_type='tinker')
 
-                async def save_weights(*, name: str, output_dir: str):
-                    return await self.call_backend(
-                        self.model.save,
-                        name=name,
-                        output_dir=output_dir,
-                        adapter_name=self.resolve_model_adapter_name(adapter_name),
-                        save_optimizer=False)
+                save_weights = partial(
+                    self.call_backend,
+                    self.model.save,
+                    adapter_name=self.resolve_model_adapter_name(adapter_name),
+                    save_optimizer=False)
 
                 tinker_path, _ = await checkpoint_manager.save_sampler(body.model_id, body.path, save_weights)
                 payload = body.model_dump()

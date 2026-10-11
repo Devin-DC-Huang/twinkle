@@ -14,7 +14,7 @@ from __future__ import annotations
 import torch
 from collections.abc import Callable
 from fastapi import Depends, FastAPI, HTTPException, Request
-from pathlib import Path
+from functools import partial
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -460,31 +460,14 @@ def _register_model_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelMana
 
         async def _call(self, body, adapter_name, token):
             checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
-            if body.is_sampler:
-
-                async def save_weights(*, name: str, output_dir: str):
-                    return await self.call_backend(
-                        self.model.save,
-                        name=name,
-                        output_dir=output_dir,
-                        adapter_name=self.resolve_model_adapter_name(adapter_name),
-                        save_optimizer=body.save_optimizer,
-                        **backend_kwargs(body))
-
-                path, checkpoint_dir = await checkpoint_manager.save_sampler(adapter_name, body.name, save_weights)
-                return {'twinkle_path': path, 'checkpoint_dir': checkpoint_dir}
-            checkpoint_name = checkpoint_manager.get_ckpt_name(body.name)
-            save_dir = checkpoint_manager.get_save_dir(model_id=adapter_name, is_sampler=body.is_sampler)
-            # Must save the checkpoint in the twinkle format before calling model.save()
-            twinkle_path = checkpoint_manager.save(
-                model_id=adapter_name, name=checkpoint_name, is_sampler=body.is_sampler)
-            checkpoint_dir = await self.call_backend(
+            save_weights = partial(
+                self.call_backend,
                 self.model.save,
-                name=checkpoint_name,
-                output_dir=save_dir,
                 adapter_name=self.resolve_model_adapter_name(adapter_name),
                 save_optimizer=body.save_optimizer,
                 **backend_kwargs(body))
+            save_checkpoint = checkpoint_manager.save_sampler if body.is_sampler else checkpoint_manager.save_training
+            twinkle_path, checkpoint_dir = await save_checkpoint(adapter_name, body.name, save_weights)
             return {'twinkle_path': twinkle_path, 'checkpoint_dir': checkpoint_dir}
 
         return await run_submit(self, request, body, task_type='save', backend_call=_call)
@@ -514,10 +497,7 @@ def _register_model_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelMana
 
         async def _call(self, body, adapter_name, token):
             checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
-            resolved = checkpoint_manager.resolve_load_path(body.name)
-            checkpoint_dir = (
-                Path(resolved.checkpoint_dir, resolved.checkpoint_name).as_posix()
-                if resolved.checkpoint_dir else body.name)
+            checkpoint_dir = checkpoint_manager.resolve_checkpoint_dir(body.name)
             ret = await self.call_backend(
                 self.model.resume_from_checkpoint,
                 checkpoint_dir,
@@ -635,12 +615,7 @@ def _register_model_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelMana
                 parsed = checkpoint_manager.parse_twinkle_path(body.checkpoint_dir)
                 if not parsed:
                     raise ValueError(f'Invalid twinkle path format: {body.checkpoint_dir}')
-                checkpoint = checkpoint_manager.get(parsed.training_run_id, parsed.checkpoint_id)
-                if not checkpoint:
-                    raise ValueError(f'Checkpoint not found or access denied: {body.checkpoint_dir}')
-                checkpoint_dir = str(
-                    checkpoint_manager.get_ckpt_dir(
-                        model_id=parsed.training_run_id, checkpoint_id=parsed.checkpoint_id))
+                checkpoint_dir = checkpoint_manager.resolve_checkpoint_dir(body.checkpoint_dir)
             else:
                 checkpoint_dir = body.checkpoint_dir
             await self.call_backend(

@@ -27,10 +27,10 @@ from .training_run_manager import BaseFileManager, BaseTrainingRunManager
 logger = get_logger()
 
 
-class _SamplerWeightSaver(Protocol):
+class _CheckpointWeightSaver(Protocol):
     """Backend callback writes weights into ``output_dir / name``."""
 
-    def __call__(self, *, name: str, output_dir: str) -> Awaitable[Any]:
+    def __call__(self, *, name: str, output_dir: str) -> Awaitable[str | None]:
         ...
 
 
@@ -339,7 +339,22 @@ class BaseCheckpointManager(BaseFileManager, ABC):
         self.training_run_manager.update(model_id, {field: ckpt_data})
         return f'{self.path_prefix}{model_id}/{checkpoint_id}'
 
-    async def save_sampler(self, model_id: str, name: str | None, save_weights: _SamplerWeightSaver) -> tuple[str, str]:
+    async def save_training(self, model_id: str, name: str | None,
+                            save_weights: _CheckpointWeightSaver) -> tuple[str, str | None]:
+        """Write training weights before recording a successful checkpoint.
+
+        The backend retains ownership of training files and optimizer state.
+        Unlike sampler publication, this does not roll back backend file writes.
+        Return its result unchanged for the Twinkle save response.
+        """
+        checkpoint_name = self.get_ckpt_name(name)
+        save_dir = self.get_save_dir(model_id)
+        checkpoint_dir = await save_weights(name=checkpoint_name, output_dir=save_dir)
+        uri = self.save(model_id, checkpoint_name)
+        return uri, checkpoint_dir
+
+    async def save_sampler(self, model_id: str, name: str | None,
+                           save_weights: _CheckpointWeightSaver) -> tuple[str, str]:
         """Save weights, publish their link, then commit the run metadata.
 
         Named saves persist; unnamed saves replace ``latest`` and return a unique
@@ -452,30 +467,30 @@ class BaseCheckpointManager(BaseFileManager, ABC):
 
         ckpt_dir = self.get_ckpt_dir(model_id, checkpoint_id)
 
-        if ckpt_dir.exists():
-            if ckpt_dir.is_symlink():
-                target = ckpt_dir.resolve()
-                ckpt_dir.unlink()
-                latest = self.get_ckpt_dir(model_id, 'sampler_weights/latest')
-                if target == latest.resolve() and latest.exists():
-                    _remove_checkpoint_path(latest)
-                if target.parent == (ckpt_dir.parent / '.versions').resolve():
-                    shutil.rmtree(target)
-            elif ckpt_dir.is_dir():
-                shutil.rmtree(ckpt_dir)
-            else:
-                ckpt_dir.unlink()
+        if not ckpt_dir.exists():
+            return False
 
-            # Update last_checkpoint in run info
-            all_ckpts = self.list_checkpoints(model_id)
-            kind = 'sampler' if checkpoint_id.startswith('sampler_weights/') else 'training'
-            remaining = [ckpt for ckpt in all_ckpts.checkpoints if ckpt.checkpoint_type == kind] if all_ckpts else []
-            last_ckpt = remaining[-1] if remaining else None
-            field = 'last_sampler_checkpoint' if kind == 'sampler' else 'last_checkpoint'
-            self.training_run_manager.update(model_id,
-                                             {field: last_ckpt.model_dump(mode='json') if last_ckpt else None})
-            return True
-        return False
+        if ckpt_dir.is_symlink():
+            target = ckpt_dir.resolve()
+            ckpt_dir.unlink()
+            latest = self.get_ckpt_dir(model_id, 'sampler_weights/latest')
+            if target == latest.resolve() and latest.exists():
+                _remove_checkpoint_path(latest)
+            if target.parent == (ckpt_dir.parent / '.versions').resolve():
+                shutil.rmtree(target)
+        elif ckpt_dir.is_dir():
+            shutil.rmtree(ckpt_dir)
+        else:
+            ckpt_dir.unlink()
+
+        # Refresh only the pointer for the deleted checkpoint's kind.
+        all_ckpts = self.list_checkpoints(model_id)
+        kind = 'sampler' if checkpoint_id.startswith('sampler_weights/') else 'training'
+        remaining = [ckpt for ckpt in all_ckpts.checkpoints if ckpt.checkpoint_type == kind] if all_ckpts else []
+        last_ckpt = remaining[-1] if remaining else None
+        field = 'last_sampler_checkpoint' if kind == 'sampler' else 'last_checkpoint'
+        self.training_run_manager.update(model_id, {field: last_ckpt.model_dump(mode='json') if last_ckpt else None})
+        return True
 
     def parse_path(self, path: str) -> Any | None:
         """
@@ -647,3 +662,15 @@ class BaseCheckpointManager(BaseFileManager, ABC):
                 is_twinkle_path=False,
                 training_run_id=None,
                 checkpoint_id=None)
+
+    def resolve_checkpoint_dir(self, path: str) -> str:
+        """Resolve a full directory for resume/upload; preserve external paths.
+
+        ``resolve_load_path`` supplies parent/name arguments to model.load.
+        Resume and upload instead consume the full checkpoint directory.
+        Sampler caching uses ``parse_adapter_uri`` to resolve version symlinks.
+        """
+        resolved = self.resolve_load_path(path)
+        if resolved.checkpoint_dir is None:
+            return path
+        return (Path(resolved.checkpoint_dir) / resolved.checkpoint_name).as_posix()

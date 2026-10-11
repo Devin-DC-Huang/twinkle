@@ -213,6 +213,76 @@ class _SaveWeightsDummyManagement:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('fail_backend', [False, True])
+@pytest.mark.parametrize('full_mode', [False, True], ids=['lora', 'full-model'])
+async def test_training_save_records_metadata_only_after_backend_success(monkeypatch, tmp_path, fail_backend, full_mode):
+    from pathlib import Path
+    import twinkle.server.model.tinker_handlers as handlers
+    from twinkle.server.checkpoint.tinker import TinkerCheckpointManager, TinkerTrainingRunManager
+
+    monkeypatch.setattr('twinkle.server.checkpoint.training_run_manager.TWINKLE_DEFAULT_SAVE_DIR', str(tmp_path))
+    runs = TinkerTrainingRunManager('token1')
+    runs._write_info('model1', {'base_model': 'test-model'})
+    manager = TinkerCheckpointManager('token1', runs)
+    monkeypatch.setattr(handlers, 'create_checkpoint_manager', lambda *args, **kwargs: manager)
+    management = _SaveWeightsDummyManagement()
+    if full_mode:
+        management.resolve_model_adapter_name = lambda name: ''
+
+    def save(name, output_dir, **kwargs):
+        assert not manager.list_checkpoints('model1').checkpoints
+        assert kwargs == {'adapter_name': '' if full_mode else 'model1', 'save_optimizer': True}
+        if fail_backend:
+            raise RuntimeError('backend save failed')
+        directory = Path(output_dir) / name
+        directory.mkdir(parents=True)
+        (directory / 'weights').write_text('training')
+        return str(directory)
+
+    management.model.save.side_effect = save
+    app = FastAPI()
+    _register_model_tinker_routes(app, lambda: management)
+    endpoint = next(r.endpoint for r in app.routes if getattr(r, 'path', '') == '/tinker/save_weights')
+    body = types.SaveWeightsRequest(model_id='model1', path='step/one')
+    request = Request({'type': 'http', 'headers': []})
+    if fail_backend:
+        with pytest.raises(RuntimeError, match='backend save failed'):
+            await endpoint(request, body, management)
+        assert not manager.list_checkpoints('model1').checkpoints
+        assert 'last_checkpoint' not in runs._read_info('model1')
+    else:
+        response = await endpoint(request, body, management)
+        assert response.path == 'twinkle://model1/weights/step_one'
+        assert response.type == 'save_weights'
+        assert manager.get('model1', 'weights/step_one').size_bytes > 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('path,output_dir', [('org/model', None), ('twinkle://model1/weights/step', 'local')])
+async def test_load_weights_resolves_location_and_preserves_optimizer_flag(monkeypatch, tmp_path, path, output_dir):
+    import twinkle.server.model.tinker_handlers as handlers
+    from twinkle.server.checkpoint.tinker import TinkerCheckpointManager, TinkerTrainingRunManager
+    monkeypatch.setattr('twinkle.server.checkpoint.training_run_manager.TWINKLE_DEFAULT_SAVE_DIR', str(tmp_path))
+    manager = TinkerCheckpointManager('token1', TinkerTrainingRunManager('token1'))
+    if output_dir:
+        manager.save('model1', 'step')
+        output_dir = manager.get_save_dir('model1')
+    monkeypatch.setattr(handlers, 'create_checkpoint_manager', lambda *args, **kwargs: manager)
+    management = _SaveWeightsDummyManagement()
+    management.set_resource_state = MagicMock()
+    app = FastAPI()
+    _register_model_tinker_routes(app, lambda: management)
+    endpoint = next(r.endpoint for r in app.routes if getattr(r, 'path', '') == '/tinker/load_weights')
+    response = await endpoint(Request({'type': 'http', 'headers': []}),
+                              types.LoadWeightsRequest(model_id='model1', path=path, optimizer=True), management)
+    management.model.tinker_load.assert_called_once_with(
+        checkpoint_name='step' if output_dir else path, output_dir=output_dir,
+        load_optimizer=True, adapter_name='model1')
+    management.set_resource_state.assert_called_once_with('model1', 'grad_ready', False)
+    assert response.path == path and response.type == 'load_weights'
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('backward', [False, True])
 async def test_tinker_loss_metric_survives_sdk_reduction(backward):
     from tinker.lib.chunked_fwdbwd_helpers import combine_fwd_bwd_output_results

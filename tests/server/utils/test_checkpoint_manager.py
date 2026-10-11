@@ -21,7 +21,7 @@ def manager(request, monkeypatch, tmp_path):
 def _writer(value, fail=False):
     async def save(name, output_dir):
         checkpoint = Path(output_dir) / name
-        checkpoint.mkdir()
+        checkpoint.mkdir(parents=True, exist_ok=True)
         (checkpoint / 'weights').write_text(value)
         await asyncio.sleep(.01)
         if fail:
@@ -273,6 +273,61 @@ async def test_missing_backend_weights_does_not_publish_checkpoint(manager):
     assert info_path.read_bytes() == before
     assert not manager.list_checkpoints('run').checkpoints
     assert not list(Path(manager.get_save_dir('run', is_sampler=True)).glob('.pending-*'))
+
+
+@pytest.mark.asyncio
+async def test_training_and_sampler_checkpoints_can_be_read_and_deleted_by_other_dialect(manager):
+    from twinkle.server.checkpoint import create_checkpoint_manager
+    manager.training_run_manager.update('run', {
+        'training_run_id': 'run', 'model_owner': manager.token, 'last_request_time': '2026-10-11T00:00:00'})
+    training_uri, training_dir = await manager.save_training('run', 'step', _writer('training'))
+    sampler_uri, sampler_dir = await manager.save_sampler('run', 'sample', _writer('sampler'))
+    peer_type = 'twinkle' if isinstance(manager, TinkerCheckpointManager) else 'tinker'
+    peer = create_checkpoint_manager(manager.token, client_type=peer_type)
+
+    assert peer.resolve_load_path(training_uri).checkpoint_name == 'step'
+    assert peer.resolve_checkpoint_dir(training_uri) == training_dir
+    assert peer.resolve_checkpoint_dir(sampler_uri) == sampler_dir
+    assert peer.get_weights_info(training_uri).base_model == 'test-model'
+    assert {ckpt.checkpoint_id for ckpt in peer.list_checkpoints('run').checkpoints} == {
+        'weights/step', 'sampler_weights/sample'}
+    assert peer.get('run', 'weights/step').size_bytes > 0
+    run = peer.training_run_manager.get('run').model_dump(mode='json')
+    assert run['last_checkpoint']['checkpoint_id'] == 'weights/step'
+    assert run['last_sampler_checkpoint']['checkpoint_id'] == 'sampler_weights/sample'
+
+    assert peer.delete('run', 'weights/step')
+    info = manager.training_run_manager._read_info('run')
+    assert info['last_checkpoint'] is None
+    assert info['last_sampler_checkpoint']['checkpoint_id'] == 'sampler_weights/sample'
+    assert not Path(training_dir).exists()
+    assert Path(sampler_dir, 'weights').read_text() == 'sampler'
+    assert not peer.delete('run', 'weights/step')
+    assert peer.delete('run', 'sampler_weights/sample')
+    assert manager.training_run_manager._read_info('run')['last_sampler_checkpoint'] is None
+
+
+@pytest.mark.asyncio
+async def test_load_and_resume_use_public_directory_while_sampler_cache_uses_version(manager):
+    uri, public_directory = await manager.save_sampler('run', 'sample', _writer('sampler'))
+    load = manager.resolve_load_path(uri)
+    assert Path(load.checkpoint_dir, load.checkpoint_name) == Path(public_directory)
+    assert manager.resolve_checkpoint_dir(uri) == public_directory
+    physical_directory = Path(manager.parse_adapter_uri(uri)[1])
+    assert physical_directory == Path(public_directory).resolve()
+    assert physical_directory != Path(public_directory)
+
+    other = type(manager)('another-token', type(manager.training_run_manager)('another-token'))
+    with pytest.raises(ValueError, match='not found or access denied'):
+        other.resolve_checkpoint_dir(uri)
+
+
+@pytest.mark.parametrize('path', ['org/model', '/external/checkpoint', './relative/checkpoint'])
+def test_external_load_paths_are_preserved(manager, path):
+    load = manager.resolve_load_path(path)
+    assert load.checkpoint_name == path and load.checkpoint_dir is None
+    assert not load.is_twinkle_path
+    assert manager.resolve_checkpoint_dir(path) == path
 
 
 @pytest.mark.asyncio
