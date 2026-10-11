@@ -333,6 +333,10 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             model_arch: Optional[Dict[str, Any]] = None,
             neftune_noise_alpha: Optional[float] = None,
             acc_strategy: str = 'token',
+            new_special_tokens: Optional[List[str]] = None,
+            init_strategy: Optional[str] = None,
+            use_liger_kernel: bool = False,
+            liger_kernel_config: Optional[Dict[str, Any]] = None,
             **kwargs):
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
         # Opt-out of the cuDNN SDPA backend (falls back to flash/mem-efficient, numerically
@@ -430,6 +434,17 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
 
         if neftune_noise_alpha:
             self._activate_neftune(neftune_noise_alpha)
+        # Post-load module surgery (Liger op kernels, token-vocab growth, weight re-init) is gated
+        # worker-side for the same reason as gradient_checkpointing above: under Ray the driver holds a
+        # proxy stub, so reaching into ``model.model`` there only mutates the stub and silently no-ops.
+        # All three run before the optimizer group is built so it sees the final parameters. The order
+        # mirrors the legacy post-construction sequence: kernelize, then grow the vocab, then re-init.
+        if use_liger_kernel:
+            self._apply_liger_kernel(liger_kernel_config)
+        if new_special_tokens:
+            self._apply_new_special_tokens(new_special_tokens)
+        if init_strategy is not None:
+            self._apply_init_strategy(init_strategy)
         self.sp_strategy = None
         self._model_wrapped = False
         self.optimizer_group: Dict[str, OptimizerGroup] = {
@@ -460,6 +475,97 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
 
         embeddings.register_forward_hook(neftune_post_forward_hook)
 
+    def _apply_liger_kernel(self, liger_kernel_config: Optional[Dict[str, Any]] = None) -> None:
+        """Patch the HF module's per-layer ops with Liger kernels via the mapping-driven ``kernelize``.
+
+        ``liger_kernel_config`` (an ``{op: bool}`` dict) switches individual ops off on top of Liger's
+        default set; None keeps the default. ``kernelize`` mutates the module in place (class / forward
+        replacement), which is why it belongs at the end of construction, before the optimizer is built.
+        The fused-linear-CE op is deliberately not a target here -- it skips the lm_head GEMM rather than
+        swapping a layer, so it is a loss-path selection, not a kernelize op.
+        """
+        from twinkle.kernel import kernelize
+        kernelize(self.model, self._liger_kernel_mapping(liger_kernel_config))
+
+    @staticmethod
+    def _liger_kernel_mapping(liger_kernel_config: Optional[Dict[str, Any]]) -> Optional[dict]:
+        """DEFAULT_KERNEL_CONFIG minus any op the config switches off; None keeps the built-in default.
+
+        Returning None rather than a copy of the default matters: ``kernelize`` logs family-skips at DEBUG
+        on the default path but raises them to WARNING for any explicit mapping. 'fused_linear_cross_entropy'
+        is not a kernelize op, so it matches no DEFAULT_KERNEL_CONFIG entry and is ignored here (the loss
+        side consumes it instead).
+        """
+        if not liger_kernel_config:
+            return None
+        from twinkle.kernel.config import DEFAULT_KERNEL_CONFIG
+        disabled = {op for op, enabled in liger_kernel_config.items() if not enabled}
+        return {
+            target: choice
+            for target, choice in DEFAULT_KERNEL_CONFIG.items()
+            if getattr(choice, 'op', None) not in disabled
+        }
+
+    def _apply_new_special_tokens(self, new_special_tokens: List[str]) -> None:
+        """Grow the tokenizer's vocabulary with ``new_special_tokens`` and resize the embeddings to match.
+
+        ``new_special_tokens`` is an already-resolved token list -- any ``.txt`` file expansion happens on
+        the caller (driver) side, so only serializable strings cross the Ray boundary. The embedding is
+        resized to a multiple of 128, and only when tokens were actually added, leaving the checkpoint's
+        own vocab untouched otherwise. When no processor was loaded (the plain model_cls path) a tokenizer
+        is built from ``tokenizer_id`` and kept as the default so ``save`` writes a matching vocab.
+        """
+        processor = self._default_tokenizer
+        if processor is None:
+            from transformers import AutoTokenizer
+            processor = AutoTokenizer.from_pretrained(self.tokenizer_id, trust_remote_code=True)
+            self._default_tokenizer = processor
+        tokenizer = getattr(processor, 'tokenizer', processor)
+        added = tokenizer.add_special_tokens({'additional_special_tokens': list(new_special_tokens)})
+        if added:
+            vocab_size = ((len(tokenizer) + 127) // 128) * 128
+            self.model.resize_token_embeddings(vocab_size)
+
+    def _apply_init_strategy(self, init_strategy: str) -> None:
+        """Re-initialize the weights a blank / partially-loaded config left uninitialized.
+
+        Only parameters whose scale is non-finite or absurdly large (> 1e7) are touched, so a properly
+        loaded checkpoint is left intact -- this is the from-config init path, not a re-randomize of
+        pretrained weights. Runs on the real module (worker-side under Ray; see ``__init__``).
+        """
+        from torch import nn
+
+        def high_dim(param, init):
+            if param.dim() > 1:
+                init(param)
+            elif param.dim() == 1 and param.numel() > 0:
+                nn.init.zeros_(param)
+
+        initializers = {
+            'zero': nn.init.zeros_,
+            'uniform': lambda param: nn.init.uniform_(param, -0.1, 0.1),
+            'normal': lambda param: nn.init.normal_(param, 0.0, 0.01),
+            'xavier_uniform': lambda param: high_dim(param, nn.init.xavier_uniform_),
+            'xavier_normal': lambda param: high_dim(param, nn.init.xavier_normal_),
+            'kaiming_uniform': lambda param: high_dim(
+                param, lambda value: nn.init.kaiming_uniform_(value, mode='fan_out', nonlinearity='leaky_relu',
+                                                              a=0.1)),
+            'kaiming_normal': lambda param: high_dim(
+                param, lambda value: nn.init.kaiming_normal_(value, mode='fan_in', nonlinearity='relu')),
+            'orthogonal': lambda param: high_dim(param, nn.init.orthogonal_),
+        }
+        if init_strategy not in initializers:
+            raise ValueError(f'Unknown init_strategy={init_strategy!r}; expected one of {sorted(initializers)}.')
+        initialize = initializers[init_strategy]
+        with torch.no_grad():
+            for param in self.model.parameters():
+                if param.numel() == 0:
+                    continue
+                mean_abs = param.abs().mean()
+                std = param.std()
+                if not torch.isfinite(mean_abs) or not torch.isfinite(std) or mean_abs > 1e7 or std > 1e7:
+                    initialize(param)
+
     def _should_init_empty_pretrained_model_on_this_rank(self) -> bool:
         use_rank0_broadcast = getattr(self.strategy, 'use_rank0_pretrained_broadcast', lambda: False)
         if not (use_rank0_broadcast() and dist.is_available() and dist.is_initialized()):
@@ -485,6 +591,12 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
     def _decide_strategy(self,
                          strategy: Literal['accelerate', 'native_fsdp', 'deepspeed'],
                          deepspeed_config: Dict[str, Any] = None):
+        if self.device_mesh is not None and self.device_mesh.pp_world_size > 1:
+            raise ValueError(
+                f'The transformers backend has no pipeline-parallel runtime (pp_world_size='
+                f'{self.device_mesh.pp_world_size}): its strategies wire dp/fsdp/tp/cp/sp only, and transformers '
+                '5.x ships pp_plan as a declaration layer with no training scheduler. Run pp>1 with '
+                '--backend megatron.')
         self._expert_parallel_config = self._fsdp_config.pop('expert_parallel', None)
         self._enable_expert_parallel = self._should_enable_expert_parallel(self._expert_parallel_config,
                                                                            self.device_mesh)

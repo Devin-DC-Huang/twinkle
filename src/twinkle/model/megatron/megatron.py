@@ -142,6 +142,13 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
         # mcore's TransformerConfig. Mirrors TransformersModel's kwarg of the same name.
         vit_gradient_checkpointing: Optional[bool] = None,
         vit_gradient_checkpointing_kwargs: Optional[Dict[str, Any]] = None,
+        # Vocab growth for added special tokens, the megatron counterpart of TransformersModel's kwarg of the
+        # same name. An already-resolved token list (any .txt expansion happened driver-side, so only
+        # serializable strings cross the Ray boundary). Consumed worker-side in __init__: the tokenizer is
+        # extended and hf_config.vocab_size raised BEFORE MegatronStrategy builds the mcore config (which
+        # sizes VocabParallelEmbedding from it), then the new zero-filled rows are re-initialized once the
+        # model exists. Declared explicitly so it never leaks through **kwargs into mcore's TransformerConfig.
+        new_special_tokens: Optional[List[str]] = None,
         # Forwarded verbatim to MegatronStrategy, which owns them. Declared explicitly (rather than
         # left in **kwargs) because they are the supported construction surface, and bridge_backend
         # in particular must stay a NAME string so it survives the Ray worker boundary.
@@ -212,6 +219,12 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
         else:
             from transformers import AutoConfig
             self.hf_config = AutoConfig.from_pretrained(self._model_path, trust_remote_code=True)
+        # Extend the tokenizer and raise hf_config.vocab_size BEFORE the strategy reads it: mcore sizes the
+        # VocabParallelEmbedding from this config (get_model_config -> hf_to_mcore_config), so the new rows
+        # already exist (zero-filled) at build time and are re-initialized just below. Worker-side, because
+        # the driver holds only a proxy stub.
+        if new_special_tokens:
+            self._extend_vocab_for_new_special_tokens(new_special_tokens)
         self.strategy = MegatronStrategy(
             self._model_path,
             self.device_mesh,
@@ -228,6 +241,10 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
         self.model: List[nn.Module] = self.strategy.create_megatron_model(load_weights)
         if vit_gradient_checkpointing is not None:
             self._apply_vit_gradient_checkpointing(vit_gradient_checkpointing, vit_gradient_checkpointing_kwargs)
+        if new_special_tokens:
+            # The rows added by the vocab raise above are zero-filled by mcore; give them real values before
+            # the optimizer group snapshots the parameters below.
+            self._initialize_new_special_token_embeddings()
 
         self._model_wrapped = False
         self._finish_config = False
@@ -283,6 +300,65 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
                         tower.gradient_checkpointing_disable()
                 except (NotImplementedError, AttributeError, ValueError) as exc:
                     logger.warning(f'vision-tower gradient checkpointing skipped for {tower_name}: {exc}')
+
+    def _extend_vocab_for_new_special_tokens(self, new_special_tokens: List[str]) -> None:
+        """Grow the tokenizer vocab with ``new_special_tokens`` and raise ``hf_config.vocab_size`` to match.
+
+        The megatron counterpart of ``TransformersModel._apply_new_special_tokens``, split across the model
+        build because the two backends size the embedding differently: the transformers path resizes the
+        loaded embedding AFTER construction, whereas mcore builds a ``VocabParallelEmbedding`` FROM
+        ``hf_config.vocab_size`` (via MegatronStrategy.get_model_config -> hf_to_mcore_config), so the vocab
+        must be raised BEFORE the strategy is constructed. The 128 alignment matches legacy register.py and
+        keeps the vocab evenly divisible across TP shards. ``get_text_config()`` resolves to the config the
+        bridge reads (self for a plain LLM, the nested text config for a multimodal one).
+        """
+        processor = self._default_tokenizer
+        if processor is None:
+            from transformers import AutoTokenizer
+            processor = AutoTokenizer.from_pretrained(self.tokenizer_id, trust_remote_code=True)
+            self._default_tokenizer = processor
+        tokenizer = getattr(processor, 'tokenizer', processor)
+        added = tokenizer.add_special_tokens({'additional_special_tokens': list(new_special_tokens)})
+        if added:
+            text_config = self.hf_config.get_text_config()
+            new_vocab_size = ((len(tokenizer) + 127) // 128) * 128
+            if text_config.vocab_size < new_vocab_size:
+                text_config.vocab_size = new_vocab_size
+
+    def _initialize_new_special_token_embeddings(self) -> None:
+        """Give the new (zero-filled) embedding rows real values on the sharded mcore modules.
+
+        After ``create_megatron_model`` builds ``embedding.word_embeddings`` / ``output_layer`` at the raised
+        vocab, the rows for the just-added tokens are all zero. This re-initializes exactly those rows with
+        mcore's own ``init_method``, so a new special token starts from the same distribution as the
+        pretrained vocab instead of a dead zero vector. Mirrors legacy
+        ``swift/megatron/trainers/base.py::_initialize_embedding`` -- same init_method, same all-zero-row
+        mask, same handling of the TP shard (``module.weight`` is this rank's slice), the PP stage
+        (``deep_getattr`` yields None on stages that do not carry the module) and tied embeddings -- so the
+        numbers match the legacy megatron path. Runs before the optimizer group snapshots the parameters.
+        """
+        from twinkle.utils import deep_getattr
+        for chunk in self.model:
+            model = chunk
+            while hasattr(model, 'module'):  # unwrap DDP / Float16Module down to the mcore model
+                model = model.module
+            init_method = model.config.init_method
+            if hasattr(model, 'language_model'):  # multimodal: the decoder carries the embeddings
+                model = model.language_model
+            for key in ('embedding.word_embeddings', 'output_layer'):
+                if key == 'output_layer' and model.share_embeddings_and_output_weights:
+                    continue  # tied to the input embedding, already initialized above
+                module = deep_getattr(model, key)
+                if module is None:
+                    continue  # this pipeline stage does not carry the module
+                initialize_mask = (module.weight == 0).all(dim=-1)
+                num_to_initialize = int(initialize_mask.sum().item())
+                if num_to_initialize == 0:
+                    continue
+                tensor = module.weight.new_empty(num_to_initialize, module.weight.shape[1])
+                module.weight.data[initialize_mask] = init_method(tensor)
+                if getattr(module.weight, 'main_param', None) is not None:
+                    module.weight.main_param.copy_(module.weight.view(-1))
 
     def _should_bind_device_id_for_process_group(self, backend: str) -> bool:
         # Keep NCCL's device binding behavior, but avoid binding HCCL's default
