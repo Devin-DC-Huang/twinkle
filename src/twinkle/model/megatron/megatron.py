@@ -29,6 +29,7 @@ from twinkle.checkpoint_engine.mixin import CheckpointEngineMixin
 from twinkle.data_format import InputFeature, ModelOutput, Trajectory
 from twinkle.hub import HubOperation
 from twinkle.infra import collect_tensor_dict
+from twinkle.infra._torch_setup import seed_from_env
 from twinkle.loss import CrossEntropyLoss, Loss
 from twinkle.metric import LossMetric, Metric, TrainMetric
 from twinkle.model.base import ModelLoaderProtocol, TrainableModel, copy_checkpoint_args, rotate_checkpoints
@@ -65,6 +66,22 @@ def _resolve_task_context(model, task):
         return apply_context(model, MegatronEmbeddingPatch())
     raise ValueError(f'Unknown task={task!r}; expected one of: causal_lm, embedding, seq_cls, reranker, '
                      'generative_reranker, value.')
+
+
+def _find_layers(model, cond_fn):
+    """Every full mcore module path under ``model`` satisfying ``cond_fn(name, module)``.
+
+    Shared by the ``all-*`` keyword expansion for both ``target_modules`` and ``modules_to_save``, so the
+    two keep one definition of "walk the real modules" (the expansion runs worker-side, where the real
+    modules live -- the driver only holds a sharded PROXY).
+    """
+    return [name for name, module in model.named_modules() if cond_fn(name, module)]
+
+
+def _find_embedding(model):
+    """mcore's embedding modules, used to expand the ``'all-embedding'`` keyword."""
+    from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
+    return _find_layers(model, lambda name, module: isinstance(module, LanguageModelEmbedding) and 'lora' not in name)
 
 
 @dataclass
@@ -119,6 +136,19 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
         recompute_method: Optional[str] = 'uniform',
         recompute_num_layers: Optional[int] = 1,
         recompute_modules: Optional[list] = None,  # Modules to recompute
+        # Per-tower vision checkpointing: the multimodal counterpart of the global recompute_* knobs
+        # above, which cover the mcore LLM decoder but NOT the external HF vision tower. Consumed
+        # worker-side in __init__ below; declared explicitly so it never leaks through **kwargs into
+        # mcore's TransformerConfig. Mirrors TransformersModel's kwarg of the same name.
+        vit_gradient_checkpointing: Optional[bool] = None,
+        vit_gradient_checkpointing_kwargs: Optional[Dict[str, Any]] = None,
+        # Vocab growth for added special tokens, the megatron counterpart of TransformersModel's kwarg of the
+        # same name. An already-resolved token list (any .txt expansion happened driver-side, so only
+        # serializable strings cross the Ray boundary). Consumed worker-side in __init__: the tokenizer is
+        # extended and hf_config.vocab_size raised BEFORE MegatronStrategy builds the mcore config (which
+        # sizes VocabParallelEmbedding from it), then the new zero-filled rows are re-initialized once the
+        # model exists. Declared explicitly so it never leaks through **kwargs into mcore's TransformerConfig.
+        new_special_tokens: Optional[List[str]] = None,
         # Forwarded verbatim to MegatronStrategy, which owns them. Declared explicitly (rather than
         # left in **kwargs) because they are the supported construction surface, and bridge_backend
         # in particular must stay a NAME string so it survives the Ray worker boundary.
@@ -176,7 +206,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
             'recompute_num_layers': recompute_num_layers,
             'variable_seq_lengths': self.variable_seq_lengths,
         })
-        seed = kwargs.pop('seed', None) or int(os.environ.get('TWINKLE_SEED', 42))
+        seed = kwargs.pop('seed', None) or seed_from_env(42)
         model_loader: Optional[ModelLoaderProtocol] = kwargs.pop('model_loader', None)
         if config is not None:
             self.hf_config = config
@@ -189,6 +219,12 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
         else:
             from transformers import AutoConfig
             self.hf_config = AutoConfig.from_pretrained(self._model_path, trust_remote_code=True)
+        # Extend the tokenizer and raise hf_config.vocab_size BEFORE the strategy reads it: mcore sizes the
+        # VocabParallelEmbedding from this config (get_model_config -> hf_to_mcore_config), so the new rows
+        # already exist (zero-filled) at build time and are re-initialized just below. Worker-side, because
+        # the driver holds only a proxy stub.
+        if new_special_tokens:
+            self._extend_vocab_for_new_special_tokens(new_special_tokens)
         self.strategy = MegatronStrategy(
             self._model_path,
             self.device_mesh,
@@ -203,6 +239,12 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
             attn_impl=attn_impl,
             **kwargs)
         self.model: List[nn.Module] = self.strategy.create_megatron_model(load_weights)
+        if vit_gradient_checkpointing is not None:
+            self._apply_vit_gradient_checkpointing(vit_gradient_checkpointing, vit_gradient_checkpointing_kwargs)
+        if new_special_tokens:
+            # The rows added by the vocab raise above are zero-filled by mcore; give them real values before
+            # the optimizer group snapshots the parameters below.
+            self._initialize_new_special_token_embeddings()
 
         self._model_wrapped = False
         self._finish_config = False
@@ -218,6 +260,105 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
         self.optimizer_group[_default_adapter_name].adapter_name = _default_adapter_name
         self.active_group = _default_adapter_name
         MegatronPeft().__call__()
+
+    def _apply_vit_gradient_checkpointing(self, enabled: bool, gc_kwargs: Optional[Dict[str, Any]]) -> None:
+        """Checkpoint each HF vision tower of a multimodal mcore model.
+
+        The megatron counterpart of TransformersModel's per-tower switch. mcore builds the vision tower
+        under ``visual`` on the FIRST pipeline stage only (later stages carry ``visual=None``), and the
+        tower names are class attributes on ``model_meta.visual_cls._vision_tower`` -- the same source
+        ``resolve_megatron_tower_prefixes`` reads for LoRA / per-tower-LR partitioning, so this stays
+        model-agnostic. A plain ``GPTModel`` has no ``visual_cls`` and is a no-op. The global
+        ``recompute_*`` knobs do not reach this external tower, which is why it needs its own switch.
+
+        Runs in the actor __init__ (worker-side), so it touches the real modules under Ray; a driver-side
+        post-construction call would only reach the proxy stub. ``enable_input_require_grads`` is the
+        standard companion when the input embedding is frozen (LoRA / quantized), so a checkpointed tower
+        still propagates gradients.
+        """
+        from twinkle.utils import deep_getattr
+        for chunk in self.model:
+            core = chunk
+            while hasattr(core, 'module'):  # unwrap DDP / Float16Module down to the mcore model
+                core = core.module
+            visual = getattr(core, 'visual', None)
+            if visual is None:  # not the first pipeline stage, or a plain LLM
+                continue
+            visual_cls = getattr(getattr(core, 'model_meta', None), 'visual_cls', None)
+            for tower_name in (getattr(visual_cls, '_vision_tower', None) or []):
+                tower = deep_getattr(visual, tower_name)
+                if tower is None:
+                    continue
+                try:
+                    if enabled:
+                        if gc_kwargs:
+                            tower.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gc_kwargs)
+                        else:
+                            tower.gradient_checkpointing_enable()
+                        tower.enable_input_require_grads()
+                    else:
+                        tower.gradient_checkpointing_disable()
+                except (NotImplementedError, AttributeError, ValueError) as exc:
+                    logger.warning(f'vision-tower gradient checkpointing skipped for {tower_name}: {exc}')
+
+    def _extend_vocab_for_new_special_tokens(self, new_special_tokens: List[str]) -> None:
+        """Grow the tokenizer vocab with ``new_special_tokens`` and raise ``hf_config.vocab_size`` to match.
+
+        The megatron counterpart of ``TransformersModel._apply_new_special_tokens``, split across the model
+        build because the two backends size the embedding differently: the transformers path resizes the
+        loaded embedding AFTER construction, whereas mcore builds a ``VocabParallelEmbedding`` FROM
+        ``hf_config.vocab_size`` (via MegatronStrategy.get_model_config -> hf_to_mcore_config), so the vocab
+        must be raised BEFORE the strategy is constructed. The 128 alignment matches legacy register.py and
+        keeps the vocab evenly divisible across TP shards. ``get_text_config()`` resolves to the config the
+        bridge reads (self for a plain LLM, the nested text config for a multimodal one).
+        """
+        processor = self._default_tokenizer
+        if processor is None:
+            from transformers import AutoTokenizer
+            processor = AutoTokenizer.from_pretrained(self.tokenizer_id, trust_remote_code=True)
+            self._default_tokenizer = processor
+        tokenizer = getattr(processor, 'tokenizer', processor)
+        added = tokenizer.add_special_tokens({'additional_special_tokens': list(new_special_tokens)})
+        if added:
+            text_config = self.hf_config.get_text_config()
+            new_vocab_size = ((len(tokenizer) + 127) // 128) * 128
+            if text_config.vocab_size < new_vocab_size:
+                text_config.vocab_size = new_vocab_size
+
+    def _initialize_new_special_token_embeddings(self) -> None:
+        """Give the new (zero-filled) embedding rows real values on the sharded mcore modules.
+
+        After ``create_megatron_model`` builds ``embedding.word_embeddings`` / ``output_layer`` at the raised
+        vocab, the rows for the just-added tokens are all zero. This re-initializes exactly those rows with
+        mcore's own ``init_method``, so a new special token starts from the same distribution as the
+        pretrained vocab instead of a dead zero vector. Mirrors legacy
+        ``swift/megatron/trainers/base.py::_initialize_embedding`` -- same init_method, same all-zero-row
+        mask, same handling of the TP shard (``module.weight`` is this rank's slice), the PP stage
+        (``deep_getattr`` yields None on stages that do not carry the module) and tied embeddings -- so the
+        numbers match the legacy megatron path. Runs before the optimizer group snapshots the parameters.
+        """
+        from twinkle.utils import deep_getattr
+        for chunk in self.model:
+            model = chunk
+            while hasattr(model, 'module'):  # unwrap DDP / Float16Module down to the mcore model
+                model = model.module
+            init_method = model.config.init_method
+            if hasattr(model, 'language_model'):  # multimodal: the decoder carries the embeddings
+                model = model.language_model
+            for key in ('embedding.word_embeddings', 'output_layer'):
+                if key == 'output_layer' and model.share_embeddings_and_output_weights:
+                    continue  # tied to the input embedding, already initialized above
+                module = deep_getattr(model, key)
+                if module is None:
+                    continue  # this pipeline stage does not carry the module
+                initialize_mask = (module.weight == 0).all(dim=-1)
+                num_to_initialize = int(initialize_mask.sum().item())
+                if num_to_initialize == 0:
+                    continue
+                tensor = module.weight.new_empty(num_to_initialize, module.weight.shape[1])
+                module.weight.data[initialize_mask] = init_method(tensor)
+                if getattr(module.weight, 'main_param', None) is not None:
+                    module.weight.main_param.copy_(module.weight.view(-1))
 
     def _should_bind_device_id_for_process_group(self, backend: str) -> bool:
         # Keep NCCL's device binding behavior, but avoid binding HCCL's default
@@ -1102,6 +1243,16 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
             loss.process_group = optimizer_config._dp_group
         optimizer_config.loss_instance = loss
 
+    @remote_function(dispatch='all')
+    def empty_cache(self, **kwargs):
+        """Release the caching allocator's unused blocks on every worker.
+
+        dispatch='all' because each rank holds its own device memory and the driver only orchestrates.
+        Backend-agnostic through torch_util (cuda/npu); mirrors TransformersModel.empty_cache so the
+        training loop can call it identically on either backend.
+        """
+        torch_util.empty_cache()
+
     @remote_function()
     def add_metric(self, metric_cls: Union[Metric, str], is_training: Optional[bool] = None, **kwargs):
         """Add an eval metric
@@ -1176,6 +1327,12 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
                     twinkle stays model-agnostic and forwards this verbatim to Megatron, so callers
                     describe their own parameter grouping (name globs / predicates) and per-group
                     ``max_lr`` / ``min_lr`` / ``wd_mult`` instead of relying on any hardcoded naming.
+                - param_groups_spec: The same backend-neutral, ordered grouping rules the transformers
+                    backend takes (per-tower LR, LoRA+). Translated here into ``config_overrides`` --
+                    each rule becomes an exclusive ``with_name_predicate`` so mcore's merge semantics
+                    reproduce first-match-wins -- and layered on top of ``get_standard_config_overrides``
+                    so the default bias / length-1 weight-decay skip is preserved. The tower role is
+                    resolved from the live model (``visual._vision_tower`` / ``_aligner``), never hardcoded.
 
         Returns:
             MegatronOptimizer instance.
@@ -1185,8 +1342,9 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
         # Build optimizer config
         lr = kwargs.pop('lr', 1e-4)
         self.use_distributed_optimizer: bool = kwargs.pop('use_distributed_optimizer', self.use_distributed_optimizer)
-        # Pop before building OptimizerConfig: this is a get_megatron_optimizer arg, not a config field.
+        # Pop before building OptimizerConfig: these are get_megatron_optimizer args, not config fields.
         config_overrides = kwargs.pop('config_overrides', None)
+        param_groups_spec = kwargs.pop('param_groups_spec', None)
 
         opt_config = OptimizerConfig(
             optimizer=kwargs.pop('optimizer', 'adam'),
@@ -1204,6 +1362,22 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
             log_num_zeros_in_grad=kwargs.pop('log_num_zeros_in_grad', False),
             **kwargs,
         )
+
+        if param_groups_spec:
+            # Translate the backend-neutral spec into mcore overrides. Start from the standard defaults
+            # (bias / length-1 weight-decay skip) -- or a caller-supplied config_overrides -- and layer the
+            # spec's rules on top, so per-tower / LoRA+ learning rates do not silently drop the wd skip.
+            from megatron.core.optimizer import get_standard_config_overrides
+            from twinkle.module.optimizer import build_param_group_overrides, resolve_megatron_tower_prefixes
+            base_overrides = config_overrides if config_overrides is not None else get_standard_config_overrides(
+                opt_config)
+            spec_overrides = build_param_group_overrides(
+                param_groups_spec,
+                model_chunks=self.model,
+                tower_prefixes=resolve_megatron_tower_prefixes(self.model),
+                base_lr=opt_config.lr,
+                base_min_lr=opt_config.min_lr)
+            config_overrides = {**base_overrides, **spec_overrides}
 
         # Ensure each model chunk has ddp_config attached (required by Megatron optimizer)
         model_chunks = self.model
@@ -1926,9 +2100,29 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
 
     def _patch_adapter(self, adapter_name: str, config_or_dir: Union[PeftConfig, str, Dict[str, Any]], **kwargs):
         assert adapter_name, 'Use a non-empty adapter_name'
+        # freeze_* drive the multimodal 'all-linear' target expansion in get_target_modules; popped so they
+        # do not leak into get_peft_model. Defaults match dev's TunerConfig defaults.
+        freeze_llm = kwargs.pop('freeze_llm', False)
+        freeze_vit = kwargs.pop('freeze_vit', True)
+        freeze_aligner = kwargs.pop('freeze_aligner', True)
         model = self.strategy.unwrap_model(self.model)
+        original_target_modules: List[str] = []
+        original_modules_to_save: List[str] = []
         if isinstance(config_or_dir, str):
             config_or_dir = HubOperation.download_model(config_or_dir)
+        else:
+            if isinstance(config_or_dir, dict):
+                config_or_dir = LoraConfig(**config_or_dir)
+            # Capture the target spec as the caller wrote it ('all-linear' / a name list) BEFORE the loop:
+            # config.target_modules is reassigned to each chunk's expansion inside it, and a virtual-PP
+            # chunk has its own module names, so re-expanding a previous chunk's result would target the
+            # wrong layers and skip this chunk's freeze_* filtering. modules_to_save is captured for the
+            # same reason (its 'all-embedding' shorthand is expanded per chunk below).
+            if isinstance(config_or_dir.target_modules, str):
+                original_target_modules = [config_or_dir.target_modules]
+            else:
+                original_target_modules = list(config_or_dir.target_modules or [])
+            original_modules_to_save = list(config_or_dir.modules_to_save or [])
 
         _models = []
         for _model in model:
@@ -1937,19 +2131,20 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
                     _model, config_or_dir, adapter_name=adapter_name, is_trainable=kwargs.get('is_trainable', True))
                 config = _model.peft_config
             else:
-                if isinstance(config_or_dir, dict):
-                    config_or_dir = LoraConfig(**config_or_dir)
                 config = config_or_dir
 
-                # Expand target_modules (e.g., 'all-linear' -> actual module names)
-                if config.target_modules:
-                    if isinstance(config.target_modules, str):
-                        target_modules = [config.target_modules]
-                    else:
-                        target_modules = list(config.target_modules)
-
-                    expanded_modules = self.get_target_modules(_model, target_modules)
-                    config.target_modules = expanded_modules
+                # Expand target_modules (e.g., 'all-linear' -> this chunk's actual module names) per chunk.
+                if original_target_modules:
+                    config.target_modules = self.get_target_modules(
+                        _model,
+                        original_target_modules,
+                        freeze_llm=freeze_llm,
+                        freeze_vit=freeze_vit,
+                        freeze_aligner=freeze_aligner)
+                # Expand the modules_to_save shorthands per chunk too ('all-embedding'; 'all-norm' is
+                # rejected inside get_modules_to_save -- mcore fuses norm into its linear layers).
+                if original_modules_to_save:
+                    config.modules_to_save = self.get_modules_to_save(_model, original_modules_to_save)
 
                 _model = get_peft_model(_model, config, adapter_name=adapter_name)  # noqa
             _models.append(_model)
@@ -2239,15 +2434,23 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
         return _peft_config
 
     @staticmethod
-    def get_target_modules(model: 'torch.nn.Module', target_modules: List[str]) -> List[str]:
-        import torch
+    def get_target_modules(model: 'torch.nn.Module',
+                           target_modules: List[str],
+                           *,
+                           freeze_llm: bool = False,
+                           freeze_vit: bool = True,
+                           freeze_aligner: bool = True) -> List[str]:
+        """Expand the ``all-*`` keywords into concrete module names, honouring the freeze_* partition.
 
-        def find_layers(model: torch.nn.Module, cond_fn) -> List[str]:
-            result = []
-            for name, module in model.named_modules():
-                if cond_fn(name, module):
-                    result.append(name)
-            return result
+        On a plain LLM this is just the keyword expansion (every linear / embedding / router). On a
+        multimodal model an ``all-*`` keyword must respect ``freeze_llm`` / ``freeze_vit`` /
+        ``freeze_aligner`` -- by default only the language model is adapted -- which is the megatron
+        counterpart of the transformers backend's ``get_multimodal_target_regex``. The tower partition is
+        read from the live model (``model_meta.visual_cls._vision_tower`` / ``_aligner``), never hardcoded,
+        so twinkle stays model-agnostic; the expanded names are full mcore module paths, filtered to the
+        unfrozen towers.
+        """
+        import torch
 
         def find_all_linears(model: torch.nn.Module) -> List[str]:
             from megatron.core.extensions.transformer_engine import (TEGroupedLinear, TELayerNormColumnParallelLinear,
@@ -2260,25 +2463,65 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
                     return True
                 return False
 
-            return find_layers(model, _cond)
+            return _find_layers(model, _cond)
 
         def find_router(model: torch.nn.Module) -> List[str]:
             from megatron.core.transformer.moe.router import TopKRouter
-            return find_layers(model, lambda name, module: isinstance(module, TopKRouter) and 'lora' not in name)
+            return _find_layers(model, lambda name, module: isinstance(module, TopKRouter) and 'lora' not in name)
 
-        def find_embedding(model: torch.nn.Module) -> List[str]:
-            from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
-            return find_layers(model,
-                               lambda name, module: isinstance(module, LanguageModelEmbedding) and 'lora' not in name)
+        keywords = ('all-linear', 'all-embedding', 'all-router')
+        # Names the caller spelled explicitly are kept verbatim; only the all-* keywords are expanded (and,
+        # on a multimodal model, filtered by tower).
+        explicit = [t for t in target_modules if t not in keywords]
+        expanded: List[str] = []
+        if 'all-linear' in target_modules:
+            expanded += find_all_linears(model)
+        if 'all-embedding' in target_modules:
+            expanded += _find_embedding(model)
+        if 'all-router' in target_modules:
+            expanded += find_router(model)
 
-        result = target_modules.copy()
-        if 'all-linear' in result:
-            result.remove('all-linear')
-            result += find_all_linears(model)
-        if 'all-embedding' in result:
-            result.remove('all-embedding')
-            result += find_embedding(model)
-        if 'all-router' in result:
-            result.remove('all-router')
-            result += find_router(model)
-        return list(set(result))
+        from twinkle.module.optimizer import resolve_megatron_tower_prefixes
+        tower_prefixes = resolve_megatron_tower_prefixes([model])
+        is_multimodal = bool(tower_prefixes['vision_tower'] or tower_prefixes['aligner'])
+        if is_multimodal and any(keyword in target_modules for keyword in keywords):
+            if freeze_llm and freeze_vit and freeze_aligner:
+                raise ValueError('freeze_llm / freeze_vit / freeze_aligner are all True, so a multimodal '
+                                 'LoRA has no tower left to adapt. Unfreeze at least one of them.')
+            frozen = {'language_model': freeze_llm, 'vision_tower': freeze_vit, 'aligner': freeze_aligner}
+            # Longest prefix first, so the aligner (nested under the vision tower, e.g. visual.visual.merger
+            # under visual.visual) is classified as the aligner rather than the vision tower -- the list
+            # form of legacy's rejected=aligner. A module in no tower is dropped: legacy only walks the
+            # declared towers, so anything outside them is not a LoRA target.
+            ranked = sorted(((prefix, role) for role, prefixes in tower_prefixes.items() for prefix in prefixes),
+                            key=lambda item: -len(item[0]))
+            kept = []
+            for name in expanded:
+                role = next((r for prefix, r in ranked if name.startswith(prefix)), None)
+                if role is not None and not frozen[role]:
+                    kept.append(name)
+            expanded = kept
+        return list(set(explicit + expanded))
+
+    @staticmethod
+    def get_modules_to_save(model: 'torch.nn.Module', modules_to_save: List[str]) -> List[str]:
+        """Expand the ``modules_to_save`` shorthands into concrete mcore module names.
+
+        Only ``'all-embedding'`` is expanded. ``'all-norm'`` is rejected rather than silently dropped:
+        mcore fuses the normalization into its linear layers (``TELayerNormColumnParallelLinear``), so
+        there is no standalone norm module to save and the shorthand has no meaning on this backend
+        (legacy megatron left the literal string in the list, which PEFT then ignored). Explicitly-named
+        modules are kept verbatim.
+        """
+        if 'all-norm' in modules_to_save:
+            raise ValueError(
+                "modules_to_save 'all-norm' is not supported on the megatron backend: mcore fuses the "
+                'normalization into its linear layers, so there is no standalone norm module to save. '
+                'List the concrete module names to save instead.')
+        if 'all-embedding' not in modules_to_save:
+            return list(modules_to_save)
+        explicit = [m for m in modules_to_save if m != 'all-embedding']
+        found = _find_embedding(model)
+        if not found:
+            logger.warning("modules_to_save 'all-embedding' matched no mcore embedding module; ignored.")
+        return list(dict.fromkeys(explicit + found))

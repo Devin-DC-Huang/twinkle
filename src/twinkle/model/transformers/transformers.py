@@ -38,7 +38,8 @@ from twinkle.model.micro_batch import MicroBatchConfig, plan_micro_batches, sele
 from twinkle.model.optimizer_group import BaseOptimizerGroup, TrainStatus
 from twinkle.model.transformers.moe import apply_expert_parallel
 from twinkle.model.transformers.strategy import AccelerateStrategy, DeepSpeedStrategy, NativeFSDPStrategy
-from twinkle.module.optimizer import (GaLoreConfig, MuonConfig, create_galore_param_groups, create_muon_param_groups)
+from twinkle.module.optimizer import (GaLoreConfig, MuonConfig, apply_param_groups_spec, create_galore_param_groups,
+                                      create_muon_param_groups, resolve_tower_prefixes)
 from twinkle.patch import Patch, apply_context, apply_patch
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
@@ -172,6 +173,7 @@ class OptimizerGroup(BaseOptimizerGroup):
     scaler_has_nan: bool = False
     checkpoint_engine: CheckpointEngine = None
     _handler: Any = None
+    acc_strategy: str = 'token'
 
     def __post_init__(self):
         self._ensure_dp_group()
@@ -180,14 +182,14 @@ class OptimizerGroup(BaseOptimizerGroup):
     def _build_metrics(self):
         train_metrics = [
             LossMetric(self._device_mesh, self._dp_group),
-            Accuracy(self._device_mesh, self._dp_group),
+            Accuracy(self._device_mesh, self._dp_group, strategy=self.acc_strategy),
             TrainMetric(self._device_mesh, self._dp_group),
         ]
         self.train_status = TrainStatus(metrics=train_metrics)
 
         eval_metrics = [
             LossMetric(self._device_mesh, self._dp_group),
-            Accuracy(self._device_mesh, self._dp_group),
+            Accuracy(self._device_mesh, self._dp_group, strategy=self.acc_strategy),
             TrainMetric(self._device_mesh, self._dp_group),
         ]
         self.eval_status = TrainStatus(metrics=eval_metrics)
@@ -324,6 +326,17 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             memory_efficient_init: bool = False,
             deepspeed_config: Dict[str, Any] = None,
             model_loader: Optional[ModelLoaderProtocol] = None,
+            gradient_checkpointing: bool = True,
+            gradient_checkpointing_kwargs: Optional[Dict[str, Any]] = None,
+            vit_gradient_checkpointing: Optional[bool] = None,
+            vit_gradient_checkpointing_kwargs: Optional[Dict[str, Any]] = None,
+            model_arch: Optional[Dict[str, Any]] = None,
+            neftune_noise_alpha: Optional[float] = None,
+            acc_strategy: str = 'token',
+            new_special_tokens: Optional[List[str]] = None,
+            init_strategy: Optional[str] = None,
+            use_liger_kernel: bool = False,
+            liger_kernel_config: Optional[Dict[str, Any]] = None,
             **kwargs):
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
         # Opt-out of the cuDNN SDPA backend (falls back to flash/mem-efficient, numerically
@@ -339,6 +352,11 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         self.mixed_precision = mixed_precision
         self._fsdp_config = dict(fsdp_config or {})
         self._ddp_config = ddp_config or {}
+        self._acc_strategy = acc_strategy
+        self.model_arch = dict(model_arch or {})
+        for _role in ('language_model', 'vision_tower', 'aligner'):
+            _value = self.model_arch.get(_role)
+            self.model_arch[_role] = [_value] if isinstance(_value, str) else list(_value or [])
         self._memory_efficient_init = memory_efficient_init
         self._router_replay_enabled = bool(kwargs.pop('enable_router_replay', False))
         self._router_replay_applied = False
@@ -388,7 +406,45 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         # applying runtime overrides such as ``attn_implementation``.  Keep Twinkle's
         # config reference aligned with the config that the model actually uses.
         self.hf_config = self.model.config
-        self.model.gradient_checkpointing_enable()
+        logger.info_once(
+            f'[TransformersModel] attn_implementation: requested={kwargs.get("attn_implementation")!r}, '
+            f'resolved={getattr(self.model.config, "_attn_implementation", None)!r}')
+        # Gated worker-side so the flag is honored under Ray too, where a driver-side post-construction
+        # reach into ``model.model`` only touches the proxy stub and silently no-ops.
+        if gradient_checkpointing:
+            self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gradient_checkpointing_kwargs)
+        vision_tower_names = self.model_arch.get('vision_tower')
+        if vit_gradient_checkpointing is not None and vision_tower_names:
+            from twinkle.utils import deep_getattr
+            for tower_name in vision_tower_names:
+                tower = deep_getattr(self.model, tower_name)
+                if tower is None:
+                    continue
+                try:
+                    if vit_gradient_checkpointing:
+                        if vit_gradient_checkpointing_kwargs:
+                            tower.gradient_checkpointing_enable(
+                                gradient_checkpointing_kwargs=vit_gradient_checkpointing_kwargs)
+                        else:
+                            tower.gradient_checkpointing_enable()
+                    else:
+                        tower.gradient_checkpointing_disable()
+                except (NotImplementedError, AttributeError, ValueError) as exc:
+                    logger.warning(f'vision-tower gradient checkpointing skipped for {tower_name}: {exc}')
+
+        if neftune_noise_alpha:
+            self._activate_neftune(neftune_noise_alpha)
+        # Post-load module surgery (Liger op kernels, token-vocab growth, weight re-init) is gated
+        # worker-side for the same reason as gradient_checkpointing above: under Ray the driver holds a
+        # proxy stub, so reaching into ``model.model`` there only mutates the stub and silently no-ops.
+        # All three run before the optimizer group is built so it sees the final parameters. The order
+        # mirrors the legacy post-construction sequence: kernelize, then grow the vocab, then re-init.
+        if use_liger_kernel:
+            self._apply_liger_kernel(liger_kernel_config)
+        if new_special_tokens:
+            self._apply_new_special_tokens(new_special_tokens)
+        if init_strategy is not None:
+            self._apply_init_strategy(init_strategy)
         self.sp_strategy = None
         self._model_wrapped = False
         self.optimizer_group: Dict[str, OptimizerGroup] = {
@@ -396,6 +452,119 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         }
         self.optimizer_group[_default_adapter_name].adapter_name = _default_adapter_name
         self.active_group = _default_adapter_name
+
+    def _activate_neftune(self, neftune_noise_alpha: float) -> None:
+        """Add NEFTune uniform noise to the embedding output during training only.
+
+        Mirrors ``transformers.integrations.neftune.neftune_post_forward_hook``: scale is
+        ``alpha / sqrt(seq_len * hidden)`` and the hook is a no-op when the module is in eval mode, so
+        validation and generation see clean embeddings. Registered on the input-embedding module object,
+        which a later LoRA/DDP wrap preserves (they wrap Linear layers / the top model, not this module).
+        """
+        embeddings = self.model.get_input_embeddings()
+        if embeddings is None:
+            logger.warning('neftune_noise_alpha is set but the model exposes no input embeddings; skipping NEFTune.')
+            return
+
+        def neftune_post_forward_hook(module, input, output):
+            if not module.training:
+                return output
+            dims = torch.tensor(output.size(1) * output.size(2))
+            mag_norm = neftune_noise_alpha / torch.sqrt(dims)
+            return output + torch.zeros_like(output).uniform_(-mag_norm, mag_norm)
+
+        embeddings.register_forward_hook(neftune_post_forward_hook)
+
+    def _apply_liger_kernel(self, liger_kernel_config: Optional[Dict[str, Any]] = None) -> None:
+        """Patch the HF module's per-layer ops with Liger kernels via the mapping-driven ``kernelize``.
+
+        ``liger_kernel_config`` (an ``{op: bool}`` dict) switches individual ops off on top of Liger's
+        default set; None keeps the default. ``kernelize`` mutates the module in place (class / forward
+        replacement), which is why it belongs at the end of construction, before the optimizer is built.
+        The fused-linear-CE op is deliberately not a target here -- it skips the lm_head GEMM rather than
+        swapping a layer, so it is a loss-path selection, not a kernelize op.
+        """
+        from twinkle.kernel import kernelize
+        kernelize(self.model, self._liger_kernel_mapping(liger_kernel_config))
+
+    @staticmethod
+    def _liger_kernel_mapping(liger_kernel_config: Optional[Dict[str, Any]]) -> Optional[dict]:
+        """DEFAULT_KERNEL_CONFIG minus any op the config switches off; None keeps the built-in default.
+
+        Returning None rather than a copy of the default matters: ``kernelize`` logs family-skips at DEBUG
+        on the default path but raises them to WARNING for any explicit mapping. 'fused_linear_cross_entropy'
+        is not a kernelize op, so it matches no DEFAULT_KERNEL_CONFIG entry and is ignored here (the loss
+        side consumes it instead).
+        """
+        if not liger_kernel_config:
+            return None
+        from twinkle.kernel.config import DEFAULT_KERNEL_CONFIG
+        disabled = {op for op, enabled in liger_kernel_config.items() if not enabled}
+        return {
+            target: choice
+            for target, choice in DEFAULT_KERNEL_CONFIG.items()
+            if getattr(choice, 'op', None) not in disabled
+        }
+
+    def _apply_new_special_tokens(self, new_special_tokens: List[str]) -> None:
+        """Grow the tokenizer's vocabulary with ``new_special_tokens`` and resize the embeddings to match.
+
+        ``new_special_tokens`` is an already-resolved token list -- any ``.txt`` file expansion happens on
+        the caller (driver) side, so only serializable strings cross the Ray boundary. The embedding is
+        resized to a multiple of 128, and only when tokens were actually added, leaving the checkpoint's
+        own vocab untouched otherwise. When no processor was loaded (the plain model_cls path) a tokenizer
+        is built from ``tokenizer_id`` and kept as the default so ``save`` writes a matching vocab.
+        """
+        processor = self._default_tokenizer
+        if processor is None:
+            from transformers import AutoTokenizer
+            processor = AutoTokenizer.from_pretrained(self.tokenizer_id, trust_remote_code=True)
+            self._default_tokenizer = processor
+        tokenizer = getattr(processor, 'tokenizer', processor)
+        added = tokenizer.add_special_tokens({'additional_special_tokens': list(new_special_tokens)})
+        if added:
+            vocab_size = ((len(tokenizer) + 127) // 128) * 128
+            self.model.resize_token_embeddings(vocab_size)
+
+    def _apply_init_strategy(self, init_strategy: str) -> None:
+        """Re-initialize the weights a blank / partially-loaded config left uninitialized.
+
+        Only parameters whose scale is non-finite or absurdly large (> 1e7) are touched, so a properly
+        loaded checkpoint is left intact -- this is the from-config init path, not a re-randomize of
+        pretrained weights. Runs on the real module (worker-side under Ray; see ``__init__``).
+        """
+        from torch import nn
+
+        def high_dim(param, init):
+            if param.dim() > 1:
+                init(param)
+            elif param.dim() == 1 and param.numel() > 0:
+                nn.init.zeros_(param)
+
+        initializers = {
+            'zero': nn.init.zeros_,
+            'uniform': lambda param: nn.init.uniform_(param, -0.1, 0.1),
+            'normal': lambda param: nn.init.normal_(param, 0.0, 0.01),
+            'xavier_uniform': lambda param: high_dim(param, nn.init.xavier_uniform_),
+            'xavier_normal': lambda param: high_dim(param, nn.init.xavier_normal_),
+            'kaiming_uniform': lambda param: high_dim(
+                param, lambda value: nn.init.kaiming_uniform_(value, mode='fan_out', nonlinearity='leaky_relu',
+                                                              a=0.1)),
+            'kaiming_normal': lambda param: high_dim(
+                param, lambda value: nn.init.kaiming_normal_(value, mode='fan_in', nonlinearity='relu')),
+            'orthogonal': lambda param: high_dim(param, nn.init.orthogonal_),
+        }
+        if init_strategy not in initializers:
+            raise ValueError(f'Unknown init_strategy={init_strategy!r}; expected one of {sorted(initializers)}.')
+        initialize = initializers[init_strategy]
+        with torch.no_grad():
+            for param in self.model.parameters():
+                if param.numel() == 0:
+                    continue
+                mean_abs = param.abs().mean()
+                std = param.std()
+                if not torch.isfinite(mean_abs) or not torch.isfinite(std) or mean_abs > 1e7 or std > 1e7:
+                    initialize(param)
 
     def _should_init_empty_pretrained_model_on_this_rank(self) -> bool:
         use_rank0_broadcast = getattr(self.strategy, 'use_rank0_pretrained_broadcast', lambda: False)
@@ -422,6 +591,12 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
     def _decide_strategy(self,
                          strategy: Literal['accelerate', 'native_fsdp', 'deepspeed'],
                          deepspeed_config: Dict[str, Any] = None):
+        if self.device_mesh is not None and self.device_mesh.pp_world_size > 1:
+            raise ValueError(
+                f'The transformers backend has no pipeline-parallel runtime (pp_world_size='
+                f'{self.device_mesh.pp_world_size}): its strategies wire dp/fsdp/tp/cp/sp only, and transformers '
+                '5.x ships pp_plan as a declaration layer with no training scheduler. Run pp>1 with '
+                '--backend megatron.')
         self._expert_parallel_config = self._fsdp_config.pop('expert_parallel', None)
         self._enable_expert_parallel = self._should_enable_expert_parallel(self._expert_parallel_config,
                                                                            self.device_mesh)
@@ -636,6 +811,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             template=Template(self.tokenizer_id),
             processor=InputProcessor(self.device_mesh),
             _device_mesh=self.device_mesh,
+            acc_strategy=self._acc_strategy,
         )
 
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
@@ -1511,6 +1687,11 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
                 adapter_name: Lora adapter name.
                 lr: Learning rate
                 weight_decay: Weight decay
+                param_groups_spec: An ordered list of backend-neutral grouping rules (first match wins)
+                    that split the decay / no-decay param groups into per-rule sub-groups with their own
+                    lr / weight_decay -- e.g. per-tower learning rates or LoRA+. Matched here on the
+                    worker against the real parameters (see `twinkle.module.optimizer.param_groups`), so
+                    the driver only ships data. Applied before galore_config / muon_config reshaping.
                 galore_config: A `GaLoreConfig` or a dict of its fields, enabling GaLore low-rank gradient
                     projection on the matched param groups. Only takes effect for the GaLore optimizers.
                 muon_config: A `MuonConfig` or a dict of its fields, marking which param groups take the
@@ -1526,6 +1707,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         optimizer_config = self.optimizer_group[adapter_name]
         galore_config = kwargs.pop('galore_config', None)
         muon_config = kwargs.pop('muon_config', None)
+        param_groups_spec = kwargs.pop('param_groups_spec', None)
         if isinstance(optimizer_cls, Optimizer):
             optimizer_config.optimizer = optimizer_cls
             return
@@ -1535,6 +1717,15 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             lr = kwargs.get('lr', DEFAULT_LEARNING_RATE)
             weight_decay = kwargs.get('weight_decay', DEFAULT_WEIGHT_DECAY)
             params = self._create_param_group(adapter_name, lr=lr, weight_decay=weight_decay)
+        if param_groups_spec:
+            # Split the decay / no-decay groups by the spec before GaLore / Muon reshape them, so a
+            # per-tower lr or LoRA+ rule owns its parameters first. tower_prefixes come from the threaded
+            # ModelArch; the match itself runs here on the worker against the real (unwrapped) parameters.
+            params = apply_param_groups_spec(
+                params,
+                param_groups_spec,
+                model=self.strategy.unwrap_model(self.model),
+                tower_prefixes=resolve_tower_prefixes(self.model_arch))
         if galore_config is not None:
             if isinstance(galore_config, dict):
                 galore_config = GaLoreConfig(**galore_config)
@@ -1587,6 +1778,16 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
     @remote_function()
     def apply_patch(self, patch_cls: Union[Patch, Type[Patch], str], **kwargs):
         apply_patch(self.model, patch_cls, **kwargs)
+
+    @remote_function(dispatch='all')
+    def empty_cache(self, **kwargs):
+        """Release the caching allocator's unused blocks on every worker.
+
+        dispatch='all' because each rank holds its own device memory; the driver only orchestrates (in
+        Ray mode it may not even hold a GPU), so the release has to run where the tensors live. Backend
+        -agnostic through torch_util (cuda/npu).
+        """
+        torch_util.empty_cache()
 
     def __del__(self):
         HubOperation.wait_for()
@@ -1969,6 +2170,9 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
 
     def _patch_adapter(self, adapter_name: str, config_or_dir: Union[PeftConfig, str], **kwargs):
         assert adapter_name, 'Use a different adapter_name, current is empty.'
+        freeze_llm = kwargs.pop('freeze_llm', False)
+        freeze_vit = kwargs.pop('freeze_vit', True)
+        freeze_aligner = kwargs.pop('freeze_aligner', True)
         unwrapped_model = self.strategy.unwrap_model(self.model)
         if not isinstance(config_or_dir, str):
             config_or_dir = self.strategy.prepare_adapter_config(
@@ -1994,6 +2198,13 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             config = _adapted_model.peft_config
         else:
             config = config_or_dir
+            self._expand_multimodal_lora_target(
+                config,
+                unwrapped_model,
+                freeze_llm=freeze_llm,
+                freeze_vit=freeze_vit,
+                freeze_aligner=freeze_aligner)
+            self._expand_modules_to_save(config, unwrapped_model)
             if not isinstance(unwrapped_model, PeftModel):
                 assert unwrapped_model is self.model, 'Cannot wrap model with peft after DDP/FSDP!'
                 self.model = get_peft_model(unwrapped_model, config, adapter_name=adapter_name)
@@ -2008,6 +2219,74 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         self.optimizer_group[adapter_name].gradient_accumulation_steps = _gas_default
         self._default_tokenizer = self.optimizer_group[adapter_name].template.processor
         self.active_group = adapter_name
+
+    def _expand_multimodal_lora_target(self, config, model, *, freeze_llm: bool, freeze_vit: bool,
+                                       freeze_aligner: bool) -> None:
+        """Rewrite a multimodal ``'all-linear'`` LoRA target into the freeze_*-aware regex, in place.
+
+        PEFT expands ``'all-linear'`` to every linear in the model, which on a multimodal model would
+        also adapt the vision tower and the aligner -- but legacy swift targets only the *unfrozen*
+        towers (by default the language model alone), and that partition is what ``freeze_*`` express.
+        The expansion needs the real modules, so it runs here on the worker, not on the driver's PROXY.
+
+        Left untouched (so PEFT's own behaviour stands) when the target is not ``'all-linear'`` -- an
+        explicit user regex or name list is respected verbatim -- or when ``model_arch`` declares no
+        vision tower / aligner, i.e. a plain LLM where ``'all-linear'`` already means the right thing.
+        """
+        target = getattr(config, 'target_modules', None)
+        is_all_linear = target == 'all-linear' or (isinstance(target, (list, tuple, set)) and 'all-linear' in target)
+        if not is_all_linear:
+            return
+        if not (self.model_arch.get('vision_tower') or self.model_arch.get('aligner')):
+            return
+        from twinkle.model.transformers.target_modules import get_multimodal_target_regex
+        # Walk the base model: target prefixes in model_arch are base-relative, and when an adapter is
+        # added to an already-peft model the towers live under the wrapped base, not the PeftModel.
+        base_model = model
+        while isinstance(base_model, PeftModel):
+            base_model = base_model.get_base_model()
+        include_embedding = isinstance(target, (list, tuple, set)) and 'all-embedding' in target
+        config.target_modules = get_multimodal_target_regex(
+            base_model,
+            self.model_arch,
+            freeze_llm=freeze_llm,
+            freeze_vit=freeze_vit,
+            freeze_aligner=freeze_aligner,
+            include_embedding=include_embedding)
+
+    def _expand_modules_to_save(self, config, model) -> None:
+        """Expand the ``'all-norm'`` / ``'all-embedding'`` shorthands in ``modules_to_save``, in place.
+
+        PEFT keeps ``modules_to_save`` entries as full-precision trainable copies and matches each by
+        ``name.endswith(entry)`` -- a shorthand like ``'all-norm'`` matches no module and is silently
+        ignored (``_set_trainable``, ``strict_module_check=False``), so it has to be resolved to concrete
+        module names here first. The expansion needs the real modules, so it runs on the worker, not the
+        driver's PROXY -- the same reason the ``'all-linear'`` target expansion lives here. Unlike that
+        target expansion, ``modules_to_save`` is NOT tower / freeze filtered: every norm / embedding the
+        shorthand names is saved, regardless of which towers are LoRA-adapted (legacy does the same).
+        """
+        modules_to_save = getattr(config, 'modules_to_save', None)
+        if not modules_to_save:
+            return
+        shorthands = ('all-norm', 'all-embedding')
+        if not any(name in shorthands for name in modules_to_save):
+            return
+        from twinkle.model.transformers.target_modules import find_embedding, find_norm
+        # Walk to the base model: when an adapter is added to an already-peft model the real modules
+        # live under the wrapped base, not the PeftModel.
+        base_model = model
+        while isinstance(base_model, PeftModel):
+            base_model = base_model.get_base_model()
+        expanded = [name for name in modules_to_save if name not in shorthands]
+        for shorthand, finder in (('all-embedding', find_embedding), ('all-norm', find_norm)):
+            if shorthand not in modules_to_save:
+                continue
+            found = finder(base_model)
+            if not found:
+                logger.warning(f'modules_to_save {shorthand!r} matched no module on this model; ignored.')
+            expanded += found
+        # de-dup while preserving order (a shorthand may overlap an explicitly-named module).
+        config.modules_to_save = list(dict.fromkeys(expanded))
 
     @remote_function()
     def add_adapter_to_model(self, adapter_name: str, config_or_dir: Union[PeftConfig, str], **kwargs):
