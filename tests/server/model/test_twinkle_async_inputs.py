@@ -154,14 +154,20 @@ async def test_forward_backward_binds_nested_dpo_ref_logps_without_coercion() ->
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('is_sampler', [False, True], ids=['training', 'sampler'])
+@pytest.mark.parametrize('is_sampler,save_optimizer', [(False, False), (True, True)],
+                         ids=['training-no-optimizer', 'sampler-with-optimizer'])
 @pytest.mark.parametrize('full_mode', [False, True], ids=['lora', 'full-model'])
-async def test_save_retains_names_and_forwards_backend_kwargs(monkeypatch, tmp_path, is_sampler, full_mode):
+async def test_save_forwards_backend_options_and_returns_public_path(
+        monkeypatch, tmp_path, is_sampler, save_optimizer, full_mode):
     from pathlib import Path
     from twinkle.server.checkpoint.twinkle import TwinkleCheckpointManager, TwinkleTrainingRunManager
+    from twinkle.server.model.app import ModelManagement
     import twinkle.server.model.twinkle_handlers as handlers
 
     class Management(_SchedulingManagement):
+        is_full_mode = ModelManagement.is_full_mode
+        resolve_model_adapter_name = ModelManagement.resolve_model_adapter_name
+
         def save(self, name, output_dir, **kwargs):
             path = Path(output_dir) / name
             path.mkdir(parents=True, exist_ok=True)
@@ -175,32 +181,23 @@ async def test_save_retains_names_and_forwards_backend_kwargs(monkeypatch, tmp_p
     manager = TwinkleCheckpointManager('token', runs)
     monkeypatch.setattr(handlers, 'create_checkpoint_manager', lambda *args, **kwargs: manager)
     service = Management()
-    if full_mode:
-        service.resolve_model_adapter_name = lambda name: ''
+    service.train_mode = 'full' if full_mode else 'lora'
     app = FastAPI()
     _register_model_twinkle_routes(app, lambda: service)
     endpoint = next(r.endpoint for r in app.routes if getattr(r, 'path', '') == '/twinkle/save')
     request = Request({'type': 'http', 'headers': []})
     request.state.session_id = 'session'
 
-    async def save(name):
-        body = types.SaveRequest(adapter_name='adapter', name=name, is_sampler=is_sampler,
-                                 save_optimizer=True, consumed_train_samples=7)
-        return await endpoint(request, body, service)
-
-    x, y, live = await save('x'), await save('y'), await save(None)
-    x_dir = Path(x.result['checkpoint_dir'])
+    body = types.SaveRequest(adapter_name='adapter', name='step/one', is_sampler=is_sampler,
+                             save_optimizer=save_optimizer, consumed_train_samples=7)
+    response = await endpoint(request, body, service)
     weights_type = 'sampler_weights' if is_sampler else 'weights'
-    assert x.result['twinkle_path'].endswith(f'/{weights_type}/x')
-    assert (x_dir / 'weights').read_text() == '1'
-    assert Path(y.result['checkpoint_dir'], 'weights').read_text() == '2'
-    if is_sampler:
-        assert Path(live.result['checkpoint_dir']).name == 'latest'
-    overwritten = await save('x')
-    assert overwritten.result['twinkle_path'] == x.result['twinkle_path']
-    assert (x_dir / 'weights').read_text() == '4'
-    assert service.model_calls[-1][1] == {'adapter_name': '' if full_mode else 'session-adapter',
-                                        'save_optimizer': True, 'consumed_train_samples': 7}
+    directory = manager.get_ckpt_dir('session-adapter', f'{weights_type}/step_one')
+    assert response.result == {'twinkle_path': f'twinkle://session-adapter/{weights_type}/step_one',
+                               'checkpoint_dir': str(directory)}
+    assert (directory / 'weights').read_text() == '1'
+    assert service.model_calls == [('step_one', {'adapter_name': '' if full_mode else 'session-adapter',
+                                                'save_optimizer': save_optimizer, 'consumed_train_samples': 7})]
 
 
 @pytest.mark.asyncio

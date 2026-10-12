@@ -4,18 +4,17 @@ from pathlib import Path
 
 import pytest
 
+from twinkle.server.checkpoint import create_checkpoint_manager
 from twinkle.server.checkpoint.tinker import TinkerCheckpointManager, TinkerTrainingRunManager
-from twinkle.server.checkpoint.twinkle import TwinkleCheckpointManager, TwinkleTrainingRunManager
+from twinkle.server.checkpoint.twinkle import TwinkleCheckpointManager
 
 
-@pytest.fixture(params=[(TinkerTrainingRunManager, TinkerCheckpointManager),
-                        (TwinkleTrainingRunManager, TwinkleCheckpointManager)], ids=['tinker', 'twinkle'])
+@pytest.fixture
 def manager(request, monkeypatch, tmp_path):
     monkeypatch.setattr('twinkle.server.checkpoint.training_run_manager.TWINKLE_DEFAULT_SAVE_DIR', str(tmp_path))
-    run_cls, ckpt_cls = request.param
-    runs = run_cls('test-token')
-    runs._write_info('run', {'base_model': 'test-model', 'is_lora': True})
-    return ckpt_cls('test-token', runs)
+    manager = create_checkpoint_manager('test-token', client_type=getattr(request, 'param', 'twinkle'))
+    manager.training_run_manager._write_info('run', {'base_model': 'test-model', 'is_lora': True})
+    return manager
 
 
 def _writer(value, fail=False):
@@ -23,7 +22,6 @@ def _writer(value, fail=False):
         checkpoint = Path(output_dir) / name
         checkpoint.mkdir(parents=True, exist_ok=True)
         (checkpoint / 'weights').write_text(value)
-        await asyncio.sleep(.01)
         if fail:
             raise RuntimeError('injected save failure')
         return str(checkpoint)
@@ -31,6 +29,7 @@ def _writer(value, fail=False):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('manager', ['tinker', 'twinkle'], indirect=True)
 async def test_named_and_live_versions_have_separate_lifetimes(manager):
     first, first_dir = await manager.save_sampler('run', 'x', _writer('x'))
     second, _ = await manager.save_sampler('run', 'y', _writer('y'))
@@ -53,6 +52,7 @@ async def test_named_and_live_versions_have_separate_lifetimes(manager):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('manager', ['tinker', 'twinkle'], indirect=True)
 async def test_overwrite_keeps_uri_but_changes_backend_path(manager):
     uri, directory = await manager.save_sampler('run', 'x', _writer('first'))
     previous = Path(manager.parse_adapter_uri(uri)[1])
@@ -73,6 +73,7 @@ async def test_same_model_saves_are_serialized(manager):
         nonlocal active, max_active
         active += 1
         max_active = max(max_active, active)
+        await asyncio.sleep(0)
         await _writer('same')(name, output_dir)
         active -= 1
     other_cls = TwinkleCheckpointManager if isinstance(manager, TinkerCheckpointManager) else TinkerCheckpointManager
@@ -83,8 +84,18 @@ async def test_same_model_saves_are_serialized(manager):
 
 
 @pytest.mark.asyncio
-async def test_cancelling_lock_waiter_does_not_block_following_saves(manager):
-    started, finish = asyncio.Event(), asyncio.Event()
+async def test_cancelling_lock_waiter_does_not_block_following_saves(manager, monkeypatch):
+    import twinkle.server.checkpoint.checkpoint_manager as module
+    started, finish, waiting_for_lock = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    acquire = module.acquire_lock
+
+    def observe_acquire(lock, blocking=False):
+        acquired = acquire(lock, blocking=blocking)
+        if not acquired:
+            waiting_for_lock.set()
+        return acquired
+
+    monkeypatch.setattr(module, 'acquire_lock', observe_acquire)
 
     async def held_save(name, output_dir):
         started.set()
@@ -95,7 +106,7 @@ async def test_cancelling_lock_waiter_does_not_block_following_saves(manager):
     await started.wait()
     waiting = asyncio.create_task(manager.save_sampler('run', 'x', _writer('cancelled')))
     try:
-        await asyncio.sleep(.06)
+        await asyncio.wait_for(waiting_for_lock.wait(), timeout=2)
         assert not waiting.done()
         waiting.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -108,6 +119,7 @@ async def test_cancelling_lock_waiter_does_not_block_following_saves(manager):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('manager', ['tinker', 'twinkle'], indirect=True)
 async def test_legacy_latest_and_alias_remain_readable(manager):
     latest = Path(manager.get_save_dir('run', is_sampler=True)) / 'latest'
     latest.mkdir(parents=True)
@@ -276,8 +288,8 @@ async def test_missing_backend_weights_does_not_publish_checkpoint(manager):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('manager', ['tinker', 'twinkle'], indirect=True)
 async def test_training_and_sampler_checkpoints_can_be_read_and_deleted_by_other_dialect(manager):
-    from twinkle.server.checkpoint import create_checkpoint_manager
     manager.training_run_manager.update('run', {
         'training_run_id': 'run', 'model_owner': manager.token, 'last_request_time': '2026-10-11T00:00:00'})
     training_uri, training_dir = await manager.save_training('run', 'step', _writer('training'))
@@ -308,6 +320,7 @@ async def test_training_and_sampler_checkpoints_can_be_read_and_deleted_by_other
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('manager', ['tinker', 'twinkle'], indirect=True)
 async def test_load_and_resume_use_public_directory_while_sampler_cache_uses_version(manager):
     uri, public_directory = await manager.save_sampler('run', 'sample', _writer('sampler'))
     load = manager.resolve_load_path(uri)
@@ -331,7 +344,8 @@ def test_external_load_paths_are_preserved(manager, path):
 
 
 @pytest.mark.asyncio
-async def test_same_uri_uses_new_weights_with_unchanged_vllm_cache(manager):
+async def test_overwrite_invalidates_existing_vllm_path_cache(manager):
+    """Exercise the real cache method with file-backed adapter loading, not GPU generation."""
     from types import SimpleNamespace
     from twinkle.sampler.vllm_sampler.vllm_engine import VLLMEngine
     engine = VLLMEngine.__new__(VLLMEngine)
@@ -347,16 +361,16 @@ async def test_same_uri_uses_new_weights_with_unchanged_vllm_cache(manager):
     engine._load_lora = load
     uri, _ = await manager.save_sampler('run', 'x', _writer('first'))
 
-    async def sample():
+    async def cached_adapter():
         return await engine._get_or_load_lora(manager.parse_adapter_uri(uri)[1])
 
-    first = await sample()
-    assert await sample() is first
+    first = await cached_adapter()
+    assert await cached_adapter() is first
     after, _ = await manager.save_sampler('run', 'x', _writer('second'))
     assert after == uri
-    second = await sample()
+    second = await cached_adapter()
     assert first.weights == 'first' and second.weights == 'second'
-    assert await sample() is second and len(loaded) == 2
+    assert await cached_adapter() is second and len(loaded) == 2
 
 
 @pytest.mark.asyncio
@@ -398,25 +412,11 @@ async def test_sampler_update_does_not_rewrite_existing_save_dir_pointer(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_reserved_sampler_name_is_a_user_failure_in_queue(manager):
-    from tests.server.utils.test_task_queue_mixin import _DummyQueue
-    queue = _DummyQueue()
-    queue.enable_compute_worker()
-
-    async def save():
-        return await manager.save_sampler('run', 'latest', _writer('unused'))
-
-    try:
-        await queue.schedule_task(save, model_id='run', token='test-token')
-        for _ in range(100):
-            failures = [kwargs['failure'] for args, kwargs in queue.state.records if args[1] == 'failed']
-            if failures:
-                break
-            await asyncio.sleep(0)
-        failure = failures[-1]
-        assert failure.reason_code == 'request_rejected'
-        assert failure.attribution == 'user'
-        assert failure.diagnostic is None
-        assert not Path(manager.get_save_dir('run', is_sampler=True)).exists()
-    finally:
-        await queue._compute_worker.stop()
+async def test_reserved_sampler_name_is_rejected_before_backend_or_file_io(manager):
+    from unittest.mock import AsyncMock
+    from twinkle.server.task_queue.types import UserTaskError
+    save = AsyncMock()
+    with pytest.raises(UserTaskError, match='reserved'):
+        await manager.save_sampler('run', 'latest', save)
+    save.assert_not_awaited()
+    assert not Path(manager.get_save_dir('run', is_sampler=True)).exists()

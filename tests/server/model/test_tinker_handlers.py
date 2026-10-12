@@ -3,8 +3,9 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.requests import Request
 from tinker import types
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock
 
+from twinkle.server.model.app import ModelManagement
 from twinkle.server.model.tinker_handlers import _register_model_tinker_routes
 from twinkle.server.deployment import twinkle_server_error_handler
 from twinkle.server.exceptions import BatchSizeError, TwinkleServerError
@@ -185,7 +186,8 @@ def test_tinker_rejects_mixed_dpo_and_rl_before_enqueue():
 class _SaveWeightsDummyManagement:
     """Dummy management that actually executes the task to test save_weights_for_sampler logic."""
 
-    is_full_mode = False
+    train_mode = 'lora'
+    is_full_mode = ModelManagement.is_full_mode
 
     def __init__(self):
         self.model = MagicMock()
@@ -199,8 +201,7 @@ class _SaveWeightsDummyManagement:
     def get_adapter_name(self, adapter_name=None):
         return adapter_name
 
-    def resolve_model_adapter_name(self, adapter_name):
-        return adapter_name
+    resolve_model_adapter_name = ModelManagement.resolve_model_adapter_name
 
     def assert_resource_exists(self, adapter_name):
         pass
@@ -213,8 +214,8 @@ class _SaveWeightsDummyManagement:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('fail_backend', [False, True])
-@pytest.mark.parametrize('full_mode', [False, True], ids=['lora', 'full-model'])
+@pytest.mark.parametrize('full_mode,fail_backend', [(False, False), (True, False), (False, True)],
+                         ids=['lora', 'full-model', 'backend-failure'])
 async def test_training_save_records_metadata_only_after_backend_success(monkeypatch, tmp_path, fail_backend, full_mode):
     from pathlib import Path
     import twinkle.server.model.tinker_handlers as handlers
@@ -226,8 +227,7 @@ async def test_training_save_records_metadata_only_after_backend_success(monkeyp
     manager = TinkerCheckpointManager('token1', runs)
     monkeypatch.setattr(handlers, 'create_checkpoint_manager', lambda *args, **kwargs: manager)
     management = _SaveWeightsDummyManagement()
-    if full_mode:
-        management.resolve_model_adapter_name = lambda name: ''
+    management.train_mode = 'full' if full_mode else 'lora'
 
     def save(name, output_dir, **kwargs):
         assert not manager.list_checkpoints('model1').checkpoints
@@ -316,59 +316,39 @@ async def test_tinker_loss_metric_survives_sdk_reduction(backward):
 
 
 @pytest.mark.asyncio
-@patch('twinkle.server.model.tinker_handlers.create_checkpoint_manager')
-async def test_save_weights_for_sampler_path_mode_returns_path(mock_create_ckpt_mgr):
-    """save_weights_for_sampler(name) mode: sampling_session_seq_id is None → returns path != None."""
-    mock_ckpt_mgr = MagicMock()
-    mock_ckpt_mgr.get_ckpt_name.return_value = 'step-1'
-    mock_ckpt_mgr.get_save_dir.return_value = '/tmp/save_dir'
-    mock_ckpt_mgr.save_sampler = AsyncMock(return_value=(
-        'twinkle://model1/sampler_weights/step-1', '/tmp/save_dir/step-1'))
-    mock_create_ckpt_mgr.return_value = mock_ckpt_mgr
-
+@pytest.mark.parametrize('name,sequence_id', [('step-1', None), (None, 0)], ids=['path', 'session'])
+@pytest.mark.parametrize('full_mode', [False, True], ids=['lora', 'full-model'])
+async def test_sampler_save_materializes_weights_and_returns_sdk_mode(monkeypatch, tmp_path, name, sequence_id, full_mode):
+    from pathlib import Path
+    from twinkle.server.checkpoint import create_checkpoint_manager
+    import twinkle.server.model.tinker_handlers as handlers
+    monkeypatch.setattr('twinkle.server.checkpoint.training_run_manager.TWINKLE_DEFAULT_SAVE_DIR', str(tmp_path))
+    manager = create_checkpoint_manager('token1', client_type='tinker')
+    manager.training_run_manager._write_info('model1', {'base_model': 'test-model'})
+    monkeypatch.setattr(handlers, 'create_checkpoint_manager', lambda *args, **kwargs: manager)
     management = _SaveWeightsDummyManagement()
+    management.train_mode = 'full' if full_mode else 'lora'
+
+    def save(name, output_dir, **kwargs):
+        directory = Path(output_dir) / name
+        directory.mkdir(parents=True)
+        (directory / 'weights').write_text('sampler')
+
+    management.model.save.side_effect = save
     app = FastAPI()
     _register_model_tinker_routes(app, lambda: management)
-
-    body = types.SaveWeightsForSamplerRequest(
-        model_id='model1',
-        path='step-1',
-        sampling_session_seq_id=None,  # path mode
-    )
-
+    body = types.SaveWeightsForSamplerRequest(model_id='model1', path=name, sampling_session_seq_id=sequence_id)
     route = next(route for route in app.routes if getattr(route, 'path', None) == '/tinker/save_weights_for_sampler')
-    request = Request({'type': 'http', 'headers': []})
-    response = await route.endpoint(request, body, management)
-
-    assert response.path == 'twinkle://model1/sampler_weights/step-1'
-    assert mock_ckpt_mgr.save_sampler.await_args.args[:2] == ('model1', 'step-1')
+    response = await route.endpoint(Request({'type': 'http', 'headers': []}), body, management)
+    management.model.save.assert_called_once_with(
+        name=name or 'latest', output_dir=ANY, adapter_name='' if full_mode else 'model1', save_optimizer=False)
+    management.state.create_sampling_session.assert_awaited_once()
+    payload = management.state.create_sampling_session.call_args.args[0]
+    uri = payload['model_path']
+    assert payload == {**body.model_dump(), 'model_path': uri, 'base_model': 'test-model'}
+    checkpoint_id = manager.parse_path(uri).checkpoint_id
+    assert Path(manager.get_ckpt_dir('model1', checkpoint_id), 'weights').read_text() == 'sampler'
+    assert response.path == (uri if sequence_id is None else None)
+    if name:
+        assert uri == 'twinkle://model1/sampler_weights/step-1'
     assert response.sampling_session_id == 'session-123'
-
-
-@pytest.mark.asyncio
-@patch('twinkle.server.model.tinker_handlers.create_checkpoint_manager')
-async def test_save_weights_for_sampler_session_mode_returns_none_path(mock_create_ckpt_mgr):
-    """save_weights_and_get_sampling_client() mode: sampling_session_seq_id is set → returns path == None."""
-    mock_ckpt_mgr = MagicMock()
-    mock_ckpt_mgr.get_ckpt_name.return_value = 'step-1'
-    mock_ckpt_mgr.get_save_dir.return_value = '/tmp/save_dir'
-    mock_ckpt_mgr.save_sampler = AsyncMock(return_value=(
-        'twinkle://model1/sampler_weights/live_test', '/tmp/save_dir/latest'))
-    mock_create_ckpt_mgr.return_value = mock_ckpt_mgr
-
-    management = _SaveWeightsDummyManagement()
-    app = FastAPI()
-    _register_model_tinker_routes(app, lambda: management)
-
-    body = types.SaveWeightsForSamplerRequest(
-        model_id='model1',
-        sampling_session_seq_id=0,  # session mode
-    )
-
-    route = next(route for route in app.routes if getattr(route, 'path', None) == '/tinker/save_weights_for_sampler')
-    request = Request({'type': 'http', 'headers': []})
-    response = await route.endpoint(request, body, management)
-
-    assert response.path is None
-    assert response.sampling_session_id == 'session-123'
-    assert mock_ckpt_mgr.save_sampler.await_args.args[:2] == ('model1', None)
