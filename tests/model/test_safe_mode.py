@@ -123,15 +123,15 @@ def test_internal_processing_keeps_public_safety_checks(cpu_model):
 
     group.processor.process_pipeline = [pipeline]
     with pytest.raises(ValueError, match='Callable or Type'):
-        group.processor._process(_features(), model=lambda: None)
+        group.processor.process_local(_features(), model=lambda: None)
 
 
 def test_local_call_rejects_remote_handle(cpu_model):
     _, group = cpu_model()
     group.processor._actors = []
     with pytest.raises(ValueError, match='remote handle'):
-        group.processor._process(_features())
+        group.processor.process_local(_features())
 
 
 def test_internal_processor_entry_is_not_exported():
-    assert not hasattr(InputProcessor._process, '_execute')
+    assert not hasattr(InputProcessor.process_local, '_execute')

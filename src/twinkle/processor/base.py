@@ -86,11 +86,15 @@ class InputProcessor:
     @remote_function()
     def __call__(self, inputs: Union[InputFeature, List[InputFeature]],
                  **kwargs) -> Union[InputFeature, List[InputFeature]]:
-        return self._process(inputs, **kwargs)
+        return self.process_local(inputs, **kwargs)
 
-    def _process(self, inputs: Union[InputFeature, List[InputFeature]],
-                 **kwargs) -> Union[InputFeature, List[InputFeature]]:
-        """Process worker-owned inputs without remote dispatch."""
+    def process_local(self, inputs: Union[InputFeature, List[InputFeature]],
+                      **kwargs) -> Union[InputFeature, List[InputFeature]]:
+        """Process inputs on this worker without remote dispatch.
+
+        Use this for worker-owned inputs such as the model passed by Transformers.
+        This method is not remotely exported; use ``__call__`` for remote calls.
+        """
         if hasattr(self, '_actors'):
             raise ValueError('Local processing requires a worker-owned object, not a remote handle.')
         for pipe in self.process_pipeline:
