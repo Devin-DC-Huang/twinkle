@@ -31,13 +31,10 @@ class BaseFileManager:
 
 
 class BaseTrainingRunManager(BaseFileManager, ABC):
-    """
-    Abstract base class for managing training run metadata.
+    """Token-scoped run storage shared by both client protocols.
 
-    Subclasses must implement:
-    - train_run_info_filename property
-    - _create_training_run method
-    - _training_runs_response_cls property
+    Concrete managers construct and parse protocol models. This class locates
+    runs (including custom save-dir pointers), writes JSON and paginates results.
     """
 
     def __init__(self, token: str):
@@ -260,12 +257,10 @@ class BaseTrainingRunManager(BaseFileManager, ABC):
         return self._parse_training_run(data)
 
     def update(self, model_id: str, updates: dict[str, Any]):
-        """
-        Update training run metadata.
+        """Merge fields and atomically replace the run metadata.
 
-        Args:
-            model_id: The model identifier
-            updates: Dictionary of fields to update
+        Ordinary updates keep the existing save-dir pointer; relocation delegates
+        to _write_info to update both the destination and pointer.
         """
         info = self._read_info(model_id)
         if info:
