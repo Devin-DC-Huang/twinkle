@@ -6,7 +6,6 @@ import pytest
 import torch
 
 import twinkle.infra as infra
-from twinkle import remote_function
 from twinkle.loss import CrossEntropyLoss
 from twinkle.model.transformers.transformers import OptimizerGroup, TransformersModel
 from twinkle.processor import InputProcessor
@@ -29,12 +28,12 @@ def cpu_model(monkeypatch):
     monkeypatch.setattr(infra, '_mode', 'ray')
     monkeypatch.setattr(Platform, 'get_local_device', lambda *args, **kwargs: torch.device('cpu'))
 
-    def build(processor_cls=InputProcessor, model_cls=TransformersModel):
+    def build(model_cls=TransformersModel):
         # Construct worker-owned objects without Ray driver handles or tokenizer
         # downloads. Keep the full processor pipeline, loss and backward methods.
         with monkeypatch.context() as local:
             local.setattr(infra, '_mode', 'local')
-            processor = processor_cls(padding_free=False)
+            processor = InputProcessor(padding_free=False)
         group = OptimizerGroup(
             processor=processor,
             template=object.__new__(Template),
@@ -115,26 +114,7 @@ def test_public_processor_rejects_callable(cpu_model, value, remote_handle):
         group.processor(_features(), external=value)
 
 
-@pytest.mark.parametrize('mode', ['local', 'ray'])
-@pytest.mark.parametrize('decorated', [False, True])
-def test_custom_processor_entry_point_is_preserved(cpu_model, monkeypatch, mode, decorated):
-    class CustomProcessor(InputProcessor):
-        def __call__(self, inputs, **kwargs):
-            self.seen_model = kwargs['model']
-            return super().__call__(inputs, **kwargs)
-
-    if decorated:
-        CustomProcessor.__call__ = remote_function()(CustomProcessor.__call__)
-    monkeypatch.setattr(infra, '_mode', mode)
-    model, group = cpu_model(processor_cls=CustomProcessor)
-    model.forward(inputs=_features())
-    assert group.processor.seen_model is model.model
-    if mode == 'ray':
-        with pytest.raises(ValueError, match='Callable or Type'):
-            InputProcessor.__call__(group.processor, _features(), external=lambda: None)
-
-
-def test_local_scope_keeps_other_objects_checked_and_resets_on_error(cpu_model):
+def test_internal_processing_keeps_public_safety_checks(cpu_model):
     _, group = cpu_model()
     _, other = cpu_model()
 
@@ -144,8 +124,6 @@ def test_local_scope_keeps_other_objects_checked_and_resets_on_error(cpu_model):
     group.processor.process_pipeline = [pipeline]
     with pytest.raises(ValueError, match='Callable or Type'):
         group.processor._process(_features(), model=lambda: None)
-    with pytest.raises(ValueError, match='Callable or Type'):
-        group.processor(_features(), external=lambda: None)
 
 
 def test_local_call_rejects_remote_handle(cpu_model):

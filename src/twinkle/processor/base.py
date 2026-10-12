@@ -86,15 +86,16 @@ class InputProcessor:
     @remote_function()
     def __call__(self, inputs: Union[InputFeature, List[InputFeature]],
                  **kwargs) -> Union[InputFeature, List[InputFeature]]:
-        for pipe in self.process_pipeline:
-            inputs = pipe(inputs, **kwargs)
-        return inputs
+        return self._process(inputs, **kwargs)
 
     def _process(self, inputs: Union[InputFeature, List[InputFeature]],
                  **kwargs) -> Union[InputFeature, List[InputFeature]]:
-        """Preserve custom entry points while processing worker-owned objects locally."""
-        from twinkle.infra import _call_local
-        return _call_local(self, '__call__', inputs, **kwargs)
+        """Process worker-owned inputs without remote dispatch."""
+        if hasattr(self, '_actors'):
+            raise ValueError('Local processing requires a worker-owned object, not a remote handle.')
+        for pipe in self.process_pipeline:
+            inputs = pipe(inputs, **kwargs)
+        return inputs
 
     def prepare_outputs(self, inputs: List[InputFeature], **kwargs) -> Union[List[InputFeature], InputFeature]:
         if self.framework == 'transformers':
