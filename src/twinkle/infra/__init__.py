@@ -173,6 +173,18 @@ def get_device_mesh() -> Optional[DeviceMesh]:
     return _device_mesh
 
 
+def get_mode() -> Optional[Literal['local', 'ray']]:
+    """The twinkle execution mode (``'local'`` or ``'ray'``) set by :func:`initialize` (None before init).
+
+    Public accessor over the module-private ``_mode``. Callers outside twinkle (e.g. swift/dev) need to
+    know whether cross-process isolation is in effect: under ``'ray'`` a ``forward_only`` serializes its
+    inputs to a worker process, so a driver-side defensive copy of those inputs is redundant, while under
+    ``'local'`` the compute shares this process and the copy is load-bearing. Reading ``_mode`` directly
+    would reach into a private global, so this is the sanctioned seam.
+    """
+    return _mode
+
+
 def get_device_placement(device_group=None) -> str:
     """Get the device placement graph, can be used to show the training topology.
 
