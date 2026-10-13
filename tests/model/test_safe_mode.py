@@ -106,33 +106,32 @@ def test_tinker_forward_backward(cpu_model, monkeypatch, trust):
 
 @pytest.mark.parametrize('value', [lambda: None, type, {'nested': [lambda: None]}])
 @pytest.mark.parametrize('remote_handle', [False, True])
-def test_processor_checks_only_remote_dispatch(cpu_model, value, remote_handle):
+def test_public_processor_rejects_callable(cpu_model, value, remote_handle):
     _, group = cpu_model()
     if remote_handle:
         group.processor._actors = []
-        with pytest.raises(ValueError, match='Callable or Type'):
-            group.processor(_features(), external=value)
-    else:
-        result = group.processor(_features(), external=value)
-        assert torch.equal(result['input_ids'], torch.tensor([[1, 2, 3, 4]]))
+    with pytest.raises(ValueError, match='Callable or Type'):
+        group.processor(_features(), external=value)
 
 
-def test_worker_call_to_remote_handle_keeps_safety_checks(cpu_model):
+def test_internal_processing_keeps_public_safety_checks(cpu_model):
     _, group = cpu_model()
     _, other = cpu_model()
-    other.processor._actors = []
 
     def pipeline(inputs, **kwargs):
         other.processor(inputs, external=lambda: None)
 
     group.processor.process_pipeline = [pipeline]
     with pytest.raises(ValueError, match='Callable or Type'):
-        group.processor(_features(), model=lambda: None)
+        group.processor.process_local(_features(), model=lambda: None)
 
 
-@pytest.mark.parametrize('value', [lambda: None, type, {'nested': [lambda: None]}])
-def test_processor_constructor_keeps_safety_checks(monkeypatch, value):
-    monkeypatch.setattr(infra, '_mode', 'ray')
-    monkeypatch.setenv('TWINKLE_TRUST_REMOTE_CODE', '0')
-    with pytest.raises(ValueError, match='Callable or Type'):
-        InputProcessor(external=value)
+def test_local_call_rejects_remote_handle(cpu_model):
+    _, group = cpu_model()
+    group.processor._actors = []
+    with pytest.raises(ValueError, match='remote handle'):
+        group.processor.process_local(_features())
+
+
+def test_internal_processor_entry_is_not_exported():
+    assert not hasattr(InputProcessor.process_local, '_execute')
