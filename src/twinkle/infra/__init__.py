@@ -1028,7 +1028,6 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                 if _mode == 'local':
                     return func(self, *args, **kwargs)
                 elif _mode == 'ray':
-                    check_unsafe(*args, **kwargs)
                     if not hasattr(self, '_actors'):
                         # This is the worker
                         from ._ray import RayHelper
@@ -1044,6 +1043,8 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                             _, args, kwargs = _workers_and_args[rank]
                         return func(self, *args, **kwargs)
                     else:
+                        # Check inputs before remote dispatch, not worker-local calls.
+                        check_unsafe(*args, **kwargs)
                         # This is the driver
                         from ._ray import RayHelper
 
