@@ -17,7 +17,7 @@ from peft import LoraConfig, PeftConfig, PeftModel, get_peft_model
 from peft.tuners.lora import Linear as LoraLinear
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
-from transformers import PreTrainedConfig
+from transformers import PretrainedConfig
 from typing import Any, Callable, Dict, Generator, List, Literal, Optional, Tuple, Type, Union
 
 import twinkle
@@ -101,7 +101,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
     def __init__(
         self,
         model_id: str,
-        config: Optional[PreTrainedConfig] = None,
+        config: Optional[PretrainedConfig] = None,
         ddp_config: Optional[Dict[str, Any]] = None,
         device_mesh: Optional[DeviceMesh] = None,
         mixed_precision: Literal['no', 'fp16', 'bf16'] = 'bf16',
@@ -980,6 +980,9 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 checkpoint_dir,
                 peft_format=(adapter_name != _default_adapter_name),
             )
+            optimizer_config = self.optimizer_group.get(adapter_name)
+            if optimizer_config is not None and optimizer_config.optimizer is not None:
+                optimizer_config.optimizer.reload_model_params()
 
         if dist.is_initialized():
             dist.barrier()
@@ -1010,7 +1013,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         if dist.is_initialized():
             dist.barrier()
 
-    @remote_function(dispatch='all')
+    @remote_function(dispatch='all', collect='first', sync=True, timeout=3600)
     def resume_from_checkpoint(self, checkpoint_dir, *, resume_only_model=False, **kwargs):
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
 

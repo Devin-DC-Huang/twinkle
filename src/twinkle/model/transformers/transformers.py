@@ -420,13 +420,12 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 self.sp_strategy.initialize()
             self._ensure_gdn_padding_free_patch()
 
-            if len(optimizer_groups) == 1:
-                optimizer_group = optimizer_groups[0]
-                optimizer = optimizer_group.optimizer
-                assert optimizer is not None
-                self.model, optimizer = self.strategy.wrap_model(self.model, optimizer)
-                optimizer_group.optimizer = optimizer
-                self.register_mm_forward_hook(optimizer_group)
+            if optimizer_groups:
+                result = self.strategy.wrap_model(self.model, *(group.optimizer for group in optimizer_groups))
+                self.model = result[0]
+                for optimizer_group, optimizer in zip(optimizer_groups, result[1:], strict=True):
+                    optimizer_group.optimizer = optimizer
+                    self.register_mm_forward_hook(optimizer_group)
             else:
                 # maybe forward_only, no optimizer_group available
                 result = self.strategy.wrap_model(self.model)
@@ -1598,11 +1597,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
     def resume_from_checkpoint(self, checkpoint_dir, *, resume_only_model=False, **kwargs):
         adapter_name = kwargs.get('adapter_name', '')
 
-        has_adapter = (
-            os.path.exists(os.path.join(checkpoint_dir, 'adapter_model.safetensors'))
-            or os.path.exists(os.path.join(checkpoint_dir, 'adapter_model.bin')))
-        if has_adapter:
-            self.load(checkpoint_dir, adapter_name=adapter_name)
+        self.load(checkpoint_dir, adapter_name=adapter_name)
 
         if not resume_only_model:
             trainer_state = self._restore_training_state(checkpoint_dir, adapter_name=adapter_name)

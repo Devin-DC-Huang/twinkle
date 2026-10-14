@@ -232,9 +232,11 @@ class AccelerateStrategy:
         fsdp_plugin = self._get_fsdp_plugin()
         if fsdp_plugin is not None and fsdp_plugin.fsdp_version == 2:
             from torch.distributed.checkpoint.state_dict import set_model_state_dict
+
+            from .weight_state import with_tied_weight_aliases
             set_model_state_dict(
                 model,
-                state_dict,
+                with_tied_weight_aliases(self.unwrap_model(model), state_dict),
                 options=self._prepare_full_optimizer_state_dict_options(for_load=True),
             )
             return

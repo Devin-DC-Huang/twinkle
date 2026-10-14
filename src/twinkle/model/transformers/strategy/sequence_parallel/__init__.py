@@ -1059,9 +1059,9 @@ class SequenceParallelStrategy:
             outputs['entropies'] = self._trim_gathered_sequence_padding(gathered_entropies, real_position_ids)
         return inputs, outputs
 
-    def wrap_model(self, model, optimizer=None):
+    def wrap_model(self, model, optimizer=None, *additional_optimizers):
         self.initialize()
-        return model, optimizer
+        return (model, optimizer, *additional_optimizers)
 
     def unwrap_model(self, model):
         return model
