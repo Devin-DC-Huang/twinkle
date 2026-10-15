@@ -1964,6 +1964,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
                 checkpoint_dir,
                 adapter_name=adapter_name,
                 consumed_train_samples=kwargs.get('consumed_train_samples', 0),
+                component_states=kwargs.get('component_states', {}),
             )
 
         copy_checkpoint_args(output_dir, checkpoint_dir)
@@ -2022,6 +2023,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             'cur_step': optimizer_config.cur_step,
             'gradient_accumulation_steps': optimizer_config.gradient_accumulation_steps,
             'consumed_train_samples': kwargs.get('consumed_train_samples', 0),
+            'component_states': kwargs.get('component_states', {}),
         }
         with open(os.path.join(output_dir, 'trainer_state.json'), 'w', encoding='utf-8') as f:
             json.dump(trainer_state, f)
@@ -2233,14 +2235,18 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
                 'cur_step': 0,
                 'consumed_train_samples': 0,
                 'gradient_accumulation_steps': optimizer_config.gradient_accumulation_steps,
+                'component_states': {},
             }
 
         trainer_state = self._restore_training_state(checkpoint_dir, adapter_name=adapter_name)
-        return {
+        result = {
             'cur_step': trainer_state['cur_step'],
             'consumed_train_samples': trainer_state['consumed_train_samples'],
             'gradient_accumulation_steps': trainer_state['gradient_accumulation_steps'],
         }
+        if 'component_states' in trainer_state:
+            result['component_states'] = trainer_state['component_states']
+        return result
 
     @remote_function(collect='first')
     def get_state_dict(self, **kwargs):

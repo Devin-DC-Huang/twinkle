@@ -150,10 +150,10 @@ class GenerationSubmissionMixin:
             }
         return {'submission_id': submission_id, 'status': 'completed'}
 
-    @remote_function(dispatch='all', collect='flatten', lazy_collect=False)
+    @remote_function(dispatch='all', collect='flatten')
     @timed
     def collect_generation(self, submission_id: str) -> list[SampleResponse]:
-        """Consume completed responses from every DP worker."""
+        """Consume completed responses as a LazyCollect without entering the driver."""
         future = self._generation_submissions.get(submission_id)
         if future is None:
             raise KeyError(f'unknown generation submission: {submission_id}')

@@ -4,6 +4,7 @@ from collections import deque
 from torch.utils.data import BatchSampler
 
 from twinkle import DeviceMesh
+from .random_state import SampleIndex
 
 
 class DeviceMeshSampler(BatchSampler):
@@ -80,6 +81,7 @@ class DeviceMeshSampler(BatchSampler):
             if self.min_batch_size is not None and len(batch) < self.min_batch_size:
                 return
             self.emitted_batch_sizes.append(len(batch))
+            batch = [index if isinstance(index, SampleIndex) else SampleIndex(index, self.epoch) for index in batch]
             if not self.device_mesh:
                 yield batch
             else:
@@ -108,7 +110,7 @@ class DeviceMeshSampler(BatchSampler):
 
         batch = []
         for i in random_idx[bucket_offset:]:
-            batch.append(start_idx + i)
+            batch.append(SampleIndex(start_idx + i, self.epoch))
             if len(batch) == per_rank_bs:
                 self.emitted_batch_sizes.append(per_rank_bs * dp_world)
                 yield batch

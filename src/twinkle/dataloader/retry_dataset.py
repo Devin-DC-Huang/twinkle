@@ -4,6 +4,7 @@ from typing import Any
 import numpy as np
 
 from twinkle.utils import get_logger
+from .random_state import derive_seed, isolated_random_state, split_sample_index
 
 logger = get_logger()
 
@@ -52,23 +53,25 @@ class RetryDataset:
         return len(self.dataset)
 
     def __getitem__(self, index: int) -> Any:
+        index, epoch = split_sample_index(index)
         if self.max_retries <= 0:
             # Strict: no substitute and no guard, so the caller sees the exception the dataset itself
             # raised rather than a wrapper reporting only that something could not be read.
-            data = self.dataset[index]
+            with isolated_random_state(self.seed, epoch, int(index), 0):
+                data = self.dataset[index]
             if not data:
                 raise ValueError(f'Sample {index} read back empty, and substitution is off '
                                  '(max_retries=0), so there is nothing to serve at that position.')
             return data
-        data = self._load(index)
+        data = self._load(index, epoch, index, 0)
         if data is not None:
             return data
 
         length = len(self.dataset)
-        generator = np.random.RandomState((self.seed + int(index)) % 2**32)
-        for _ in range(self.max_retries):
+        generator = np.random.RandomState(derive_seed(self.seed, epoch, int(index)) % 2**32)
+        for attempt in range(1, self.max_retries + 1):
             replacement = int(generator.randint(length))
-            data = self._load(replacement)
+            data = self._load(replacement, epoch, index, attempt)
             if data is not None:
                 logger.warning(f'Sample {index} could not be read; using sample {replacement} in its place.')
                 return data
@@ -76,7 +79,7 @@ class RetryDataset:
                            f'replacements drawn for it. The dataset is likely unreadable rather than '
                            f'holding a few bad rows.')
 
-    def _load(self, index: int) -> Any:
+    def _load(self, index: int, epoch: int, logical_index: int, attempt: int) -> Any:
         """The sample at ``index``, or None if it is unreadable or empty.
 
         Empty counts as unreadable: a preprocessor that could not make sense of a row returns an empty
@@ -84,7 +87,8 @@ class RetryDataset:
         that threw.
         """
         try:
-            data = self.dataset[index]
+            with isolated_random_state(self.seed, epoch, int(logical_index), attempt):
+                data = self.dataset[index]
         except Exception:  # noqa: BLE001
             logger.warning(f'Reading sample {index} failed.', exc_info=True)
             return None

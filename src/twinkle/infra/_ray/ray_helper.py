@@ -3,6 +3,7 @@ import os
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Type, TypeVar, Union
 
 from twinkle import DeviceGroup, Platform, find_free_port, find_node_ip, requires
+from twinkle.utils.loader import run_worker_setup_hook
 from .. import _torch_setup
 from .resource_manager import ResourceManager
 
@@ -223,6 +224,23 @@ class RayHelper:
                 """Lazily collect results, support repeated calls (with caching)"""
                 return self._get_result()
 
+            def ready(self) -> bool:
+                """Whether every referenced task has finished, WITHOUT fetching any payload.
+
+                A control-plane probe only: it exists so a driver can time a side effect (e.g. releasing an
+                adapter pin) to the true completion of a lazily-collected call, while the payload keeps
+                flowing as a reference to a downstream actor. ``ray.wait(timeout=0)`` inspects task status and
+                never materialises the result, so ``_result`` stays untouched and no data returns to the
+                caller. A FAILED task also reports ready (``ray.wait`` surfaces completion, not success); the
+                exception is raised later, at the real :meth:`__call__` collect.
+                """
+                import ray
+                refs = [future for future in self._futures if isinstance(future, ray.ObjectRef)]
+                if not refs:
+                    return True
+                ready, _ = ray.wait(refs, num_returns=len(refs), timeout=0)
+                return len(ready) == len(refs)
+
             def __iter__(self):
                 """Support iteration: automatically collect results then iterate"""
                 return iter(self._get_result())
@@ -344,7 +362,7 @@ class RayHelper:
                     # blocking continuous-work methods off the actor's event loop.
                     env_vars['TWINKLE_ACTOR_MAX_CONCURRENCY'] = str(max_concurrency)
 
-                runtime_env = RuntimeEnv(env_vars=env_vars)
+                runtime_env = RuntimeEnv(env_vars=env_vars, worker_process_setup_hook=run_worker_setup_hook)
 
                 worker_options = {
                     'scheduling_strategy':
@@ -401,7 +419,7 @@ class RayHelper:
                     # blocking continuous-work methods off the actor's event loop.
                     env_vars['TWINKLE_ACTOR_MAX_CONCURRENCY'] = str(max_concurrency)
 
-                runtime_env = RuntimeEnv(env_vars=env_vars)
+                runtime_env = RuntimeEnv(env_vars=env_vars, worker_process_setup_hook=run_worker_setup_hook)
 
                 worker_options = {
                     'scheduling_strategy':

@@ -338,6 +338,7 @@ class MultiLoraMegatronModel(MegatronModel):
                     'cur_step': optimizer_config.cur_step,
                     'consumed_train_samples': kwargs.get('consumed_train_samples', 0),
                     'gradient_accumulation_steps': optimizer_config.gradient_accumulation_steps,
+                    'component_states': kwargs.get('component_states', {}),
                 }
                 rank = dist.get_rank() if dist.is_initialized() else 0
                 if rank == 0:
@@ -394,6 +395,7 @@ class MultiLoraMegatronModel(MegatronModel):
                 'cur_step': 0,
                 'consumed_train_samples': 0,
                 'gradient_accumulation_steps': optimizer_config.gradient_accumulation_steps,
+                'component_states': {},
             }
 
         trainer_state_path = os.path.join(checkpoint_dir, 'trainer_state.json')
@@ -407,11 +409,14 @@ class MultiLoraMegatronModel(MegatronModel):
             optimizer_config.cur_step = trainer_state['cur_step']
             optimizer_config.gradient_accumulation_steps = trainer_state['gradient_accumulation_steps']
 
-        return {
+        result = {
             'cur_step': trainer_state['cur_step'],
             'consumed_train_samples': trainer_state['consumed_train_samples'],
             'gradient_accumulation_steps': trainer_state['gradient_accumulation_steps'],
         }
+        if 'component_states' in trainer_state:
+            result['component_states'] = trainer_state['component_states']
+        return result
 
     @remote_function(execute='first')
     def get_state_dict(self, **kwargs):
