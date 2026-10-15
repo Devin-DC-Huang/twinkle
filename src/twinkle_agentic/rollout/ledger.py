@@ -347,11 +347,19 @@ class MessageLedger:
     -- and a common base would be thinner than the disagreement between them.
     """
 
-    def __init__(self, *, label: str = 'trajectory', max_tokens: Optional[int] = None) -> None:
+    def __init__(self, *, label: str = 'trajectory', max_tokens: Optional[int] = None,
+                 template: Optional[Template] = None) -> None:
         self.label = label
         # Taken for signature parity with TurnLedger and ignored: there are no
         # tokens to budget at the message level.
         self.max_tokens = max_tokens
+        # An optional template used ONLY for its text operations (parse_tool_call / tool_call_errors /
+        # decode_tokens), so a message-level episode that nonetheless has a local template -- the TUI's
+        # streaming tool turn -- can read tool-call markup out of a reply's text. Accounting stays at the
+        # message level either way: this never encodes, never banks token ids, and ``merge`` still emits
+        # no ``input_ids`` / ``labels`` / ``logprobs``. Without a template (a text-only remote teacher)
+        # the three text operations fall back to their structural-only behaviour.
+        self._template = template
         # One live dict, handed out by ``input_feature`` and annotated in place by
         # the loop (it withdraws tool schemas with ``['tools'] = []`` and rewrites
         # the last message). ``messages`` is the very list the writer methods
@@ -392,16 +400,28 @@ class MessageLedger:
     # ------------------------------------------------------- text operations
 
     def parse_tool_call(self, decoded: str) -> List[Dict[str, Any]]:
-        """No template, so no text parser: tool calls arrive structurally only."""
+        """Tool calls in ``decoded``: parsed via the template when one is present, else structural-only.
+
+        A message-level episode with a local template (the TUI streaming tool turn) can read markup out
+        of the reply text; a text-only backend has no parser, so its tool calls must arrive structurally
+        on the assistant message (which the loop reads before falling back to this).
+        """
+        if self._template is not None:
+            return self._template.parse_tool_call(decoded)
         return []
 
     def tool_call_errors(self, decoded: str) -> List[str]:
-        """No markup to validate without a template."""
+        """Malformed tool-call markup errors in ``decoded`` (template-specific); empty without a template."""
+        if self._template is not None:
+            return self._template.tool_call_errors(decoded)
         return []
 
     def decode_tokens(self, seq: SampledSequence) -> str:
-        """No tokenizer: the reply's text is all there is."""
-        return seq.decoded or ''
+        """Text of a reply: decoded from its tokens when a template/tokenizer is present, else ``seq.decoded``."""
+        tokenizer = getattr(self._template, 'tokenizer', None) if self._template is not None else None
+        if tokenizer is None or not seq.tokens:
+            return seq.decoded or ''
+        return tokenizer.decode(seq.tokens, skip_special_tokens=True)
 
     # ---------------------------------------------------------------- writing
 

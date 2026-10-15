@@ -981,6 +981,38 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
             else:
                 raise ValueError(f'Unsupported mode: {_mode}')
 
+        def perf_on(self, *, profiler_spec=None):
+            from twinkle.perf import Perf
+            strategy = getattr(self, 'strategy', None)
+            model = getattr(self, 'model', None)
+            target = strategy.unwrap_model(model) if (strategy is not None and model is not None) else None
+            self._profiler = Perf.enable_process(model=target, profiler_spec=profiler_spec)
+
+        def perf_step(self):
+            from twinkle.perf import Perf
+            Perf.step_process(getattr(self, '_profiler', None))
+
+        def perf_dump(self):
+            from twinkle.perf import Perf
+            return Perf.dump_process(getattr(self, '_profiler', None))
+
+        def perf_off(self):
+            from twinkle.perf import Perf
+            Perf.disable_process(getattr(self, '_profiler', None))
+            self._profiler = None
+
+        if not hasattr(cls, 'perf_on'):
+            cls.perf_on = remote_function(dispatch='all', execute=execute, collect='none',
+                                          lazy_collect=False)(perf_on)
+        if not hasattr(cls, 'perf_step'):
+            cls.perf_step = remote_function(dispatch='all', execute=execute, collect='none')(perf_step)
+        if not hasattr(cls, 'perf_dump'):
+            cls.perf_dump = remote_function(dispatch='all', execute=execute, collect='none',
+                                            lazy_collect=False)(perf_dump)
+        if not hasattr(cls, 'perf_off'):
+            cls.perf_off = remote_function(dispatch='all', execute=execute, collect='none',
+                                           lazy_collect=False)(perf_off)
+
         cls.__init__ = new_init
         return cls
 

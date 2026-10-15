@@ -15,6 +15,7 @@ from twinkle.data_format import (InputFeature, PoolingParams, PoolingResponse, S
 from twinkle.hub import HubOperation
 from twinkle.patch import Patch, apply_patch
 from twinkle.patch.vllm_lora_weights import VLLMLoraWeights
+from twinkle.perf import timed
 from twinkle.sampler.base import Sampler
 from twinkle.sampler.generation_submission import GenerationSubmissionMixin
 from twinkle.sampler.partial_rollout import PartialRolloutMixin
@@ -341,6 +342,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, Par
             topk_prompt_logprobs=response.topk_prompt_logprobs)
 
     @remote_function(dispatch='slice_dp', collect='flatten', lazy_collect=False, enable_continous_work=True)
+    @timed
     def sample(
         self,
         inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
@@ -525,6 +527,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, Par
         )
 
     @remote_function(dispatch='slice_dp', collect='flatten', lazy_collect=False)
+    @timed
     def encode(
         self,
         inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
@@ -661,6 +664,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, Par
         stream_to_queue(self, queue, inputs, sampling_params, adapter_name, adapter_path)
 
     @remote_function(dispatch='all', collect='first')
+    @timed
     def sleep(self, level: int = 1) -> None:
         """
         Release GPU memory for colocate mode.
@@ -668,6 +672,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, Par
         self._run_in_loop(self.engine.sleep(level))
 
     @remote_function(dispatch='all', collect='first')
+    @timed
     def wake_up(self, tags: List[str] = None) -> None:
         self._run_in_loop(self.engine.wake_up(tags=tags))
 
@@ -688,6 +693,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, Par
         return self._run_in_loop(self.engine.get_state_keys())
 
     @remote_function(dispatch='all', lazy_collect=True)
+    @timed
     def receive_weights(
         self,
         base_sync_done: bool = False,
@@ -749,6 +755,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, Par
         self._run_in_loop(self.engine.unload_lora_paths(adapter_paths))
 
     @remote_function(dispatch='all', collect='first', lazy_collect=False)
+    @timed
     def load_full_weights_from_path(self, path: Optional[str] = None) -> int:
         """Load a full (non-LoRA) HF checkpoint into the engine's base model.
 

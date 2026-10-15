@@ -27,9 +27,10 @@ import torch.nn as nn
 
 from .stats import describe_shape, primary_tensor, tensor_moments, tensor_numel
 
-__all__ = ['ModuleProfiler', 'ActivationStatsProfiler', 'build_module_profiler']
+__all__ = ['ModuleProfiler', 'ActivationStatsProfiler', 'ParamStatsProfiler', 'build_module_profiler']
 
 _NS_PER_MS = 1e6
+_NS_PER_SEC = 1e9
 
 #: A matcher deciding whether a module (by qualified name) is profiled.
 Matcher = Callable[[str, nn.Module], bool]
@@ -121,6 +122,9 @@ class ModuleProfiler:
         self._agg: Dict[str, Dict[str, list]] = {}
         self._counts: Dict[str, int] = {}
         self._shapes: Dict[str, str] = {}
+        # Wall ns this profiler spent inside its own collect()/stats hooks; reported so the
+        # consumer can subtract profiling cost from the stage timing it inflates (see overhead_s).
+        self._overhead_ns: int = 0
 
     # ------------------------------------------------------------------ control
 
@@ -210,13 +214,18 @@ class ModuleProfiler:
         if not self._collecting():
             return None
         forward_ms = self._pop_elapsed_ms(module)
+        # collect() reduces tensors with .item() (device syncs), so it can cost more than the
+        # forward it measures. Time it separately and accumulate as overhead, so the enclosing
+        # @timed stage span can be reported net of the profiling cost (see overhead_s).
+        start_ns = time.perf_counter_ns()
         try:
             stats = self.collect(name, module, args, kwargs, output)
             shape = describe_shape(output)
         except Exception as exc:  # observation failure, not a business error
             warnings.warn(f'[twinkle.perf] collect failed for {name!r}; skipping stats: {exc}', RuntimeWarning)
+            self._add_overhead(time.perf_counter_ns() - start_ns)
             return None
-        self._accumulate(name, forward_ms, stats, shape)
+        self._accumulate(name, forward_ms, stats, shape, time.perf_counter_ns() - start_ns)
         return None
 
     def _pop_elapsed_ms(self, module: nn.Module) -> Optional[float]:
@@ -238,8 +247,14 @@ class ModuleProfiler:
 
     # ------------------------------------------------------------------ aggregation
 
-    def _accumulate(self, name: str, forward_ms: Optional[float], stats: Dict[str, float], shape: str) -> None:
+    def _accumulate(self,
+                    name: str,
+                    forward_ms: Optional[float],
+                    stats: Dict[str, float],
+                    shape: str,
+                    overhead_ns: int = 0) -> None:
         with self._lock:
+            self._overhead_ns += overhead_ns
             per_key = self._agg.setdefault(name, {})
 
             def add(key: str, value: float) -> None:
@@ -259,12 +274,18 @@ class ModuleProfiler:
             self._counts[name] = self._counts.get(name, 0) + 1
             self._shapes[name] = shape
 
+    def _add_overhead(self, overhead_ns: int) -> None:
+        """Record profiling cost on a path that produced no stats (e.g. a failed collect)."""
+        with self._lock:
+            self._overhead_ns += overhead_ns
+
     def reset(self) -> None:
-        """Drop accumulated stats (keeps the step counter and attached hooks)."""
+        """Drop accumulated stats and overhead (keeps the step counter and attached hooks)."""
         with self._lock:
             self._agg.clear()
             self._counts.clear()
             self._shapes.clear()
+            self._overhead_ns = 0
 
     # ------------------------------------------------------------------ output
 
@@ -295,6 +316,17 @@ class ModuleProfiler:
             for key, (n, total, _lo, _hi) in agg.get(name, {}).items():
                 out[f'{prefix}{name}/{key}/mean'] = (total / n) if n else 0.0
         return out
+
+    def overhead_s(self) -> float:
+        """Wall seconds this profiler spent inside its own ``collect()`` / stats hooks.
+
+        The forward hooks run *during* the module forward, so their cost lands inside
+        whatever ``@timed`` stage span encloses that forward (e.g. ``forward_backward``).
+        Reporting it lets the dump emit a net stage time (``raw - overhead``), so turning on
+        deep stats does not silently inflate the very timing it exists to explain.
+        """
+        with self._lock:
+            return self._overhead_ns / _NS_PER_SEC
 
     def print_summary(self, *, sort: str = 'forward_ms', top: Optional[int] = None) -> None:
         """Print a per-module table sorted by the mean of ``sort`` (default forward time)."""
@@ -327,6 +359,42 @@ class ActivationStatsProfiler(ModuleProfiler):
                 stats[f'out_{key}'] = value
         stats['out_numel'] = tensor_numel(output)
         stats['in_numel'] = tensor_numel(args[0]) if args else 0.0
+        return stats
+
+
+class ParamStatsProfiler(ModuleProfiler):
+    """Subclass: forward time (base) plus each module's OWN parameter / gradient norms.
+
+    Kept separate from :class:`ActivationStatsProfiler` because reading parameters -- and
+    ``.grad`` in particular -- forces device syncs, so it costs more than activation stats. A
+    run therefore opts into it explicitly via the spec's ``profiler`` class, and the cheap
+    timing decorators stay unaffected either way. Uses ``recurse=False`` so each hooked module
+    reports only its own direct parameters (a parent block's params live in its children, which
+    are hooked separately when selected), avoiding tree-wide double counting.
+    """
+
+    def collect(self, name: str, module: nn.Module, args: Any, kwargs: Any, output: Any) -> Dict[str, float]:
+        param_sq = param_absmax = param_count = 0.0
+        grad_sq = grad_absmax = grad_count = 0.0
+        for param in module.parameters(recurse=False):
+            moments = tensor_moments(param)
+            param_sq += moments['l2']**2
+            param_absmax = max(param_absmax, moments['absmax'])
+            param_count += 1
+            if param.grad is not None:
+                grad_moments = tensor_moments(param.grad)
+                grad_sq += grad_moments['l2']**2
+                grad_absmax = max(grad_absmax, grad_moments['absmax'])
+                grad_count += 1
+        stats: Dict[str, float] = {}
+        if param_count:
+            # Report the module's total parameter L2 (sqrt of summed squares) and its peak magnitude.
+            stats['param_l2'] = param_sq**0.5
+            stats['param_absmax'] = param_absmax
+            stats['param_count'] = param_count
+        if grad_count:
+            stats['grad_l2'] = grad_sq**0.5
+            stats['grad_absmax'] = grad_absmax
         return stats
 
 

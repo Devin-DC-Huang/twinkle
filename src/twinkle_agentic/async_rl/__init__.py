@@ -4,7 +4,7 @@ The public names resolve LAZILY (PEP 562 ``__getattr__``). The control-plane pri
 ``RLContext`` / ``RLContextManager`` / the ``weight_sync`` strategies -- are dependency-light
 dataclasses, whereas the runtime (``pipeline`` / ``workers`` / ``vllm_sampler_tq`` / ``data_plane`` /
 ``native_tq``) pulls in TransferQueue, vLLM and native FSDP. A consumer that only needs a primitive
-(dev's ``grpo_async.StreamingGRPOLoop`` drives ``RLContextManager`` + ``build_weight_sync_strategy``
+(dev's ``recipe._streaming`` builder drives ``RLContextManager`` + ``build_weight_sync_strategy``
 over its own sampler, never the TransferQueue runtime) must not be forced to import that whole stack,
 so each name is imported from its defining submodule on first access instead of eagerly here. The
 runtime modules themselves import each other by relative submodule path, so they are unaffected.
@@ -27,6 +27,7 @@ _EXPORTS = {
     'ContextScheduler': 'scheduler',
     'ContextStatus': 'context_manager',
     'DriverStats': 'streaming_driver',
+    'GroupDecision': 'streaming_driver',
     'InPlaceWeightSync': 'weight_sync',
     'LoraContext': 'types',
     'LoraContextManager': 'context_manager',

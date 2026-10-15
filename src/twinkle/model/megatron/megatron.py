@@ -35,6 +35,7 @@ from twinkle.metric import LossMetric, Metric, TrainMetric
 from twinkle.model.base import ModelLoaderProtocol, TrainableModel, copy_checkpoint_args, rotate_checkpoints
 from twinkle.model.optimizer_group import BaseOptimizerGroup, TrainStatus
 from twinkle.patch import Patch, apply_context, apply_patch
+from twinkle.perf import timed
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
 from twinkle.utils import construct_class, get_logger, selective_log_softmax
@@ -594,6 +595,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
     # receive the materialized dict rather than an un-collected callable. sync=True orders the workers but
     # does not materialize the result. Mirrors the transformers backend and calculate_metric.
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict, sync=True, lazy_collect=False)
+    @timed
     def forward_only(self,
                      *,
                      inputs: Union[InputFeature, List[InputFeature], List[Trajectory]],
@@ -635,6 +637,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
             '(vLLM/SGLang/Transformers) that loads its own copy of the weights.')
 
     @remote_function(collect='mean')
+    @timed
     def calculate_loss(self, **kwargs):
         raise NotImplementedError('Megatron only supports `forward_backward` and `forward_only`')
 
@@ -643,10 +646,14 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
         raise NotImplementedError('Megatron only supports `forward_backward` and `forward_only`')
 
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict, sync=True)
+    @timed
     def forward_backward(self,
                          *,
                          inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
                          micro_batch_size: Optional[int] = None,
+                         loss_key: Optional[str] = None,
+                         loss_weight: float = 1.0,
+                         finalize_gradients: bool = True,
                          **kwargs):
         """Combined forward and backward pass using Megatron's scheduler.
 
@@ -680,17 +687,41 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
         disable_lora = kwargs.pop('disable_lora', False)
         temperature = float(kwargs.pop('temperature', 1.0))
         forward_only = kwargs.pop('forward_only', False)
+        # Per-call opt-in to skip the configured loss and return logps only (empty-loss probe). The
+        # transformers backend derives logps in forward_only without ever calling the loss, so this brings
+        # Megatron to parity: a probe batch (KTO z_KL / adapter-disabled reference) carries no
+        # label/ref_logps and the configured loss would reject it. eval/training omit it and keep the real
+        # loss -- Megatron's calculate_loss is a no-op raise, so eval_loss depends on forward_only computing
+        # it here, which is why this must stay a per-call opt-in rather than a changed default.
+        compute_loss = kwargs.pop('compute_loss', True)
         return_logits = kwargs.pop('return_logits', False)
         task = kwargs.pop('task', 'causal_lm')
-        # MoE routing replay (R2/R3). The action is a backend-neutral token (str/None) resolved below to
-        # this backend's enum -- symmetric with TransformersModel.forward (basic principle 1). Popped here,
+        # MoE routing replay (R2/R3). The driver passes the MODE scalar, resolved below to this
+        # backend's action -- symmetric with TransformersModel.forward (basic principle 1). Popped here,
         # before loss_extra_kwargs_per_mb is assembled, so it never reaches the loss.
-        router_replay_action = kwargs.pop('router_replay_action', None)
+        router_replay_mode = kwargs.pop('router_replay_mode', None)
         router_replay_manual_cleanup = kwargs.pop('router_replay_manual_cleanup', False)
         optimizer_config = self.optimizer_group[adapter_name]
-        loss_instance = self.optimizer_group[adapter_name].loss_instance
+        loss_instance = optimizer_config.get_loss(loss_key)
         if not inputs:
             raise ValueError('inputs empty, check your DataLoader outputs')
+        if forward_only and not finalize_gradients:
+            raise ValueError('forward_only does not support finalize_gradients=False')
+        if not forward_only and not finalize_gradients and self.strategy.uses_fsdp(self.strategy.ddp_config):
+            ddp_config = getattr(self.model[0], 'ddp_config', None)
+            sharding_strategy = getattr(
+                ddp_config,
+                'data_parallel_sharding_strategy',
+                self.strategy.ddp_config.get('data_parallel_sharding_strategy'),
+            )
+            if sharding_strategy in {'optim_grads', 'optim_grads_params'}:
+                raise ValueError(
+                    'Deferred backward is not supported by Megatron-FSDP with gradient sharding '
+                    f'({sharding_strategy}); use data_parallel_sharding_strategy="no_shard" or "optim".')
+        completing_pending = False
+        if not forward_only:
+            completing_pending = optimizer_config.prepare_backward_transaction(finalize_gradients, loss_weight)
+        transactional = not forward_only and (not finalize_gradients or completing_pending)
         if (isinstance(inputs, dict) and self._not_encoded(inputs)) or (isinstance(inputs, list)
                                                                         and self._not_encoded(inputs[0])):
             # Trajectory or List[Trajectory]
@@ -699,6 +730,9 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
             if isinstance(inputs, dict):
                 inputs = [inputs]
             inputs = optimizer_config.template.batch_encode(inputs)  # noqa
+        if isinstance(inputs, dict):
+            inputs = [inputs]
+        local_batch_normalizer = loss_instance.batch_normalizer(inputs) if transactional else None
         processor: InputProcessor = optimizer_config.processor
         assert isinstance(processor, InputProcessor), 'Set InputProcessor correctly before forwarding'
 
@@ -713,13 +747,15 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
             attention_mask_type=getattr(unwrapped_model.config, 'attention_mask_type', None),
         )
 
-        # MoE routing replay: resolve the backend-neutral action to this backend's enum and lazily patch
-        # the dispatcher once. The global action is set right before the scheduler runs; the per-microbatch
-        # record/replay dance lives in forward_step_func (prepare_replay_forward / finish_replay_forward).
+        # MoE routing replay: resolve the dev-side MODE scalar to this backend's action (an R2 capture
+        # pass -- forward_only=True, inputs carry no routing yet -- RECORDs; every training forward
+        # REPLAYS) and lazily patch the dispatcher once. The global action is set right before the
+        # scheduler runs; the per-microbatch record/replay dance lives in forward_step_func
+        # (prepare_replay_forward / finish_replay_forward).
         rr_action = rr_pre = rr_post = None
-        if self._router_replay_enabled and router_replay_action is not None:
+        if self._router_replay_enabled and router_replay_mode is not None:
             from twinkle.model.megatron.moe import router_replay as _rr_mod
-            rr_action = _rr_mod.resolve_router_replay_action(router_replay_action)
+            rr_action = _rr_mod.resolve_router_replay_mode(router_replay_mode, allow_record=forward_only)
             rr_pre, rr_post = _rr_mod.prepare_replay_forward, _rr_mod.finish_replay_forward
             self._maybe_apply_router_replay()
 
@@ -745,6 +781,18 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
 
         num_microbatches = len(inputs)
         self._last_num_microbatches = num_microbatches
+        global_normalizer = None
+        if transactional:
+            local_normalizer = num_microbatches if local_batch_normalizer is None else local_batch_normalizer
+            cp_size_for_normalizer = self.device_mesh.cp_world_size or 1
+            global_normalizer = torch.as_tensor(
+                float(local_normalizer) / cp_size_for_normalizer,
+                device=Platform.get_local_device(),
+                dtype=torch.float32,
+            )
+            dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
+            if dist.get_world_size(dp_cp_group) > 1:
+                dist.all_reduce(global_normalizer, op=dist.ReduceOp.SUM, group=dp_cp_group)
         loss_extra_kwargs_per_mb = []
         if num_microbatches <= 1:
             loss_extra_kwargs_per_mb = [kwargs]
@@ -774,6 +822,13 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
                 outputs = ModelOutput(logits=logits, logps=logps)
                 if entropies is not None:
                     outputs['entropies'] = entropies
+            if not compute_loss:
+                # Empty-loss probe: skip the configured loss (a probe batch carries no label/ref_logps and
+                # the loss would reject it) but still route a zero loss through reduce_loss so the logps
+                # reach its returned dict unchanged -- the same logps-only contract the transformers
+                # backend's forward_only satisfies without ever calling the loss.
+                zero = torch.zeros((), device=Platform.get_local_device(), dtype=torch.float32)
+                return self.strategy.reduce_loss(zero, zero.clone(), output_tensor, logps)
             result = loss_instance(inputs, outputs, **current_kwargs)
             if unpacked_logits is not None:
                 outputs.pop('logits', None)
@@ -986,23 +1041,79 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
 
         self._accumulate_metric(optimizer_config, is_training=not forward_only)
 
-        # Run forward-backward with Megatron's scheduler
-        # Megatron handles all communication internally using proper process groups
+        # Run forward-backward with Megatron's scheduler. Transaction hooks are restored even when
+        # the schedule raises, because the config object is shared by all later steps on this worker.
         if rr_action is not None:
             # Set the action on every local router before the schedule; forward_step_func's dance then
             # flips REPLAY_FORWARD<->REPLAY_BACKWARD per microbatch (mirrors legacy base.py train_step).
             from twinkle.model.megatron.moe.router_replay import set_global_router_replay_action
             set_global_router_replay_action(rr_action)
-        with _resolve_task_context(self.model, task):
-            losses = forward_backward_func(
-                forward_step_func=forward_step_func,
-                data_iterator=data_iter,
-                model=self.model,
-                num_microbatches=len(inputs),
-                seq_length=seq_length,
-                micro_batch_size=micro_batch_size,
-                forward_only=forward_only,
-            )
+        config = self.strategy.config
+        original_grad_scale_func = config.grad_scale_func
+        original_no_sync_func = config.no_sync_func
+        original_grad_sync_func = config.grad_sync_func
+        original_finalize_model_grads_func = config.finalize_model_grads_func
+
+        scale = float(loss_weight)
+        if transactional:
+            gradient_accumulation_steps = int(kwargs.get('gradient_accumulation_steps') or 1)
+            if gradient_accumulation_steps < 1:
+                raise ValueError('gradient_accumulation_steps must be positive')
+            scale = scale / global_normalizer.clamp(min=1) / gradient_accumulation_steps
+
+        def transaction_grad_scale(value):
+            if original_grad_scale_func is not None:
+                value = original_grad_scale_func(value)
+            return value * scale
+
+        def disabled_no_sync():
+            return contextlib.nullcontext()
+
+        def disabled_grad_sync(*args, **kwargs):
+            return None
+
+        def disabled_finalize(*args, **kwargs):
+            return None
+
+        def finalize_accumulated_gradients(model, num_tokens=None, **finalize_kwargs):
+            return original_finalize_model_grads_func(model, None, **finalize_kwargs)
+
+        outer_no_sync = contextlib.ExitStack()
+        try:
+            with outer_no_sync:
+                if not forward_only and (transactional or loss_weight != 1.0):
+                    config.grad_scale_func = transaction_grad_scale
+                if not forward_only and not finalize_gradients:
+                    for model_chunk in self.model:
+                        if hasattr(model_chunk, 'no_sync'):
+                            outer_no_sync.enter_context(model_chunk.no_sync())
+                    if isinstance(original_no_sync_func, list):
+                        config.no_sync_func = [disabled_no_sync for _ in original_no_sync_func]
+                    else:
+                        config.no_sync_func = disabled_no_sync
+                    if isinstance(original_grad_sync_func, list):
+                        config.grad_sync_func = [disabled_grad_sync for _ in original_grad_sync_func]
+                    else:
+                        config.grad_sync_func = disabled_grad_sync
+                    config.finalize_model_grads_func = disabled_finalize
+                elif completing_pending and original_finalize_model_grads_func is not None:
+                    config.finalize_model_grads_func = finalize_accumulated_gradients
+
+                with _resolve_task_context(self.model, task):
+                    losses = forward_backward_func(
+                        forward_step_func=forward_step_func,
+                        data_iterator=data_iter,
+                        model=self.model,
+                        num_microbatches=len(inputs),
+                        seq_length=seq_length,
+                        micro_batch_size=micro_batch_size,
+                        forward_only=forward_only,
+                    )
+        finally:
+            config.grad_scale_func = original_grad_scale_func
+            config.no_sync_func = original_no_sync_func
+            config.grad_sync_func = original_grad_sync_func
+            config.finalize_model_grads_func = original_finalize_model_grads_func
 
         # Extract loss from results (only last PP stage returns non-empty)
         loss = torch.tensor(0.0).to(Platform.get_local_device())
@@ -1056,7 +1167,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
             loss = packed[0]
             num_tokens = packed[1]
 
-        if not forward_only:
+        if not forward_only and finalize_gradients:
             optimizer_config.cur_step += 1
 
         if logps and not self.variable_seq_lengths:
@@ -1065,6 +1176,12 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
             logps = None
         if logits and not self.variable_seq_lengths:
             logits = torch.cat(logits, dim=0)
+        if transactional:
+            dp_world_size = self.device_mesh._get_dp_fsdp_world_size()
+            loss = loss * (float(loss_weight) * dp_world_size / global_normalizer.clamp(min=1))
+            num_tokens = 0
+        elif not forward_only and loss_weight != 1.0:
+            loss = loss * float(loss_weight)
         if isinstance(loss, torch.Tensor):
             loss = loss.detach().float().item()
         if isinstance(num_tokens, torch.Tensor):
@@ -1099,13 +1216,30 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
             optimizer_config.eval_status.outputs = model_output
             optimizer_config.eval_status.forward_kwargs = kwargs
         else:
-            optimizer_config.train_status.inputs = inputs
-            optimizer_config.train_status.outputs = model_output
-            optimizer_config.train_status.forward_kwargs = kwargs
+            status = optimizer_config.train_status
+            status.inputs = inputs
+            status.outputs = model_output
+            status.forward_kwargs = {**kwargs, '_metric_loss_key': loss_key}
+            status.loss_reduction = 'mean' if transactional else getattr(loss_instance, 'reduction', 'mean')
+            if transactional:
+                metric_step = optimizer_config.cur_step - 1 if finalize_gradients else optimizer_config.cur_step
+                optimizer_config.accumulate_metrics(True, include_default=False, metric_step=metric_step)
+                status.inputs = None
+                status.outputs = None
+                total_loss = optimizer_config.record_transaction_loss(model_output.get('loss', 0.0),
+                                                                     finalize_gradients)
+                if finalize_gradients:
+                    status.inputs = {}
+                    status.outputs = ModelOutput(loss=total_loss)
+                    status.forward_kwargs = {}
+                    status.loss_reduction = 'mean'
+                    return ModelOutput(loss=total_loss)
         return model_output
 
     @remote_function(dispatch='all')
     def clip_grad_norm(self, max_grad_norm: float = 1.0, norm_type: int = 2, **kwargs):
+        adapter_name = kwargs.pop('adapter_name', self._get_default_group())
+        self.optimizer_group[adapter_name].require_finalized('clip gradients')
         # Megatron optimizer will cover this function.
         return 0
 
@@ -1129,6 +1263,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
         """
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
+        optimizer_config.require_finalized('step the optimizer')
 
         if not optimizer_config.do_grad_sync(kwargs.pop('gradient_accumulation_steps', None)):
             return
@@ -1180,6 +1315,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
         """
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
+        optimizer_config.require_finalized('zero gradients')
 
         # For DDP-wrapped models, ALWAYS zero the gradient buffer
         # This is essential because Megatron's forward_backward_func uses
@@ -1206,6 +1342,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
         """
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
+        optimizer_config.require_finalized('step the learning-rate scheduler')
 
         if not optimizer_config.do_grad_sync(kwargs.pop('gradient_accumulation_steps', None)):
             return
@@ -1219,21 +1356,14 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
     @remote_function(dispatch='all')
     def set_loss(self, loss_cls: Union[Loss, Type[Loss], str, Callable[[InputFeature, ModelOutput, ...], torch.Tensor]],
                  **kwargs):
-        """Set loss function.
-
-        NOTE: For MegatronModel, the loss is computed internally by Megatron's
-        GPTModel when labels are passed. This method is kept for API compatibility
-        but the provided loss_cls is NOT used during forward_backward.
-
-        Megatron internally uses vocab_parallel_cross_entropy which correctly
-        handles tensor parallelism. This design ensures Loss classes don't need
-        to be aware of the training backend (Megatron vs Transformers).
+        """Register a loss used by Megatron's scheduler-side loss callback.
 
         Args:
-            loss_cls: Loss class or string name (not used for Megatron).
-            **kwargs: Additional arguments.
+            loss_cls: Loss class, instance, or registered name.
+            **kwargs: Constructor arguments plus optional ``loss_key`` and ``adapter_name``.
         """
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
+        loss_key = kwargs.pop('loss_key', None)
         optimizer_config = self.optimizer_group[adapter_name]
         loss = construct_class(loss_cls, Loss, twinkle.loss, **kwargs)
         # Gather over the DP group, not WORLD: under PP the loss runs only on the last
@@ -1241,7 +1371,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
         # would deadlock on earlier-stage ranks that never enter the loss. Mirrors add_metric.
         if getattr(loss, 'process_group', None) is None and getattr(optimizer_config, '_dp_group', None) is not None:
             loss.process_group = optimizer_config._dp_group
-        optimizer_config.loss_instance = loss
+        optimizer_config.set_loss(loss, loss_key=loss_key)
 
     @remote_function(dispatch='all')
     def empty_cache(self, **kwargs):
@@ -1265,13 +1395,18 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
                 Any parameters needed to construct the metric_cls instance.
         """
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
+        loss_key = kwargs.pop('loss_key', None)
         optimizer_config = self.optimizer_group[adapter_name]
         kwargs['device_mesh'] = self.device_mesh
         kwargs['process_group'] = optimizer_config._dp_group
         if is_training is None or is_training is True:
-            optimizer_config.train_status.metrics.append(construct_class(metric_cls, Metric, twinkle.metric, **kwargs))
+            metric = construct_class(metric_cls, Metric, twinkle.metric, **kwargs)
+            metric._twinkle_loss_key = loss_key
+            optimizer_config.train_status.metrics.append(metric)
         if not is_training:
-            optimizer_config.eval_status.metrics.append(construct_class(metric_cls, Metric, twinkle.metric, **kwargs))
+            metric = construct_class(metric_cls, Metric, twinkle.metric, **kwargs)
+            metric._twinkle_loss_key = loss_key
+            optimizer_config.eval_status.metrics.append(metric)
 
     @remote_function(dispatch='all')
     def set_optimizer(self, optimizer_cls: Union[Optimizer, Type[Optimizer], str], **kwargs):
@@ -1303,9 +1438,11 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
         optimizer_config.accumulate_metrics(is_training)
 
     @remote_function(collect='last_pp_first', lazy_collect=False)
+    @timed
     def calculate_metric(self, is_training, **kwargs):
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
+        optimizer_config.require_finalized('calculate metrics')
         return optimizer_config.calculate_metrics(is_training)
 
     def _create_megatron_optimizer(self, **kwargs):
@@ -1445,12 +1582,14 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
                 f'Unsupported scheduler: {scheduler_cls}, only support OptimizerParamScheduler currently.')
 
     @remote_function(dispatch='all')
+    @timed
     def clip_grad_and_step(self, max_grad_norm: float = 1.0, norm_type=2, **kwargs):
         self.step(**kwargs)
         self.zero_grad(**kwargs)
         self.lr_step(**kwargs)
 
     @remote_function(dispatch='all', collect='first', sync=True)
+    @timed
     def save(self,
              name: Optional[str] = None,
              output_dir: Optional[str] = None,
@@ -1532,6 +1671,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
         return checkpoint_dir
 
     @remote_function(dispatch='all')
+    @timed
     def load(self, name: str, output_dir: Optional[str] = None, **kwargs):
         """Load model weights, and optionally optimizer / scheduler / RNG state.
 
@@ -1605,6 +1745,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
     # training-state dict immediately (loop.resume subscripts state['cur_step']), so the lazy callable
     # default would break it. Keeps megatron backend-equivalent with the transformers variant.
     @remote_function(dispatch='all', lazy_collect=False)
+    @timed
     def resume_from_checkpoint(self, checkpoint_dir, *, resume_only_model=False, **kwargs):
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
@@ -2366,22 +2507,30 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
         return weight_generator()
 
     @remote_function(dispatch='all', lazy_collect=True)
+    @timed
     def send_weights(
         self,
         adapter_name: str = None,
         base_sync_done: bool = False,
         merge_and_sync: bool = False,
         model_keys: List[str] = None,
+        local: bool = False,
     ):
         engine = self._get_or_create_checkpoint_engine()
-        weight_generator = self._get_weight_generator(
-            adapter_name=adapter_name,
-            base_sync_done=base_sync_done,
-            merge_and_sync=merge_and_sync,
-            model_keys=model_keys,
-        )
+        if local:
+            weight_generator = self._get_local_weight_generator()
+        else:
+            weight_generator = self._get_weight_generator(
+                adapter_name=adapter_name,
+                base_sync_done=base_sync_done,
+                merge_and_sync=merge_and_sync,
+                model_keys=model_keys,
+            )
 
-        is_sender = (engine.rank is not None and engine.rank == 0)
+        # In local (paired EMA) mode every rank is a sender in its own 2-rank group.
+        # In broadcast mode only engine rank 0 actually sends; others consume silently
+        # (they still must iterate the generator for TP allgather collectives to complete).
+        is_sender = local or (engine.rank is not None and engine.rank == 0)
 
         if not is_sender:
             for _name, _tensor in weight_generator:
@@ -2399,6 +2548,76 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
                 asyncio.set_event_loop(loop)
                 try:
                     loop.run_until_complete(_send())
+                finally:
+                    loop.close()
+            except Exception as e:
+                result_container['error'] = e
+
+        thread = threading.Thread(target=_run)
+        thread.start()
+        thread.join()
+        if result_container['error'] is not None:
+            raise result_container['error']
+
+    # ── Paired EMA support (policy→reference via checkpoint-engine) ─────────
+
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
+    def prepare_ema_sender(self):
+        """Prepare this rank's engine as master for a paired 2-rank EMA group.
+
+        Returns this rank's MasterMetadata (unique TCPStore port) so the manager
+        can relay it to the paired reference rank.
+        """
+        engine = self._get_or_create_checkpoint_engine()
+        engine.is_master = True
+        return engine.prepare()
+
+    def _get_local_weight_generator(self):
+        """Yield (name, local_param_data) for this rank's Megatron shard.
+
+        Iterates each model chunk's named_parameters directly — no HF conversion,
+        no TP allgather.  Names are prefixed with ``chunk{i}.`` to disambiguate VPP
+        chunks.  The paired reference (same parallel_spec) uses identical naming.
+        """
+        models = self.strategy.unwrap_model(self.model)
+        for chunk_idx, chunk in enumerate(models):
+            for name, param in chunk.named_parameters():
+                yield f'chunk{chunk_idx}.{name}', param.data
+
+    def _get_local_state_dict(self):
+        """Return {name: param_data} for this rank's local Megatron shard."""
+        models = self.strategy.unwrap_model(self.model)
+        state = {}
+        for chunk_idx, chunk in enumerate(models):
+            for name, param in chunk.named_parameters():
+                state[f'chunk{chunk_idx}.{name}'] = param.data
+        return state
+
+    @remote_function(dispatch='all', lazy_collect=True)
+    @timed
+    def receive_weights_ema(self, alpha: float, **kwargs):
+        """Receive policy weights via checkpoint-engine and apply EMA to local params.
+
+        Streaming: processes one bucket at a time, so peak memory is one bucket
+        (not the full model).  Each received (name, tensor) is matched to the
+        local state dict by name; a mismatch raises KeyError immediately.
+        """
+        engine = self._get_or_create_checkpoint_engine()
+        local_state = self._get_local_state_dict()
+
+        async def _receive_and_ema():
+            async for name, tensor in engine.receive_weights():
+                param = local_state[name]
+                param.mul_(alpha).add_(tensor, alpha=1.0 - alpha)
+
+        result_container = {'error': None}
+
+        def _run():
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    loop.run_until_complete(_receive_and_ema())
                 finally:
                     loop.close()
             except Exception as e:

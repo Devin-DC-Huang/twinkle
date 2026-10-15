@@ -32,6 +32,7 @@ from typing import Any, Awaitable, Callable, Optional
 
 from twinkle import get_logger, remote_function
 from twinkle.data_format import SampledSequence, SampleResponse, SamplingParams
+from twinkle.perf import timed
 
 logger = get_logger()
 
@@ -112,6 +113,7 @@ class PartialRolloutMixin:
         return aborted
 
     @remote_function(dispatch='all', collect='none', lazy_collect=False)
+    @timed
     def abort_all_inflight(self) -> dict[str, int]:
         """Abort every in-flight generation on this DP worker (called on an in-place weight republish).
 

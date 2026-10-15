@@ -11,6 +11,7 @@ import twinkle
 from twinkle import preprocessor
 from twinkle.hub import HubOperation
 from twinkle.infra import remote_class, remote_function
+from twinkle.perf import timed
 from twinkle.preprocessor import DataFilter, Preprocessor
 from twinkle.template import Template
 from twinkle.utils import construct_class, processing_lock
@@ -136,6 +137,7 @@ class Dataset(TorchDataset):
         return kw
 
     @remote_function()
+    @timed
     def encode(self, add_generation_prompt: bool = False, **kwargs):
         """An inplace operation to encode the dataset.
 
@@ -267,6 +269,7 @@ class Dataset(TorchDataset):
             self._merged = self._merged.cast_column(column, ImageFeature(decode=decode))
 
     @remote_function()
+    @timed
     def map(self,
             preprocess_func: Union[Preprocessor, Callable, str, Type[Preprocessor]],
             dataset_meta: DatasetMeta = None,
@@ -297,6 +300,7 @@ class Dataset(TorchDataset):
                 self.datasets[key] = self.datasets[key].map(preprocess_func, **kw)
 
     @remote_function()
+    @timed
     def filter(self,
                filter_func: Union[Callable, str, Type[DataFilter], DataFilter],
                dataset_meta: DatasetMeta = None,

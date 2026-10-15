@@ -16,6 +16,7 @@ from twinkle.data_format import (InputFeature, PoolingParams, PoolingResponse, S
                                  SamplingParams, Trajectory)
 from twinkle.hub import HubOperation
 from twinkle.patch import Patch, apply_patch
+from twinkle.perf import timed
 from twinkle.sampler.base import Sampler
 from twinkle.sampler.generation_submission import GenerationSubmissionMixin
 from twinkle.sampler.partial_rollout import PartialRolloutMixin
@@ -242,6 +243,7 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, P
             topk_prompt_logprobs=response.topk_prompt_logprobs)
 
     @remote_function(dispatch='slice_dp', collect='flatten', lazy_collect=False, enable_continous_work=True)
+    @timed
     def sample(
         self,
         inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
@@ -413,6 +415,7 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, P
         )
 
     @remote_function(dispatch='slice_dp', collect='flatten', lazy_collect=False)
+    @timed
     def encode(
         self,
         inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
@@ -574,11 +577,13 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, P
             yield item
 
     @remote_function(dispatch='all', collect='first')
+    @timed
     def sleep(self, level: int = 1) -> None:
         """Release device memory for colocate mode. Needs ``enable_memory_saver=True``."""
         self._run_in_loop(self.engine.sleep(level))
 
     @remote_function(dispatch='all', collect='first')
+    @timed
     def wake_up(self, tags: List[str] = None) -> None:
         self._run_in_loop(self.engine.wake_up(tags=tags))
 
@@ -587,6 +592,7 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, P
         self._run_in_loop(self.engine.reset_prefix_cache())
 
     @remote_function(dispatch='all', lazy_collect=True)
+    @timed
     def receive_weights(
         self,
         base_sync_done: bool = False,

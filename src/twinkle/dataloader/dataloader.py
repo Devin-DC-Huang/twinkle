@@ -1,5 +1,4 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import os
 import warnings
 from functools import partial
 from typing import Callable, Optional, Sequence, Type, Union
@@ -34,7 +33,12 @@ class DataLoader:
             it is continuing. See :class:`EpochSampler`.
         group_by_length: Batch samples of similar length together to cut padding. Needs ``lengths``.
         lengths: One length per sample, for ``group_by_length``.
-        max_retries: Number of times to retry at one time if data fetch fails.
+        max_retries: How many replacements to try for a sample that cannot be read. 0 substitutes
+            nothing and lets the original failure through -- the strict mode, for a caller that would
+            rather stop on a bad row than train on a different one. See :class:`RetryDataset`.
+        retry_seed: Seeds the replacement draw, so a given failing index resolves to the same
+            replacement on every rank and on every run. Defaults to the process-wide torch seed
+            (see :meth:`_resolve_retry_seed`); pass the caller's own data seed to tie the two together.
         kwargs: The dataloader creation parameters.
     """
 
@@ -48,6 +52,7 @@ class DataLoader:
                  group_by_length: bool = False,
                  lengths: Optional[Sequence] = None,
                  data_sharding: bool = False,
+                 retry_seed: Optional[int] = None,
                  **kwargs):
         if isinstance(dataset, Callable):
             self.dataset: Dataset = dataset()
@@ -83,7 +88,7 @@ class DataLoader:
         self._consumed_train_samples = 0
         self._base_batch_sampler = None
         self._base_sampler = None
-        self._retry_seed = self._resolve_retry_seed()
+        self._retry_seed = self._resolve_retry_seed() if retry_seed is None else int(retry_seed)
         self._set_work_init_fn()
 
     def _set_work_init_fn(self):
@@ -95,15 +100,14 @@ class DataLoader:
 
     @staticmethod
     def _resolve_retry_seed() -> int:
-        """The seed :class:`RetryDataset` draws replacements with, so they match across ranks."""
-        env_seed = os.environ.get('TWINKLE_SEED')
-        if env_seed is not None:
-            return int(env_seed)
-        try:
-            from twinkle.infra import _seed
-            return int(_seed)
-        except Exception:
-            return 42
+        """The seed :class:`RetryDataset` draws replacements with, so they match across ranks.
+
+        Reads the process-wide torch knob set -- the ``EXTRA_TORCH_KWARGS`` blob that ``initialize``
+        writes and a Ray worker inherits through its runtime_env -- so the draw agrees everywhere
+        without a caller having to thread a seed through. An explicit ``retry_seed`` wins over this.
+        """
+        from twinkle.infra import _torch_setup
+        return _torch_setup.seed_from_env()
 
     @remote_function()
     def __len__(self):

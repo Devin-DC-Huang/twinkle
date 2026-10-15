@@ -261,3 +261,73 @@ class CheckpointEngineManager:
             self.base_sync_done = True
             if not merge_and_sync:
                 logger.info('Base model sync completed, subsequent syncs will be LoRA-only')
+
+    # ── Paired EMA sync (policy → reference) ────────────────────────────────
+
+    def sync_ema(self, alpha: float):
+        """Synchronize reference weights as an EMA of policy weights.
+
+        Each policy rank k and reference rank k form an independent 2-rank NCCL group:
+        policy sends its LOCAL shard parameters, reference receives and applies
+        ``param.mul_(alpha).add_(received, alpha=1-alpha)``.  Peak memory per rank is
+        one engine bucket (configurable, default 2-3 GB), independent of model size.
+
+        Requires policy and reference to have the SAME parallel_spec (identical sharding),
+        so local parameter names and shapes match one-to-one across the pair.
+
+        Args:
+            alpha: EMA decay factor.  ``ref = alpha * ref + (1 - alpha) * policy``.
+                   Closer to 1 means slower tracking.
+        """
+        if self.mode == 'naive':
+            self._sync_ema_naive(alpha)
+            return
+
+        world_size = self.model.device_mesh.world_size
+        ref_world_size = self.sampler.device_mesh.world_size
+        if world_size != ref_world_size:
+            raise ValueError(
+                f'Paired EMA requires policy and reference to have the same world_size '
+                f'(policy={world_size}, reference={ref_world_size}); use the same parallel_spec.')
+
+        # Phase 1: all policy ranks prepare as master (each gets a unique TCPStore port).
+        all_metadata = self.model.prepare_ema_sender()
+        if not isinstance(all_metadata, list):
+            all_metadata = [all_metadata]
+        # Reference ranks prepare as non-master (allocate receive buffers).
+        # Scalar False: dispatch='slice' broadcasts it identically to every rank.
+        self.sampler.prepare_checkpoint_engine(False)
+
+        # Phase 2: init paired 2-rank groups (policy rank k = NCCL rank 0, ref rank k = rank 1).
+        model_init = self.model.init_checkpoint_process_group(
+            rank=[0] * world_size,
+            world_size=[2] * world_size,
+            master_metadata=all_metadata,
+        )
+        sampler_init = self.sampler.init_checkpoint_process_group(
+            rank=[1] * world_size,
+            world_size=[2] * world_size,
+            master_metadata=all_metadata,
+        )
+        model_init()
+        sampler_init()
+
+        # Phase 3: concurrent send (local shard) / receive+EMA.
+        send_future = self.model.send_weights(local=True)
+        recv_future = self.sampler.receive_weights_ema(alpha)
+        send_future()
+        recv_future()
+
+        # Phase 4: finalize.
+        self.model.finalize_checkpoint_engine()
+        self.sampler.finalize_checkpoint_engine()
+
+    def _sync_ema_naive(self, alpha: float):
+        """In-process EMA: iterate policy's local params and blend into reference's."""
+        import torch
+        policy_state = dict(self.model._get_local_state_dict())
+        ref_state = dict(self.sampler._get_local_state_dict())
+        with torch.no_grad():
+            for name, policy_param in policy_state.items():
+                ref_param = ref_state[name]
+                ref_param.data.mul_(alpha).add_(policy_param.data, alpha=1.0 - alpha)

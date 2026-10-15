@@ -99,6 +99,10 @@ class SafeLossWrapper(Loss):
         """Preserve the wrapped loss's micro-batch reduction semantics."""
         return self._loss_instance.micro_batch_scale(inputs, indices)
 
+    def batch_normalizer(self, inputs):
+        """Preserve the wrapped loss's additive reduction denominator."""
+        return self._loss_instance.batch_normalizer(inputs)
+
 
 def _zero_loss(outputs) -> 'LossOutput':
     """Create a graph-connected zero loss for FSDP compatibility.

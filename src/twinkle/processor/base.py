@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Literal, Optional, Union
 
 from twinkle import DeviceMesh, Platform, remote_class, remote_function, torch_util
 from twinkle.data_format import InputFeature
+from twinkle.perf import timed
 from twinkle.utils.transformers_utils import is_flash_attention_implementation
 
 
@@ -85,6 +86,7 @@ class InputProcessor:
         ]
 
     @remote_function()
+    @timed
     def __call__(self, inputs: Union[InputFeature, List[InputFeature]],
                  **kwargs) -> Union[InputFeature, List[InputFeature]]:
         for pipe in self.process_pipeline:
@@ -167,6 +169,11 @@ class InputProcessor:
         pooling (with padding-free / SP gather awareness) and writes the
         pooled ``[n_seqs, H]`` tensor to ``outputs['embeddings']``; the raw
         per-token ``outputs['features']`` is consumed and removed.
+
+        For ``task='seq_cls'``/``'reranker'`` the model outputs per-token scores
+        ``[B, T, num_labels]`` (TransformersValuePatch skips HF's internal pooling);
+        this method pools them to ``[n_seqs, num_labels]`` via the same packed-aware
+        last-valid-token logic as embedding.
         """
         sp_strategy = kwargs.get('sp_strategy')
         task = kwargs.get('task', 'causal_lm')
@@ -174,6 +181,8 @@ class InputProcessor:
             return self._postprocess_embedding(inputs, outputs, sp_strategy=sp_strategy)
         if task == 'generative_reranker':
             return self._postprocess_generative_reranker(inputs, outputs, sp_strategy=sp_strategy)
+        if task in ('seq_cls', 'reranker'):
+            return self._postprocess_seq_cls(inputs, outputs, sp_strategy=sp_strategy)
         if self.framework == 'transformers' and sp_strategy is not None:
             return sp_strategy.gather_loss_tensors(inputs, outputs)
         return inputs, outputs
@@ -228,6 +237,24 @@ class InputProcessor:
         assert logits is not None, (
             "outputs['logits'] missing; ensure TransformersGenerativeRerankerPatch is applied and the "
             'reranker loss sets require_logits=True.')
+        pooled, _ = self._pool_last_valid_token(logits, inputs, sp_strategy=sp_strategy)
+        outputs = copy(outputs)
+        outputs['logits'] = pooled.contiguous()
+        return inputs, outputs
+
+    def _postprocess_seq_cls(self,
+                             inputs: Dict[str, Any],
+                             outputs: Dict[str, Any],
+                             sp_strategy=None) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        """Pool per-token seq_cls/reranker scores ``[B, T, num_labels]`` to ``[n_seqs, num_labels]``.
+
+        Same last-valid-token logic as embedding/generative_reranker, packed-aware.
+        TransformersValuePatch(squeeze_single=False) surfaces the per-token scores;
+        this method reduces them so the loss sees one score per sequence.
+        """
+        logits = outputs.get('logits')
+        if logits is None:
+            return inputs, outputs
         pooled, _ = self._pool_last_valid_token(logits, inputs, sp_strategy=sp_strategy)
         outputs = copy(outputs)
         outputs['logits'] = pooled.contiguous()
@@ -670,9 +697,11 @@ class InputProcessor:
 
         For ``task='embedding'`` the outputs are already pooled to ``[n_seqs, H]``
         by ``postprocess_tensor_sp``, so this is a no-op. Same for
-        ``task='generative_reranker'``, whose logits are already reduced to ``[n_seqs, 1]``.
+        ``task='generative_reranker'``, whose logits are already reduced to ``[n_seqs, 1]``,
+        and ``task='seq_cls'``/``'reranker'``, whose per-token scores are pooled to
+        ``[n_seqs, num_labels]`` by ``_postprocess_seq_cls``.
         """
-        if task in ('embedding', 'generative_reranker'):
+        if task in ('embedding', 'generative_reranker', 'seq_cls', 'reranker'):
             return inputs, outputs
         labels = inputs.get('labels')
         position_ids = inputs.get('position_ids')

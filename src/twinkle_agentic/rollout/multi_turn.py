@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import json
 import re
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Literal, Optional
 
 from twinkle.data_format import Trajectory
@@ -10,11 +11,30 @@ from twinkle.template.base import Template
 from twinkle_agentic.protocol.api_sampler import APIGenerationError, APISampler
 from twinkle_agentic.protocol.base import API
 from twinkle_agentic.tools.tool_manager import ToolManager
-from .base import MAX_FOLLOWUPS, STOP_GENERATION_ERROR, Rollout
+from .base import MAX_FOLLOWUPS, STOP_GENERATION_ERROR, STOP_NO_TOOL, Rollout
 from .ledger import MessageLedger, TurnLedger
 from .trace import TraceWriter
 
 ResponseCallback = Callable[..., SampledSequence]
+
+
+@dataclass(frozen=True)
+class StreamDelta:
+    """One token delta of the current generation, for live display."""
+    text: str
+
+
+@dataclass(frozen=True)
+class StreamToolCall:
+    """One turn's dispatched tool calls: the function names and what each returned."""
+    names: List[str] = field(default_factory=list)
+    observations: List[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class StreamDone:
+    """The finished episode: a message-level transcript trajectory (NOT trainable -- no token fields)."""
+    trajectory: Trajectory
 
 
 def _default_response_callback(sampler, api, sampling_params, *, input_feature, adapter_kwargs,
@@ -82,6 +102,21 @@ def _call_key(tool_call: Dict[str, Any]) -> str:
         except (TypeError, ValueError):
             args = repr(args)
     return f'{name}\x00{args}'
+
+
+def _tool_call_names(tool_calls: List[Dict[str, Any]]) -> List[str]:
+    """The function names of this turn's calls, in order, for display.
+
+    Reads the same three shapes :func:`_call_key` does (``function.name`` / ``name`` / ``tool_name``);
+    a call whose name cannot be read is dropped rather than shown as an empty string.
+    """
+    names: List[str] = []
+    for tool_call in tool_calls:
+        fn = tool_call.get('function') if isinstance(tool_call.get('function'), dict) else {}
+        name = fn.get('name') or tool_call.get('name') or tool_call.get('tool_name') or ''
+        if name:
+            names.append(name)
+    return names
 
 
 def _default_tool_messages(
@@ -327,6 +362,85 @@ class MultiTurnRollout(Rollout):
     def __call__(self, trajectories: List[Trajectory], **kwargs) -> List[Trajectory]:
         """The base implementation; the decorator is what a deployed handle needs."""
         return super().__call__(trajectories, **kwargs)
+
+    def stream(self, trajectory: Trajectory, *, sampling_params: Optional[SamplingParams] = None,
+               tool_manager: Optional[ToolManager] = None, adapter_path: Optional[str] = None):
+        """Display-only streaming variant of ONE episode: yield token deltas live, then the transcript.
+
+        Runs the same tool loop as :meth:`_run_episode` but accounts at the MESSAGE level (a
+        :class:`MessageLedger`, template-aware so tool-call markup in the reply text still parses) and
+        streams each generation's text deltas as they arrive, so an interactive REPL can echo tokens
+        live. The result is a transcript, NOT a trainable trajectory: ``sample_stream`` yields text
+        only, so no token ids / labels / logprobs are banked. Training rollouts keep using the blocking
+        :meth:`__call__` path, which produces the trainable per-token account.
+
+        Single-trajectory and local: a generator does not cross the Ray boundary, so this needs an
+        in-process sampler with ``sample_stream`` (the TUI), not a deployed handle or an API backend.
+
+        Termination is deliberately simpler than ``_run_episode`` (no follow-up stages, no stuck-turn
+        or malformed-markup retries -- those are training-rollout concerns): the episode ends when the
+        model stops calling tools, when a generation hits its length cap, or at ``max_turns``.
+
+        Yields:
+            :class:`StreamDelta` for each token delta of each turn's generation;
+            :class:`StreamToolCall` after each turn that dispatched tools;
+            :class:`StreamDone` once at the end, carrying the transcript trajectory.
+        """
+        if self.sampler is None or not hasattr(self.sampler, 'sample_stream'):
+            raise ValueError('MultiTurnRollout.stream requires a local sampler exposing sample_stream; '
+                             'an API / response_callback backend has no token stream to show.')
+        params = sampling_params if sampling_params is not None else self.sampling_params
+        if params is None:
+            params = SamplingParams()
+        # Fall back to the construction-time tool_manager, as __call__/_resolve_call does, so a caller
+        # that wired tools at build time need not re-pass them per stream.
+        tool_manager = tool_manager if tool_manager is not None else self.tool_manager
+        # Message-level accounting, but template-aware so a reply's tool-call markup still parses. The
+        # feature stays a {'messages','tools'} dict with no input_ids, so sample_stream re-encodes the
+        # whole trajectory each turn and the tool schema reaches the prompt tokens.
+        ledger = MessageLedger(label='stream', max_tokens=self.max_trajectory_tokens, template=self.template)
+        opening_tools = None
+        if 'tools' not in trajectory and tool_manager is not None:
+            opening_tools = list(tool_manager.tool_infos() or [])
+        ledger.open(trajectory, tools=opening_tools)
+
+        stop_reason: Optional[str] = None
+        truncated = False
+        turns = 0
+        while turns < self.max_turns:
+            turns += 1
+            pieces: List[str] = []
+            finish: Optional[str] = None
+            for delta, finish_reason in self.sampler.sample_stream(ledger.input_feature, params,
+                                                                   adapter_path=adapter_path):
+                if delta:
+                    pieces.append(delta)
+                    yield StreamDelta(delta)
+                if finish_reason is not None:
+                    finish = finish_reason
+            text = ''.join(pieces)
+            stop_reason = finish or STOP_NO_TOOL
+            ledger.record(SampledSequence(stop_reason=stop_reason, tokens=[], decoded=text))
+            if finish == 'length':
+                # Cut off mid-reply: the tokens streamed are all there is, and no tool call it was
+                # still emitting gets dispatched (the turn never decided it was done).
+                truncated = True
+                break
+            tool_calls = ledger.parse_tool_call(text)
+            if not tool_calls:
+                break
+            if turns >= self.max_turns:
+                # Out of turns: the model asked for tools but there is no further generation to read
+                # their results, so do not dispatch (mirrors _run_episode) -- mark the episode truncated.
+                truncated = True
+                break
+            if tool_manager is None:
+                raise ValueError('the model emitted tool_calls but stream() was given no tool_manager')
+            observations = self._run_tools(tool_manager, tool_calls)
+            yield StreamToolCall(names=_tool_call_names(tool_calls), observations=observations)
+            ledger.observe(_default_tool_messages(tool_calls, observations))
+        out = ledger.merge(trajectory, turns=ledger.turns, stop_reason=stop_reason, truncated=truncated)
+        yield StreamDone(out)
 
     def _resolve_call(self, kwargs: Dict[str, Any], n: int) -> Dict[str, Any]:
         adapter_path = kwargs.get('adapter_path', self.adapter_path)

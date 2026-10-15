@@ -184,6 +184,20 @@ class TimeRecorder:
             return 0
         return self._last_end_ns - self._first_start_ns
 
+    def bubble_s(self) -> float:
+        """Idle seconds in the recorded window: wall time not covered by any root span.
+
+        A root span (parent ``None``) is a top-level timed operation, so the union of the
+        root spans is the window's busy time and ``wall - busy`` is the gap spent waiting --
+        for data, for dispatch, for a peer rank. Clamped at 0 because concurrent roots can
+        overlap and over-count busy. Complements each span's ``self_s`` (idle *inside* a
+        span, between its children) with the idle *between* top-level spans.
+        """
+        with self._lock:
+            wall_ns = self._wall_ns()
+            root_busy_ns = sum(total for (parent, _name), (_count, total) in self._edges.items() if parent is None)
+        return max(0, wall_ns - root_busy_ns) / _NS_PER_SEC
+
     def summary(self) -> Dict[str, Any]:
         """Structured aggregate: per-span timings plus the nesting tree.
 

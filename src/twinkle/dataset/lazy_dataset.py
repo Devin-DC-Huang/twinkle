@@ -3,6 +3,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
 import twinkle
 from twinkle import remote_class, remote_function
+from twinkle.perf import timed
 from twinkle.preprocessor import DataFilter, Preprocessor
 from twinkle.utils import construct_class, processing_lock
 from .base import Dataset, DatasetMeta
@@ -64,6 +65,7 @@ class LazyDataset(Dataset):
         return list(self.datasets.keys())
 
     @remote_function()
+    @timed
     def map(self,
             preprocess_func: Union[Preprocessor, Callable, str, Type[Preprocessor]],
             dataset_meta: DatasetMeta = None,
@@ -88,6 +90,7 @@ class LazyDataset(Dataset):
             self._lazy_map_ops.setdefault(key, []).append((func, kwargs))
 
     @remote_function()
+    @timed
     def filter(self,
                filter_func: Union[Callable, str, Type[DataFilter], DataFilter],
                dataset_meta: DatasetMeta = None,
@@ -130,6 +133,7 @@ class LazyDataset(Dataset):
             self._invalidate_length_cache()
 
     @remote_function()
+    @timed
     def encode(self, add_generation_prompt: bool = False, **kwargs):
         """Record encode operation for lazy execution."""
         assert self.template is not None

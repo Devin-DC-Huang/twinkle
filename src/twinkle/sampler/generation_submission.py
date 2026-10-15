@@ -29,6 +29,7 @@ from typing import Any
 
 from twinkle import remote_function
 from twinkle.data_format import SampleResponse, SamplingParams
+from twinkle.perf import timed
 
 
 def _dispatch_generation(
@@ -87,6 +88,7 @@ class GenerationSubmissionMixin:
         raise NotImplementedError(f'{type(self).__name__} must implement _generate_inputs')
 
     @remote_function(dispatch=_dispatch_generation, collect='none', lazy_collect=False)
+    @timed
     def submit_generation(
         self,
         submission_id: str,
@@ -149,6 +151,7 @@ class GenerationSubmissionMixin:
         return {'submission_id': submission_id, 'status': 'completed'}
 
     @remote_function(dispatch='all', collect='flatten', lazy_collect=False)
+    @timed
     def collect_generation(self, submission_id: str) -> list[SampleResponse]:
         """Consume completed responses from every DP worker."""
         future = self._generation_submissions.get(submission_id)
@@ -181,6 +184,7 @@ class GenerationSubmissionMixin:
         }
 
     @remote_function(dispatch='all', collect='none', lazy_collect=False)
+    @timed
     def cancel_all_generations(self) -> dict[str, int]:
         """Cancel all retained submissions during replica shutdown."""
         submissions = list(self._generation_submissions.values())

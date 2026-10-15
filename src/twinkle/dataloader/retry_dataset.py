@@ -22,7 +22,14 @@ class RetryDataset:
     A failing index is replaced rather than dropped, so a batch keeps the width the caller asked for
     and an epoch stays ``len(dataset)`` samples long. Replacements come from a generator seeded by
     ``(seed, index)``: reproducible, and needing no state shared between workers, which a running
-    counter would.
+    counter would. Being a pure function of those two is also what makes it resumable -- a run
+    continuing from a checkpoint resolves a given failing index to the same replacement it would have,
+    because nothing about the draw depends on how many failures came before it.
+
+    ``max_retries=0`` turns substitution off: the read is unguarded, so the first failure propagates as
+    itself. That is the mode a caller wants when a bad row is a defect to stop for rather than one to
+    train around, and the original exception carries the reason (a too-long row says so) which the
+    ``RuntimeError`` at the end of the retry path does not.
 
     Note this substitutes on a transient failure too, rather than insisting on the requested index. For
     training that is the better trade -- no single sample matters, and a flaky mount stalls nothing --
@@ -31,19 +38,28 @@ class RetryDataset:
 
     Args:
         dataset: The dataset to read through.
-        max_retries: How many replacements to try before giving up on a batch position.
+        max_retries: How many replacements to try before giving up on a batch position. 0 substitutes
+            nothing and lets the original failure through.
         seed: Seeds the replacement draw, so a given index resolves the same way across runs.
     """
 
     def __init__(self, dataset, max_retries: int = 20, seed: int = 42):
         self.dataset = dataset
-        self.max_retries = max_retries
+        self.max_retries = int(max_retries)
         self.seed = int(seed)
 
     def __len__(self) -> int:
         return len(self.dataset)
 
     def __getitem__(self, index: int) -> Any:
+        if self.max_retries <= 0:
+            # Strict: no substitute and no guard, so the caller sees the exception the dataset itself
+            # raised rather than a wrapper reporting only that something could not be read.
+            data = self.dataset[index]
+            if not data:
+                raise ValueError(f'Sample {index} read back empty, and substitution is off '
+                                 '(max_retries=0), so there is nothing to serve at that position.')
+            return data
         data = self._load(index)
         if data is not None:
             return data
