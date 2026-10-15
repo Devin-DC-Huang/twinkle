@@ -420,13 +420,12 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 self.sp_strategy.initialize()
             self._ensure_gdn_padding_free_patch()
 
-            if len(optimizer_groups) == 1:
-                optimizer_group = optimizer_groups[0]
-                optimizer = optimizer_group.optimizer
-                assert optimizer is not None
-                self.model, optimizer = self.strategy.wrap_model(self.model, optimizer)
-                optimizer_group.optimizer = optimizer
-                self.register_mm_forward_hook(optimizer_group)
+            if optimizer_groups:
+                result = self.strategy.wrap_model(self.model, *(group.optimizer for group in optimizer_groups))
+                self.model = result[0]
+                for optimizer_group, optimizer in zip(optimizer_groups, result[1:], strict=True):
+                    optimizer_group.optimizer = optimizer
+                    self.register_mm_forward_hook(optimizer_group)
             else:
                 # maybe forward_only, no optimizer_group available
                 result = self.strategy.wrap_model(self.model)
@@ -440,7 +439,24 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         model = self.strategy.unwrap_model(self.model)
         template = optimizer_group.template
         assert template is not None
-        optimizer_group._handler = model.register_forward_pre_hook(template.pre_forward_hook, with_kwargs=True)
+
+        def forward_hook(model, args, kwargs):
+            selected_group = getattr(self, '_forward_optimizer_group', None)
+            if selected_group is None:
+                selected_group = self.optimizer_group.get(self._get_default_group())
+            if selected_group is optimizer_group:
+                return template.pre_forward_hook(model, args, kwargs)
+
+        optimizer_group._handler = model.register_forward_pre_hook(forward_hook, with_kwargs=True)
+
+    @contextlib.contextmanager
+    def _mm_forward_context(self, optimizer_group: OptimizerGroup):
+        previous = getattr(self, '_forward_optimizer_group', None)
+        self._forward_optimizer_group = optimizer_group
+        try:
+            yield
+        finally:
+            self._forward_optimizer_group = previous
 
     def unregister_mm_forward_hook(self, optimizer_group: OptimizerGroup):
         if optimizer_group._handler is not None:
@@ -605,7 +621,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         rr_cleanup = self._router_replay_setup(router_replay_action, routed_experts, batch_size,
                                                router_replay_manual_cleanup)
 
-        with _resolve_task_context(self.model, task):
+        with _resolve_task_context(self.model, task), self._mm_forward_context(optimizer_config):
             outputs = self.model(**inputs)
 
         recorded_routing = rr_cleanup()
@@ -734,7 +750,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             lora_ctx = (
                 unwrapped_model.disable_adapter()
                 if disable_lora and isinstance(unwrapped_model, PeftModel) else contextlib.nullcontext())
-            with _resolve_task_context(self.model, task), lora_ctx:
+            with _resolve_task_context(self.model, task), lora_ctx, self._mm_forward_context(optimizer_config):
                 outputs = self.model(**inputs)
 
             recorded_routing = rr_cleanup()
@@ -1618,11 +1634,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
     def resume_from_checkpoint(self, checkpoint_dir, *, resume_only_model=False, **kwargs):
         adapter_name = kwargs.get('adapter_name', '')
 
-        has_adapter = (
-            os.path.exists(os.path.join(checkpoint_dir, 'adapter_model.safetensors'))
-            or os.path.exists(os.path.join(checkpoint_dir, 'adapter_model.bin')))
-        if has_adapter:
-            self.load(checkpoint_dir, adapter_name=adapter_name)
+        self.load(checkpoint_dir, adapter_name=adapter_name)
 
         if not resume_only_model:
             trainer_state = self._restore_training_state(checkpoint_dir, adapter_name=adapter_name)

@@ -365,6 +365,9 @@ class MultiLoraMegatronModel(MegatronModel):
                 adapter_name=real_adapter_name,
                 converter=self.multi_adapter.load_lora_converter)
 
+        optimizer_config = self.optimizer_group.get(adapter_name)
+        if optimizer_config is not None and optimizer_config.optimizer is not None:
+            optimizer_config.optimizer.reload_model_params()
         if load_optimizer:
             with self.optimizer_context(real_adapter_name):
                 self._load_multi_lora_optimizer(checkpoint_dir, adapter_name=adapter_name, **kwargs)

@@ -980,6 +980,9 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 checkpoint_dir,
                 peft_format=(adapter_name != _default_adapter_name),
             )
+            optimizer_config = self.optimizer_group.get(adapter_name)
+            if optimizer_config is not None and optimizer_config.optimizer is not None:
+                optimizer_config.optimizer.reload_model_params()
 
         if dist.is_initialized():
             dist.barrier()
@@ -1013,7 +1016,7 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         if dist.is_initialized():
             dist.barrier()
 
-    @remote_function(dispatch='all')
+    @remote_function(dispatch='all', collect='first', sync=True, timeout=3600)
     def resume_from_checkpoint(self, checkpoint_dir, *, resume_only_model=False, **kwargs):
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
 
