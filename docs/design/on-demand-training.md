@@ -25,7 +25,7 @@ resource waiting queues, preemption, training batching, or automatic checkpointi
 | R10 | New specifications use business inactivity, defaulting to 1800 seconds. |
 | R11 | Heartbeats, polling, health, and information queries do not renew business inactivity. |
 | R12 | Remove an empty dynamic instance immediately; retain clean resident capacity. |
-| R13 | Expired handles stay invalid; users explicitly recreate and restore saved state. |
+| R13 | Expired handles stay invalid; users explicitly recreate. No checkpoint is resumed implicitly. |
 | R14 | Worker failure or controller restart invalidates affected handles without replaying training. |
 | R15 | Retain the existing instance queue and backend execution gate. |
 | R16 | Keep `applications`, old model arguments, and SDK methods; use one controller. |
@@ -153,17 +153,17 @@ Serve teardown behavior.
 | A11 | Partial startup, cancellation, and allocation failure leave correct quota and ownership. |
 | A12 | Worker/controller failure fences old handles and preserves unrelated instances. |
 | A13 | Same-label recreation, old requests, and sequence retries cannot mutate another handle. |
-| A14 | Explicit recreation restores saved weights and optimizer state. |
+| A14 | Explicit recreation starts with clean weights and optimizer state; checkpoint restoration is separate. |
 | A15 | Resident full reset leaves a clean base for the next user. |
 | A16 | Ten cross-model reload cycles leave no accumulated workers, PGs, or device memory. |
 | A17 | Invalid mode/config, expired IDs, and cross-user access fail without allocation. |
-| A18 | Related SDK, YAML, checkpoint, and repository regressions pass together. |
+| A18 | Related SDK, YAML, and repository CPU regressions pass together. |
 | A19 | Late startup/user initialization cannot publish success or prematurely reuse a slot. |
 | A20 | Memory and Redis recovery invalidate old state and rebuild quota correctly. |
 | A21 | Checkpoint upload needs no base; patched residents rebuild before reuse. |
 
 Review regressions also cover nonblocking resident recovery, launcher initialization
 rollback, lost completion notification, and sequence-receipt expiry. CPU/logical Ray
-resources are not device training evidence. The revised code still requires both
-backend device reruns, including an SP=true check for the Megatron LoRA forward path.
+resources are not device training evidence. The standalone resource lifecycle is accepted with DP on both backends.
+Checkpoint restoration and FSDP/TP/SP backend repairs are tracked separately in #315.
 Raw device evidence is retained outside the public source tree.

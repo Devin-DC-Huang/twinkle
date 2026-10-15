@@ -554,10 +554,7 @@ class ComputeWorker:
                 continue
 
             # Execute the task (serial: stops after the first execution)
-            try:
-                await self._execute_task(task, queue_key, q)
-            finally:
-                self._request_ids.discard(task.request_id)
+            await self._execute_task(task, queue_key, q)
             return True
 
         return False

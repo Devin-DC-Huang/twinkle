@@ -195,7 +195,7 @@ class ModelManagement(ManagedTrainingRuntime, TaskQueueMixin, AdapterManagerMixi
         return await asyncio.shield(self._health_probe_task)
 
     def mark_unhealthy(self) -> None:
-        """Flag the deployment unhealthy; /healthz returns 503 until a probe recovers it."""
+        """Flag this training runtime unhealthy until the controller replaces it."""
         self._model_unhealthy = True
 
     async def _probe_after_timeout(self) -> None:

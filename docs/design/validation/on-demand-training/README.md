@@ -1,35 +1,30 @@
 # On-demand training validation
 
-The review fixes passed local validation with CPU models, real Ray scheduling,
-the Native/Tinker SDKs over HTTP, and isolated memory/Redis state:
+PR #312 is based directly on main. It does not require the checkpoint,
+FSDP optimizer, or Megatron TP/SP repairs in #315. Its backend changes are
+limited to resetting resident full-training state and using the supported
+Transformers configuration import needed to initialize Megatron.
 
-- Server, model, Transformers, and client CPU regression: 807 passed, no failures,
-  and 21 hardware-specific tests skipped.
-- HTTP mock acceptance: passed for both SDKs in shared LoRA and exclusive full
-  modes, including release/recreation, runtime lifecycle rejection, controller
-  restart, state loss, and ten reuse cycles.
-- Existing YAML startup: passed with memory state and with Redis state.
-- The separate backend prerequisite (#315): 17 focused CPU regressions passed
-  without failures or skips in an isolated checkout.
-
-Repository pre-commit checks passed. Raw local outputs are retained outside the
-repository.
-
-Real-device validation of the revised code is deferred at the user's request
-because the PPU server is running other tests. PR #312 remains a draft.
-
-The previous runtime (`1bcf657e1534f6023b5de605b5a204c94705729b`) passed nine
-acceptance cases on each of Transformers and Megatron, with no failures or skips.
-Those results do not validate the revised lifecycle code. Raw logs, JUnit files,
-server configurations, and numerical results are retained outside the repository.
+Collected CPU tests under `tests/server/training/` exercise the controller,
+allocation, recovery, and both installed SDKs over HTTP using a mock backend.
+The HTTP and allocation probes run in isolated subprocesses. Existing
+applications YAML startup can also be checked with memory and Redis state.
 
 Standalone validation programs live in `tools/validation/on_demand_training/`.
-The collected CPU tests under `tests/server/training/` run their allocation and
-HTTP programs in isolated processes. Device validation is explicitly invoked:
+The DP resource-lifecycle device suite is explicitly invoked:
 
 ```bash
 python -m pytest tools/validation/on_demand_training/device_validation.py -vv
 ```
 
-It requires the backend, model paths, a separate evidence directory, and free
-devices configured by `TWINKLE_DEVICE_*`. It must not run against occupied devices.
+It runs DP=2, TP=1, and no FSDP for both backends and both SDKs in shared
+LoRA/exclusive full modes. Assertions cover actual training and tenant isolation,
+release, cross-model reuse, business-idle reclamation, expired handles, and clean
+recreation. Checkpoint I/O and FSDP/TP repairs belong to #315, not this acceptance.
+Results from older revisions containing #315 do not validate standalone #312.
+
+Device validation requires explicit `TWINKLE_DEVICE_*` configuration, a separate
+evidence directory, and exclusively available devices. Record the exact source
+SHA, import origins, raw JUnit/logs, numerical assertions, and resource cleanup.
+Current results and remaining limitations are recorded in the English PR body;
+results from an older revision are not acceptance evidence for the new head.

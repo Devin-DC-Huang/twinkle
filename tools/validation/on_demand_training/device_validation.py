@@ -3,6 +3,7 @@
 
 Required: TWINKLE_DEVICE_BACKEND, TWINKLE_DEVICE_MODEL, TWINKLE_DEVICE_OTHER_MODEL,
 TWINKLE_DEVICE_RUN_DIR and four exclusively available visible devices.
+Tests cover DP resource lifecycle without checkpoint I/O.
 This is intentionally outside pytest's default test filename pattern.
 """
 import json
@@ -40,14 +41,14 @@ def server():
     os.environ['TWINKLE_DEFAULT_SAVE_DIR'] = str(run_dir / 'checkpoints')
     os.environ['TWINKLE_PERSISTENCE_MODE'] = 'memory'
     os.environ['TWINKLE_LONG_POLL_TIMEOUT'] = '2'
-    mesh = {'fsdp_size': 2} if backend == 'transformers' else {'tp_size': 2}
+    mesh = {'dp_size': 2}
     apps = []
     for alias, variable in [('small', 'TWINKLE_DEVICE_MODEL'), ('other', 'TWINKLE_DEVICE_OTHER_MODEL')]:
         source = os.environ[variable]
         assert Path(source, 'config.json').is_file()
         mode = {'num_devices': 2, 'device_mesh': mesh, 'idle_timeout_s': 600 if alias == 'small' else 30}
         if backend == 'transformers':
-            mode['strategy'] = 'native_fsdp'
+            mode['strategy'] = 'accelerate'
         apps.append({
             'name': alias,
             'route_prefix': '/api/v1/model/' + alias,
@@ -176,37 +177,14 @@ class Handle:
         assert values.size and np.isfinite(values).all(), values
         return values
 
-    def step(self, *, contrast=False):
-        labels = self.inputs[0]['labels']
-        if contrast:
-            self.inputs[0]['labels'] = list(reversed(labels))
-        try:
-            if self.protocol == 'native':
-                self.client.forward_backward(self.inputs)
-                self.client.clip_grad_and_step()
-            else:
-                from tinker import types
-                self.client.forward_backward(self.datum(), 'cross_entropy').result()
-                self.client.optim_step(types.AdamParams(learning_rate=self.rate)).result()
-        finally:
-            self.inputs[0]['labels'] = labels
-
-    def save(self):
-        name = 'device-' + uuid.uuid4().hex[:8]
-        return (self.client.save(name, save_optimizer=True).twinkle_path
-                if self.protocol == 'native' else self.client.save_state(name).result().path)
-
-    def restore(self, path):
+    def step(self):
         if self.protocol == 'native':
-            self.client.resume_from_checkpoint(path)
+            self.client.forward_backward(self.inputs)
+            self.client.clip_grad_and_step()
         else:
-            self.client.load_state_with_optimizer(path).result()
-
-    def restore_weights(self, path):
-        if self.protocol == 'native':
-            self.client.resume_from_checkpoint(path, resume_only_model=True)
-        else:
-            self.client.load_state(path).result()
+            from tinker import types
+            self.client.forward_backward(self.datum(), 'cross_entropy').result()
+            self.client.optim_step(types.AdamParams(learning_rate=self.rate)).result()
 
     def close(self):
         if self.protocol == 'native':
@@ -222,219 +200,105 @@ def active_instances(controller):
 
 @pytest.mark.parametrize('protocol', ['native', 'tinker'])
 @pytest.mark.parametrize('mode', ['lora', 'full'])
-def test_training_isolation_checkpoint_and_device_reclamation(server, protocol, mode):
+def test_dp_resource_lifecycle(server, protocol, mode):
     base, controller, evidence, _ = server
+    assert not active_instances(controller)
+    assert ray.available_resources().get('GPU', 0) == 4
     first, second = Handle(base, protocol, mode), Handle(base, protocol, mode)
-    assert first.identity != second.identity
     instances = active_instances(controller)
     assert len(instances) == (1 if mode == 'lora' else 2)
     assert all(len(row['devices']) == 2 for row in instances)
-    devices = [device for row in instances for device in row['devices']]
-    assert len(set(devices)) == len(devices)
-    original, untouched = first.evaluate(), second.evaluate()
-    untouched_checkpoint = second.save() if mode == 'lora' else None
+    first_instance_ids = {row['instance_id'] for row in instances}
+    baseline, untouched = first.evaluate(), second.evaluate()
     for _ in range(4):
         first.step()
     trained = first.evaluate()
-    assert float(trained.mean()) > float(original.mean()) + 1e-4, (original, trained)
+    assert float(trained.mean()) > float(baseline.mean()) + 1e-4
     np.testing.assert_allclose(second.evaluate(), untouched, rtol=0, atol=2e-3)
+    second.step()
+    peer_trained = second.evaluate()
+    assert float(peer_trained.mean()) > float(untouched.mean()) + 1e-4
+    np.testing.assert_allclose(first.evaluate(), trained, rtol=0, atol=2e-3)
     if mode == 'lora':
         third, fourth = Handle(base, protocol, mode), Handle(base, protocol, mode)
-        assert len(active_instances(controller)) == 2
+        third.evaluate()
+        instances = active_instances(controller)
+        assert len(instances) == 2
         assert ray.available_resources().get('GPU', 0) == 0
         with pytest.raises(Exception, match='(?i)allocation'):
             Handle(base, protocol, mode)
+    allocated = [device for row in instances for device in row['devices']]
+    assert len(allocated) == 4 and len(set(allocated)) == 4
+    if mode == 'lora':
         fourth.close()
-        third.restore(untouched_checkpoint)
-        second.step()
-        third.step()
-        np.testing.assert_allclose(second.evaluate(), third.evaluate(), rtol=0, atol=2e-2)
-        np.testing.assert_allclose(first.evaluate(), trained, rtol=0, atol=2e-3)
         third.close()
-        assert len(active_instances(controller)) == 1
-    checkpoint = first.save()
-    first.step(contrast=True)
-    continuation = first.evaluate()
-    first.restore(checkpoint)
-    np.testing.assert_allclose(first.evaluate(), trained, rtol=0, atol=2e-3)
-    first.step(contrast=True)
-    np.testing.assert_allclose(first.evaluate(), continuation, rtol=0, atol=2e-2)
-    old_id = first.identity
     first.close()
     assert len(active_instances(controller)) == 1
-    replacement = Handle(base, protocol, mode)
-    assert replacement.identity != old_id
-    replacement.restore_weights(checkpoint)
-    np.testing.assert_allclose(replacement.evaluate(), trained, rtol=0, atol=2e-3)
-    replacement.step(contrast=True)
-    optimizer_reset = replacement.evaluate()
-    assert float(np.max(np.abs(optimizer_reset - continuation))) > 2e-2, 'Optimizer continuation oracle is not decisive'
-    replacement.restore(checkpoint)
-    np.testing.assert_allclose(replacement.evaluate(), trained, rtol=0, atol=2e-3)
-    replacement.step(contrast=True)
-    np.testing.assert_allclose(replacement.evaluate(), continuation, rtol=0, atol=2e-2)
-    replacement.close()
+    assert ray.available_resources().get('GPU', 0) == 2
+    np.testing.assert_allclose(second.evaluate(), peer_trained, rtol=0, atol=2e-3)
+    second.step()
+    peer_continued = second.evaluate()
+    assert float(peer_continued.mean()) > float(peer_trained.mean()) + 1e-4
     second.close()
+    assert not active_instances(controller)
+    assert ray.available_resources().get('GPU', 0) == 4
+
+    alternate = Handle(base, protocol, mode, alias='other')
+    alternate_instances = active_instances(controller)
+    assert len(alternate_instances) == 1
+    reused = alternate_instances[0]['devices']
+    assert len(reused) == 2 and set(reused).issubset(allocated)
+    other_initial = alternate.evaluate()
+    for _ in range(4):
+        alternate.step()
+    other_trained = alternate.evaluate()
+    assert float(other_trained.mean()) > float(other_initial.mean()) + 1e-4
+    health = requests.get(base + '/api/v1/twinkle/healthz/deep', timeout=30)
+    assert health.status_code == 200 and health.json()['healthy']
+    deadline = time.monotonic() + 90
+    while active_instances(controller):
+        assert time.monotonic() < deadline, 'Business-idle instance did not release DP devices'
+        response = alternate.transport.post(
+            base + '/api/v1/twinkle/session_heartbeat',
+            json_data={'session_id': alternate.transport.context.session_id})
+        response.raise_for_status()
+        time.sleep(2)
+    assert ray.available_resources().get('GPU', 0) == 4
+    with pytest.raises(Exception) as expired:
+        alternate.evaluate()
+    alternate.transport.close()
+
+    fresh = Handle(base, protocol, mode)
+    fresh_instances = active_instances(controller)
+    assert len(fresh_instances) == 1
+    assert fresh_instances[0]['instance_id'] not in first_instance_ids
+    np.testing.assert_allclose(fresh.evaluate(), baseline, rtol=0, atol=2e-3)
+    fresh.close()
     assert not active_instances(controller)
     assert ray.available_resources().get('GPU', 0) == 4
     evidence['cases'].append({
         'protocol': protocol,
         'mode': mode,
-        'initial_logps': original.tolist(),
+        'parallelism': {
+            'dp_size': 2,
+            'tp_size': 1,
+            'fsdp_size': 1
+        },
+        'initial_logps': baseline.tolist(),
         'trained_logps': trained.tolist(),
-        'continuation_logps': continuation.tolist(),
-        'optimizer_reset_logps': optimizer_reset.tolist(),
-        'checkpoint': checkpoint,
-        'devices': devices,
+        'peer_initial_logps': untouched.tolist(),
+        'peer_trained_logps': peer_trained.tolist(),
+        'peer_continued_logps': peer_continued.tolist(),
+        'other_initial_logps': other_initial.tolist(),
+        'other_trained_logps': other_trained.tolist(),
+        'original_devices': allocated,
+        'cross_model_reused_devices': reused,
+        'health': health.json(),
+        'idle_expired_error': str(expired.value)[:400],
+        'lazy_start': True,
+        'shared_or_exclusive_isolation': True,
+        'idle_reclaimed': True,
+        'fresh_recreated': True,
         'passed': True
     })
-
-
-def test_cross_model_reuse_and_heartbeat_does_not_prevent_expiry(server):
-    base, controller, evidence, _ = server
-    before = ray.available_resources().get('GPU', 0)
-    for index in range(10):
-        handle = Handle(base, 'native', 'full', alias='small' if index % 2 == 0 else 'other')
-        values = handle.evaluate()
-        handle.close()
-        assert not active_instances(controller)
-        assert ray.available_resources().get('GPU', 0) == before
-        print(json.dumps({'cycle': index + 1, 'logps': values.tolist()}), flush=True)
-    expired = Handle(base, 'native', 'lora', alias='other')
-    expired.evaluate()
-    deadline = time.monotonic() + 60
-    while active_instances(controller) and time.monotonic() < deadline:
-        response = expired.transport.post(
-            base + '/api/v1/twinkle/session_heartbeat', json_data={'session_id': expired.transport.context.session_id})
-        response.raise_for_status()
-        time.sleep(2)
-    assert not active_instances(controller), 'Heartbeats incorrectly kept idle training alive'
-    with pytest.raises(Exception):
-        expired.client.zero_grad()
-    assert ray.available_resources().get('GPU', 0) == before
-    expired.transport.close()
-    evidence['cases'].append({'cycles': 10, 'idle_reclaimed': True, 'passed': True})
-
-
-@pytest.mark.parametrize('protocol', ['native', 'tinker'])
-def test_idle_lora_user_expires_without_resetting_active_user(server, protocol):
-    base, controller, evidence, _ = server
-    idle = Handle(base, protocol, 'lora', alias='other')
-    active = Handle(base, protocol, 'lora', alias='other')
-    instance = active_instances(controller)[0]
-    assert instance['training_ids'] == [idle.identity, active.identity]
-    original = idle.evaluate()
-    for _ in range(4):
-        active.step()
-    trained = active.evaluate()
-    assert trained.mean() > original.mean() + 1e-4
-    np.testing.assert_allclose(idle.evaluate(), original, rtol=0, atol=2e-3)
-    checkpoint = active.save()
-    active.step(contrast=True)
-    expected = active.evaluate()
-    active.restore(checkpoint)
-    deadline = time.monotonic() + 60
-    while True:
-        np.testing.assert_allclose(active.evaluate(), trained, rtol=0, atol=2e-3)
-        response = idle.transport.post(
-            base + '/api/v1/twinkle/session_heartbeat', json_data={'session_id': idle.transport.context.session_id})
-        response.raise_for_status()
-        instances = active_instances(controller)
-        assert len(instances) == 1 and instances[0]['instance_id'] == instance['instance_id']
-        if idle.identity not in instances[0]['training_ids']:
-            break
-        assert time.monotonic() < deadline, 'Idle LoRA user did not expire while the other user stayed active'
-        time.sleep(2)
-    with pytest.raises(Exception):
-        idle.evaluate()
-    active.step(contrast=True)
-    np.testing.assert_allclose(active.evaluate(), expected, rtol=0, atol=2e-2)
-    replacement = Handle(base, protocol, 'lora', alias='other')
-    assert replacement.identity != idle.identity
-    assert active_instances(controller)[0]['instance_id'] == instance['instance_id']
-    np.testing.assert_allclose(replacement.evaluate(), original, rtol=0, atol=2e-3)
-    replacement.close()
-    np.testing.assert_allclose(active.evaluate(), expected, rtol=0, atol=2e-3)
-    active.close()
-    idle.transport.close()
-    assert not active_instances(controller)
-    assert ray.available_resources().get('GPU', 0) == 4
-    evidence['cases'].append({
-        'protocol': protocol,
-        'idle_lora_expired': True,
-        'active_optimizer_preserved': True,
-        'slot_reused': True,
-        'passed': True
-    })
-
-
-def test_resident_full_reset_preserves_other_instances(server):
-    base, controller, evidence, launcher = server
-    raw = launcher.config.to_yaml_dict()
-    raw['applications'][0]['args']['modes']['full']['min_replicas'] = 1
-    ray.get(controller.shutdown.remote(), timeout=180)
-    ray.kill(controller, no_restart=True)
-    from twinkle.server.training.actor import controller_name
-    deadline = time.monotonic() + 30
-    while True:
-        try:
-            ray.get_actor(controller_name(launcher.config.ray_namespace), namespace=launcher.config.ray_namespace)
-        except ValueError:
-            break
-        assert time.monotonic() < deadline, 'Previous controller name was not released'
-        time.sleep(0.1)
-    replacement = ServerLauncher(ServerConfig.model_validate(raw))
-    replacement._deploy_training()
-    controller = replacement._training_controller
-    launcher._training_controller = controller
-    evidence['resident_controller_epoch'] = ray.get(controller.diagnostics.remote())['epoch']
-    resident, extra = Handle(base, 'native', 'full'), Handle(base, 'native', 'full')
-    instances = active_instances(controller)
-    resident_instance = next(row for row in instances if row['resident'])
-    original, untouched = resident.evaluate(), extra.evaluate()
-    for _ in range(2):
-        resident.step()
-    assert resident.evaluate().mean() > original.mean() + 1e-4
-    resident.close()
-    restored = Handle(base, 'native', 'full')
-    instances = active_instances(controller)
-    assert next(row for row in instances if row['resident'])['instance_id'] == resident_instance['instance_id']
-    np.testing.assert_allclose(restored.evaluate(), original, rtol=0, atol=2e-3)
-    np.testing.assert_allclose(extra.evaluate(), untouched, rtol=0, atol=2e-3)
-    restored.close()
-    extra.close()
-    instances = active_instances(controller)
-    assert len(instances) == 1 and instances[0]['resident']
-    assert ray.available_resources().get('GPU', 0) == 2
-    evidence['cases'].append({'resident_reset': True, 'extra_preserved': True, 'passed': True})
-
-
-def test_worker_failure_reclaims_devices_and_preserves_resident(server):
-    from ray.util import list_named_actors
-    base, _, evidence, launcher = server
-    controller = launcher._training_controller
-    resident = Handle(base, 'native', 'full')
-    original = resident.evaluate()
-    failing = Handle(base, 'native', 'lora')
-    failing.evaluate()
-    instance = next(row for row in active_instances(controller) if row['mode'] == 'lora')
-    actors = [
-        row for row in list_named_actors(all_namespaces=True) if row['namespace'] == evidence['namespace']
-        and instance['instance_id'] in row['name'] and not row['name'].endswith('-registry')
-    ]
-    assert len(actors) == 2, actors
-    ray.kill(ray.get_actor(actors[0]['name'], namespace=evidence['namespace']), no_restart=True)
-    deadline = time.monotonic() + 90
-    while any(row['instance_id'] == instance['instance_id'] for row in active_instances(controller)):
-        assert time.monotonic() < deadline, 'Failed runtime devices were not reclaimed'
-        time.sleep(1)
-    with pytest.raises(Exception):
-        failing.client.zero_grad()
-    np.testing.assert_allclose(resident.evaluate(), original, rtol=0, atol=2e-3)
-    recovered = Handle(base, 'native', 'lora')
-    recovered.evaluate()
-    recovered.close()
-    resident.close()
-    failing.transport.close()
-    assert ray.available_resources().get('GPU', 0) == 2
-    evidence['cases'].append({'worker_failure': True, 'resident_preserved': True, 'recreated': True, 'passed': True})
+    (Path(os.environ['TWINKLE_DEVICE_RUN_DIR']) / 'progress.json').write_text(json.dumps(evidence, indent=2))

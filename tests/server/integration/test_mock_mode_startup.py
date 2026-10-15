@@ -196,6 +196,10 @@ def _exercise_twinkle_clients(base: str) -> None:
 
     save_resp = model.save(name='step-1')
     assert save_resp.twinkle_path and save_resp.twinkle_path.startswith('twinkle://')
+    # Mock save creates an empty directory; identify it as the LoRA checkpoint
+    # expected by the sampler's checkpoint classification introduced on main.
+    assert save_resp.checkpoint_dir
+    lora_cfg.save_pretrained(save_resp.checkpoint_dir)
     model.load(name=save_resp.twinkle_path)
     model.resume_from_checkpoint(name=save_resp.twinkle_path)
     model.apply_patch('NoopPatch')
@@ -221,8 +225,7 @@ def _exercise_twinkle_clients(base: str) -> None:
     )
     assert samples and samples[0].sequences and len(samples[0].sequences[0].tokens) == 4
 
-    # adapter_uri triggers reset_prefix_cache; reuse the training-weights
-    # path because mock ``save()`` materialized that directory on disk.
+    # Exercise adapter_uri resolution using the mock LoRA checkpoint directory.
     sampler.sample(
         inputs=[{
             'input_ids': [1, 2, 3]
