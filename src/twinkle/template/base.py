@@ -872,7 +872,7 @@ class Template:
             if isinstance(trajectories[0], Mapping) and len(self._get_trajectory_keys(trajectories[0], False)) > 0:
                 # Convert row→columnar, process with columnar logic, convert back
                 columnar = self.map_row_to_col(trajectories)
-                encoded = self.batch_encode(columnar, add_generation_prompt)
+                encoded = self.batch_encode(columnar, add_generation_prompt, **kwargs)
                 return self.map_col_to_row(encoded)
 
         if isinstance(trajectories, Mapping):
@@ -883,7 +883,7 @@ class Template:
                 # Nested format: encode each trajectory list separately, keep other columns
                 return {
                     key:
-                    self.batch_encode(trajectories[key], add_generation_prompt)
+                    self.batch_encode(trajectories[key], add_generation_prompt, **kwargs)
                     if key in traj_keys else trajectories[key]
                     for key in trajectories
                 }
