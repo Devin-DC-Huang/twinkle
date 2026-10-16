@@ -6,6 +6,15 @@ import httpx
 
 from twinkle.server.common.tunnel import TunnelRequest, TunnelResponse
 
+HEARTBEAT_PATHS = frozenset({'/api/v1/session_heartbeat', '/api/v1/twinkle/session_heartbeat'})
+_QUERY_PATHS = frozenset({
+    '/api/v1/models',
+    '/api/v1/get_server_capabilities',
+    '/api/v1/twinkle/get_server_capabilities',
+    '/api/v1/twinkle/capacity_info',
+    '/api/v1/twinkle/healthz',
+})
+
 
 class ServiceMeshError(Exception):
     """The mesh returned a response that cannot be restored for the client."""
@@ -24,9 +33,11 @@ class ServiceMeshProxy:
     ) -> None:
         self._service_id = service_id
         self._mesh_url = mesh_url
+        # The long timeout is for training responses, not connection admission.
+        self._timeout = httpx.Timeout(timeout_seconds, connect=5.0, write=30.0, pool=3.0)
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(
-            timeout=httpx.Timeout(timeout_seconds),
+            timeout=self._timeout,
             trust_env=False,
         )
 
@@ -35,8 +46,15 @@ class ServiceMeshProxy:
             await self._client.aclose()
 
     async def forward(self, request_id: str, tunnel_request: TunnelRequest) -> TunnelResponse:
+        timeout = self._timeout
+        if tunnel_request.method == 'POST' and tunnel_request.path in HEARTBEAT_PATHS:
+            timeout = httpx.Timeout(min(self._timeout.read, 10.0), connect=5.0, pool=3.0)
+        elif tunnel_request.method == 'GET' and tunnel_request.path in _QUERY_PATHS:
+            timeout = httpx.Timeout(min(self._timeout.read, 15.0), connect=5.0, pool=3.0)
+
         response = await self._client.post(
             self._mesh_url,
+            timeout=timeout,
             json={
                 'header': {
                     'request_id': request_id,

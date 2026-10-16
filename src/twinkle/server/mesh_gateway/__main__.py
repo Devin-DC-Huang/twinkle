@@ -2,6 +2,7 @@
 """Standalone launcher for the CPU-side Service Mesh gateway."""
 from __future__ import annotations
 
+import logging
 import os
 
 
@@ -9,6 +10,7 @@ def main() -> None:
     import uvicorn
 
     from .app import create_mesh_gateway_app
+    from .logging import HeartbeatAccessLogFilter
 
     gpu_service_id = os.environ['TWINKLE_GPU_SERVICE_ID']
     app = create_mesh_gateway_app(
@@ -16,6 +18,7 @@ def main() -> None:
         mesh_url=os.getenv('TWINKLE_SERVICE_MESH_URL', 'http://127.0.0.1:8880/api/v2/inference'),
         timeout_seconds=float(os.getenv('TWINKLE_SERVICE_MESH_TIMEOUT_SECONDS', '620')),
     )
+    logging.getLogger('uvicorn.access').addFilter(HeartbeatAccessLogFilter())
     uvicorn.run(app, host='0.0.0.0', port=int(os.getenv('PORT', '9000')))
 
 
