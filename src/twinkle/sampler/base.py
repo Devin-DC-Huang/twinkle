@@ -39,13 +39,22 @@ class Sampler(ABC):
 
     def _save_worker_factory(self, cls, args, kwargs, torch_kwargs):
         self._worker_factory = (cls, tuple(args), dict(kwargs), torch_kwargs)
+        self._worker_lock = threading.RLock()
+        self._worker_configurations = []
+
+    def _configuration_call_lock(self, method):
+        if method in ('set_template', 'add_adapter_to_sampler', 'apply_patch'):
+            return getattr(self, '_worker_lock', None)
+        if hasattr(self, '_sampler_workers') and method in ('pause_generation', 'resume_generation'):
+            return self._worker_lock
+        return None
 
     def __getstate__(self):
         state = self.__dict__.copy()
         if hasattr(self, '_actors'):
             # 远程 payload 处理只需要原生 handler 的可序列化元数据；准入和在途状态仍归原 driver。
             for key in ('_worker_lock', '_continous_work_state', '_sampler_workers', '_generation_owners',
-                        '_suspended_workers', '_creating_slots', '_worker_factory'):
+                        '_suspended_workers', '_paused_generation_workers', '_creating_slots', '_worker_factory'):
                 state.pop(key, None)
             if hasattr(self, '_sampler_workers'):
                 state['_admission_owned_elsewhere'] = True
@@ -66,10 +75,12 @@ class Sampler(ABC):
             raise ValueError('Physical ranks must match gpus_per_worker for every complete sampler actor slot.')
         if state not in ('WARMING', 'ACTIVE', 'DRAINING', 'PAUSED'):
             raise ValueError(f'Unknown sampler worker state: {state!r}.')
-        self._worker_lock = threading.RLock()
+        if not hasattr(self, '_worker_lock'):
+            self._worker_lock = threading.RLock()
         self._sampler_workers = {}
         self._generation_owners = {}
         self._suspended_workers = set()
+        self._paused_generation_workers = set()
         self._creating_slots = set()
         self._round_robin = 0
         self._admission_closed = False
@@ -106,7 +117,9 @@ class Sampler(ABC):
             return None
         from twinkle.infra import _select_workers
 
-        with self._worker_lock:
+        # 选择、屏障和 RPC 发送使用同一临界区；普通调用发出后在锁外收集结果。
+        self._worker_lock.acquire()
+        try:
             if worker_ids is None and worker_selector is not None:
                 worker_ids = getattr(self, worker_selector)()
             actors = _select_workers(self, worker_ids)
@@ -114,6 +127,12 @@ class Sampler(ABC):
             for worker_id in worker_ids:
                 self._sampler_workers[worker_id].dispatching += 1
             return worker_ids
+        except BaseException:
+            self._worker_lock.release()
+            raise
+
+    def _end_worker_dispatch(self):
+        self._worker_lock.release()
 
     def _end_worker_call(self, worker_ids):
         with self._worker_lock:
@@ -121,6 +140,35 @@ class Sampler(ABC):
                 worker = self._sampler_workers.get(worker_id)
                 if worker is not None:
                     worker.dispatching -= 1
+
+    def _worker_call_conflicts(self, current_method, pending_method, worker_id):
+        if not hasattr(self, '_sampler_workers') or pending_method != 'sample':
+            return True
+        controls = ('pause_generation', 'resume_generation', 'abort_all_inflight', '_get_generation_status',
+                    '_cancel_generation', '_cancel_all_generations', '_generation_count')
+        return (current_method not in controls
+                and worker_id not in getattr(self, '_paused_generation_workers', ()))
+
+    def _worker_call_completed(self, method, worker_ids):
+        with self._worker_lock:
+            if method == 'pause_generation':
+                self._paused_generation_workers.update(worker_ids)
+            elif method == 'resume_generation':
+                self._paused_generation_workers.difference_update(worker_ids)
+
+    def _settle_worker_controls(self, method, submissions):
+        """分派或收集失败后，逐个确认已发出的暂停/恢复 RPC。"""
+        if method not in ('pause_generation', 'resume_generation'):
+            return
+        import ray
+
+        for worker_id, ref in submissions:
+            try:
+                ray.get(ref)
+            except BaseException:
+                logger.warning('sampler actor %s 的 %s 未成功完成。', worker_id, method, exc_info=True)
+            else:
+                self._worker_call_completed(method, (worker_id,))
 
     @staticmethod
     def _normalize_sampling_args(args, kwargs):
@@ -161,10 +209,8 @@ class Sampler(ABC):
     def _record_worker_configuration(self, method, args, kwargs):
         if method not in ('set_template', 'add_adapter_to_sampler', 'apply_patch'):
             return
-        configurations = getattr(self, '_worker_configurations', None)
-        if configurations is None:
-            configurations = self._worker_configurations = []
-        configurations.append((method, tuple(args), dict(kwargs)))
+        with self._worker_lock:
+            self._worker_configurations.append((method, tuple(args), dict(kwargs)))
 
     def add_workers(self, group, ranks, *, worker_slots=None, shared=False, engine_args=None):
         """从已预留的完整 slot 创建 actors；完成配置后仍不接收新请求。"""
@@ -206,16 +252,19 @@ class Sampler(ABC):
                 worker_slots=list(slots), **kwargs)
             worker_ids = tuple(get_worker_id(actor) for actor in actors)
             with self._worker_lock:
+                if self._admission_closed:
+                    raise RuntimeError('Sampler closed while new workers were being constructed.')
                 self._actors = tuple(self._actors) + tuple(actors)
                 for actor, worker_id, physical_ranks in zip(actors, worker_ids, selected_ranks):
                     self._sampler_workers[worker_id] = SamplerWorker(
                         worker_id, actor, group, physical_ranks, shared=shared)
-            self._worker_ready(_worker_ids=worker_ids)
-            for method, args, kwargs in tuple(getattr(self, '_worker_configurations', ())):
-                result = getattr(self, method)(*args, _worker_ids=worker_ids, **kwargs)
-                if callable(result):
-                    result()
-            return worker_ids
+                self._worker_ready(_worker_ids=worker_ids)
+                # 全量配置调用与新 actor 的安装/重放互斥，避免漏放或重复执行 patch。
+                for method, args, kwargs in self._worker_configurations:
+                    result = getattr(self, method)(*args, _worker_ids=worker_ids, **kwargs)
+                    if callable(result):
+                        result()
+                return worker_ids
         except BaseException:
             try:
                 self._discard_workers(actors)
@@ -338,6 +387,7 @@ class Sampler(ABC):
                     for worker_id in worker_ids:
                         self._sampler_workers.pop(worker_id, None)
                     self._suspended_workers.difference_update(worker_ids)
+                    self._paused_generation_workers.difference_update(worker_ids)
                     self._generation_owners = {
                         key: owner for key, owner in self._generation_owners.items() if owner.worker_id not in worker_ids
                     }

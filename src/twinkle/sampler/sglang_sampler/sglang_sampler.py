@@ -204,17 +204,16 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, P
         """
         if request_id is None:
             request_id = uuid.uuid4().hex
-        self._register_inflight(request_id)
-        try:
-            response = await self.engine.sample(
+        response = await self._sample_engine_request(
+            request_id,
+            self.engine.sample(
                 prompt=feat['input_ids'],
                 sampling_params=sampling_params,
                 image_data=image_data,
                 lora_name=lora_name,
                 request_id=request_id,
-            )
-        finally:
-            self._unregister_inflight(request_id)
+            ),
+        )
 
         if 'input_ids' not in feat:
             feat['input_ids'] = response.prompt_token_ids

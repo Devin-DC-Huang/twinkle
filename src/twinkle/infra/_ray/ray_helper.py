@@ -139,19 +139,25 @@ class RayHelper:
         return RayHelper.ray_inited() and ray._private.worker.global_worker.mode == ray._private.worker.WORKER_MODE
 
     @staticmethod
-    def execute_all_sync(method_name: str, workers_and_args: List[Tuple[Any, List[Any], Dict[str, Any]]]):
+    def execute_all_sync(method_name: str, workers_and_args: List[Tuple[Any, List[Any], Dict[str, Any]]], *,
+                         on_submit: Optional[Callable] = None):
         """Execute method and return results."""
         import ray
-        return ray.get(RayHelper.execute_all_async(method_name, workers_and_args))
+        return ray.get(RayHelper.execute_all_async(method_name, workers_and_args, on_submit=on_submit))
 
     @staticmethod
-    def execute_all_async(method_name: str, workers_and_args: List[Tuple[Any, List[Any], Dict[str, Any]]]):
+    def execute_all_async(method_name: str, workers_and_args: List[Tuple[Any, List[Any], Dict[str, Any]]], *,
+                          on_submit: Optional[Callable] = None):
         """Execute method and return futures."""
         output = []
         for worker_and_args in workers_and_args:
             worker, args, kwargs = worker_and_args
             remote_call = getattr(worker, method_name)
-            output.append(remote_call.remote(*args, **kwargs))
+            result = remote_call.remote(*args, **kwargs)
+            output.append(result)
+            # 逐个登记，后续 RPC 发送失败也不能丢失已发出的 refs。
+            if on_submit is not None:
+                on_submit(worker, result)
         return output
 
     @staticmethod

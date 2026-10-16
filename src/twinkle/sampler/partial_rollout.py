@@ -95,6 +95,36 @@ class PartialRolloutMixin:
         """Abort one in-flight engine request; it then finishes with ``stop_reason='abort'`` + partials."""
         await self.engine.abort_request(request_id)
 
+    async def _sample_engine_request(self, request_id: str, coroutine) -> SampleResponse:
+        """取消调用方时显式 abort，并等真实引擎调用结束后才注销请求。"""
+        try:
+            await self._wait_generation_gate()
+            task = asyncio.create_task(coroutine)
+        except BaseException:
+            coroutine.close()
+            raise
+        self._register_inflight(request_id)
+        try:
+            return await asyncio.shield(task)
+        except BaseException:
+            async def cleanup():
+                try:
+                    await self._abort_request(request_id)
+                except BaseException as error:
+                    logger.warning('取消引擎请求 %s 失败，等待请求自然结束：%s', request_id, error)
+                await asyncio.gather(task, return_exceptions=True)
+
+            cleanup_task = asyncio.create_task(cleanup())
+            while not cleanup_task.done():
+                try:
+                    await asyncio.shield(cleanup_task)
+                except asyncio.CancelledError:
+                    continue
+            cleanup_task.result()
+            raise
+        finally:
+            self._unregister_inflight(request_id)
+
     async def _abort_all_inflight(self) -> int:
         """Abort every in-flight request on this worker; returns how many abort calls were issued.
 

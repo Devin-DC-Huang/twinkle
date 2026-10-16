@@ -290,9 +290,9 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, Par
         """
         if request_id is None:
             request_id = uuid.uuid4().hex
-        self._register_inflight(request_id)
-        try:
-            response = await self.engine.sample(
+        response = await self._sample_engine_request(
+            request_id,
+            self.engine.sample(
                 prompt=self.template.get_vllm_input_ids(feat['input_ids']) if self.template else feat['input_ids'],
                 sampling_params=sampling_params,
                 lora_request=lora_request,
@@ -300,9 +300,8 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, Par
                 mm_processor_kwargs=feat.get('mm_processor_kwargs'),
                 disable_lora=disable_lora,
                 request_id=request_id,
-            )
-        finally:
-            self._unregister_inflight(request_id)
+            ),
+        )
 
         if 'input_ids' not in feat or multi_modal_data:
             if 'input_ids' in feat:

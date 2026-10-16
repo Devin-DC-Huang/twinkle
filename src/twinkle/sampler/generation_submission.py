@@ -27,7 +27,7 @@ import asyncio
 import time
 import zlib
 from dataclasses import dataclass
-from concurrent.futures import CancelledError, Future
+from concurrent.futures import CancelledError, Future, InvalidStateError
 from typing import Any
 
 from twinkle import remote_function
@@ -87,6 +87,7 @@ class GenerationOwner:
     submitted_at: float
     collection: Any = None
     cancelling: bool = False
+    submitting: bool = False
 
 
 class GenerationSubmissionMixin:
@@ -101,36 +102,76 @@ class GenerationSubmissionMixin:
         if submission_id is None:
             return asyncio.run_coroutine_threadsafe(coro, self._async_loop)
 
+        future = Future()
+
+        def completed(task):
+            self._running_generation_submissions.discard(submission_id)
+            if task.cancelled():
+                future.cancel()
+                return
+            error = task.exception()
+            try:
+                if error is None:
+                    future.set_result(task.result())
+                else:
+                    future.set_exception(error)
+            except InvalidStateError:
+                # Future 的取消可先于 Task 的清理完成；仍须取出 Task 的异常。
+                pass
+
         async def schedule():
-            task = self._async_loop.create_task(coro)
+            try:
+                task = self._async_loop.create_task(coro)
+            except BaseException:
+                coro.close()
+                raise
             self._running_generation_submissions.add(submission_id)
-            task.add_done_callback(lambda _: self._running_generation_submissions.discard(submission_id))
-            return task
+            task.add_done_callback(completed)
 
-        task = asyncio.run_coroutine_threadsafe(schedule(), self._async_loop).result()
+            def cancel_task():
+                if not task.done() and not task.cancelling():
+                    task.cancel()
 
-        async def wait():
-            return await task
+            def cancellation_requested(result):
+                if result.cancelled() and not task.done():
+                    self._async_loop.call_soon_threadsafe(cancel_task)
 
-        future = asyncio.run_coroutine_threadsafe(wait(), self._async_loop)
+            future.add_done_callback(cancellation_requested)
 
-        def cancel_task(result):
-            if result.cancelled():
-                self._async_loop.call_soon_threadsafe(task.cancel)
-
-        future.add_done_callback(cancel_task)
+        scheduling = schedule()
+        try:
+            scheduled = asyncio.run_coroutine_threadsafe(scheduling, self._async_loop)
+        except BaseException:
+            scheduling.close()
+            coro.close()
+            raise
+        try:
+            scheduled.result()
+        except BaseException:
+            future.cancel()
+            raise
         return future
 
     @staticmethod
     async def _gather_generation_tasks(coroutines):
         """一个输入失败或取消后，等同批次的全部生成协程结束再释放 submission。"""
-        tasks = [asyncio.create_task(coroutine) for coroutine in coroutines]
+        tasks = []
         try:
-            return await asyncio.gather(*tasks)
+            for coroutine in coroutines:
+                tasks.append(asyncio.create_task(coroutine))
+            # 父任务取消不自动再次取消正在执行清理的子任务。
+            return await asyncio.shield(asyncio.gather(*tasks))
         except BaseException:
             for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+                if not task.done() and not task.cancelling():
+                    task.cancel()
+            cleanup = asyncio.gather(*tasks, return_exceptions=True)
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    continue
+            cleanup.result()
             raise
 
     def _check_generation_control(self):
@@ -163,7 +204,9 @@ class GenerationSubmissionMixin:
                 if self._generation_owners.get(submission_id) is not owner:
                     continue
                 collection = owner.collection
-                if collection is not None and collection != 'submitting':
+                if owner.submitting or collection == 'submitting':
+                    continue
+                if collection is not None:
                     if hasattr(collection, 'ready') and not collection.ready():
                         continue
                     status = self._get_generation_status(submission_id, _worker_ids=(owner.worker_id,))
@@ -200,17 +243,25 @@ class GenerationSubmissionMixin:
             owner = GenerationOwner(worker_id, time.monotonic())
             self._generation_owners[submission_id] = owner
             self._sampler_workers[worker_id].inflight += 1
+            owner.submitting = True
         try:
             return self._submit_generation(submission_id, inputs, sampling_params, adapter_name, adapter_path,
                                            target_worker=0, _worker_ids=(worker_id,), **kwargs)
         except BaseException:
-            try:
-                status = self._get_generation_status(submission_id, _worker_ids=(worker_id,))
-                if status['status'] == 'missing':
-                    self._release_generation_owner(submission_id, owner)
-            except Exception:
-                pass
+            with self._worker_lock:
+                if self._generation_owners.get(submission_id) is owner:
+                    owner.cancelling = True
             raise
+        finally:
+            with self._worker_lock:
+                owner.submitting = False
+                cancel_requested = self._generation_owners.get(submission_id) is owner and owner.cancelling
+            if cancel_requested:
+                try:
+                    self._reap_generation_owners()
+                except Exception:
+                    # 控制 RPC 失败时保留 owner，后续排干操作继续确认真实取消状态。
+                    pass
 
     def get_generation_status(self, submission_id: str):
         self._check_generation_control()
@@ -218,6 +269,9 @@ class GenerationSubmissionMixin:
             return self._get_generation_status(submission_id)
         with self._worker_lock:
             owner = self._generation_owner(submission_id)
+            if owner.submitting:
+                return {'submission_id': submission_id,
+                        'status': 'cancellation_requested' if owner.cancelling else 'running'}
             return self._get_generation_status(submission_id, _worker_ids=(owner.worker_id,))
 
     def collect_generation(self, submission_id: str):
@@ -230,8 +284,8 @@ class GenerationSubmissionMixin:
             return result
         with self._worker_lock:
             owner = self._generation_owner(submission_id)
-            if owner.collection is not None or owner.cancelling:
-                raise RuntimeError(f'generation submission is already being consumed: {submission_id}')
+            if owner.submitting or owner.collection is not None or owner.cancelling:
+                raise RuntimeError(f'generation submission is already being submitted or consumed: {submission_id}')
             status = self._get_generation_status(submission_id, _worker_ids=(owner.worker_id,))
             if status['status'] not in ('completed', 'failed', 'cancelled'):
                 raise RuntimeError(f'generation submission is still running: {submission_id}')
@@ -261,6 +315,8 @@ class GenerationSubmissionMixin:
             if owner.collection is not None:
                 raise RuntimeError(f'generation submission is already being consumed: {submission_id}')
             owner.cancelling = True
+            if owner.submitting:
+                return {'submission_id': submission_id, 'status': 'cancellation_requested'}
             result = self._cancel_generation(submission_id, _worker_ids=(owner.worker_id,))
             if result['status'] in ('missing', 'cancelled', 'completed'):
                 self._release_generation_owner(submission_id, owner)

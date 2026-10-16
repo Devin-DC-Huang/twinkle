@@ -465,9 +465,11 @@ def _cw_barrier(self, current_func: str, workers, *, materialize=True) -> None:
     if not state:
         return
     worker_ids = {get_worker_id(worker) for worker in workers}
+    conflicts = getattr(self, '_worker_call_conflicts', None)
     with state['lock']:
         others = {
-            name: [ref for ref in refs if state['owners'][ref][0] in worker_ids]
+            name: [ref for ref in refs if state['owners'][ref][0] in worker_ids
+                   and (conflicts is None or conflicts(current_func, name, state['owners'][ref][0]))]
             for name, refs in state['inflight'].items() if name != current_func
         }
         others = {name: refs for name, refs in others.items() if refs}
@@ -569,7 +571,7 @@ def _cw_sub_args(args, kwargs, indices: List[int], batch_len: int):
 
 
 def _run_continous_work(self, func_name: str, execute_method, workers, args, kwargs, batch_len: int,
-                        ray_get_timeout: Optional[float]):
+                        ray_get_timeout: Optional[float], *, on_dispatched=None):
     """Submit one call per chosen worker and return results in the caller's order.
 
     Submission happens under the lock so that picking a worker and charging it are
@@ -584,19 +586,27 @@ def _run_continous_work(self, func_name: str, execute_method, workers, args, kwa
     # The awaitable form, so the worker can hold several of these at once. Book-
     # keeping still uses the plain name, which is what callers and the barrier see.
     remote_name = _WORKER_ASYNC_PREFIX + func_name
-    with state['lock']:
-        load = [state['load'].get(worker_id, 0) for worker_id in worker_ids]
-        plan = _cw_plan(len(workers), load, batch_len)
-        for worker_index, indices in enumerate(plan):
-            if not indices:
-                continue
-            sub_args, sub_kwargs = _cw_sub_args(args, kwargs, indices, batch_len)
-            ref = execute_method(remote_name, [(workers[worker_index], sub_args, sub_kwargs)])[0]
-            worker_id = worker_ids[worker_index]
-            state['load'][worker_id] = state['load'].get(worker_id, 0) + len(indices)
-            state['owners'][ref] = (worker_id, len(indices))
-            state['inflight'].setdefault(func_name, []).append(ref)
-            submitted.append((worker_index, indices, ref))
+    try:
+        with state['lock']:
+            pending = [ref for ref, (owner, _) in state['owners'].items() if owner in worker_ids]
+            if pending:
+                ready, _ = ray.wait(pending, num_returns=len(pending), timeout=0)
+                _cw_drop_locked(state, ready)
+            load = [state['load'].get(worker_id, 0) for worker_id in worker_ids]
+            plan = _cw_plan(len(workers), load, batch_len)
+            for worker_index, indices in enumerate(plan):
+                if not indices:
+                    continue
+                sub_args, sub_kwargs = _cw_sub_args(args, kwargs, indices, batch_len)
+                ref = execute_method(remote_name, [(workers[worker_index], sub_args, sub_kwargs)])[0]
+                worker_id = worker_ids[worker_index]
+                state['load'][worker_id] = state['load'].get(worker_id, 0) + len(indices)
+                state['owners'][ref] = (worker_id, len(indices))
+                state['inflight'].setdefault(func_name, []).append(ref)
+                submitted.append((worker_index, indices, ref))
+    finally:
+        if on_dispatched is not None:
+            on_dispatched()
 
     try:
         ordered: List[Any] = [None] * batch_len
@@ -1116,6 +1126,17 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
             if _caller:
                 _ctx = f'{_ctx} <- {_caller}'
             _worker_reservation = None
+            _worker_dispatching = False
+            _configuration_lock = None
+            _submitted_calls = []
+            _call_completed = False
+
+            def _finish_dispatch():
+                nonlocal _worker_dispatching
+                if _worker_dispatching:
+                    _worker_dispatching = False
+                    self._end_worker_dispatch()
+
             try:
                 device_mesh = getattr(self, 'device_mesh', None)
                 worker_ids = kwargs.pop('_worker_ids', None)
@@ -1151,9 +1172,16 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                         from ._ray import RayHelper
                         execute_method = RayHelper.execute_all_async if not sync else RayHelper.execute_all_sync
                         _default_workers = worker_ids is None and worker_selector is None
+                        configuration_lock = getattr(self, '_configuration_call_lock', None)
+                        if configuration_lock is not None:
+                            lock = configuration_lock(func.__name__)
+                            if lock is not None:
+                                lock.acquire()
+                                _configuration_lock = lock
                         begin_call = getattr(self, '_begin_worker_call', None)
                         if begin_call is not None:
                             _worker_reservation = begin_call(worker_ids, worker_selector)
+                            _worker_dispatching = _worker_reservation is not None
                         if _worker_reservation is not None:
                             selected_ids = _worker_reservation
                             _subset = not _default_workers
@@ -1185,7 +1213,8 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                             if _batch_len:
                                 return _run_continous_work(self, func.__name__, execute_method, _workers, args, kwargs,
                                                            _batch_len,
-                                                           getattr(self, '_ray_get_timeout', None) or timeout)
+                                                           getattr(self, '_ray_get_timeout', None) or timeout,
+                                                           on_dispatched=_finish_dispatch)
                         if RayHelper.has_ref(args, kwargs):
                             # If has any object-ref, dispatch in worker, because we don't know the structure in the ref.
                             # for example, dataloader returns any data list.
@@ -1198,20 +1227,28 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                             _workers_and_args = _dispatch_args(
                                 _workers, _dispatch, execute, _mesh, args, kwargs)
 
-                        result = execute_method(func.__name__, _workers_and_args)
-                        # Tracked from here so that a different method called next
-                        # waits for this one. It matters most for the lazily
-                        # collected methods, which return while the worker is still
-                        # busy.
-                        _tracked_refs = _cw_register(self, func.__name__, result, _workers) if _track_calls else []
+                        _tracked_refs = []
+
+                        def _track_submission(worker, result):
+                            _submitted_calls.append((get_worker_id(worker), result))
+                            _tracked_refs.extend(_cw_register(self, func.__name__, [result], [worker]))
+
+                        # 配置后的 sampler 不持有选择锁等待同步 RPC 的结果。
+                        _sync_sampler = sync and _worker_reservation is not None
+                        if _sync_sampler:
+                            execute_method = RayHelper.execute_all_async
+                        result = execute_method(func.__name__, _workers_and_args,
+                                                on_submit=_track_submission if _track_calls else None)
+                        _finish_dispatch()
+                        if _sync_sampler:
+                            import ray
+                            result = ray.get(result)
                         # This is a result future, call it to get the actual result
                         _rgt = getattr(self, '_ray_get_timeout', None) or timeout
                         result_func = RayHelper.do_get_and_collect_func(
                             _collect_func, collect, result, device_mesh, timeout=_rgt)
                         _local_lazy_collect = _lazy_collect
                         recorder = getattr(self, '_record_worker_configuration', None)
-                        if recorder is not None and _default_workers:
-                            recorder(func.__name__, args, kwargs)
                         if func.__name__ == '__iter__':
                             # return self
                             return self
@@ -1239,6 +1276,8 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                             # This is the unique case that an object ref contains another
                             # And this is user independent, only decided by the code.
                             _local_lazy_collect = self._lazy_collect
+                        if _configuration_lock is not None:
+                            _local_lazy_collect = False
                         if _local_lazy_collect:
                             if _subset or _worker_reservation is not None:
                                 # 子集调用的载荷跨 Ray 流转时，不捕获 driver handler 的锁与生命周期状态。
@@ -1261,7 +1300,14 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                                     setattr(_notifying_result_func, _attr, getattr(_orig_result_func, _attr))
                             return _notifying_result_func
                         try:
-                            return result_func()
+                            output = result_func()
+                            completed = getattr(self, '_worker_call_completed', None)
+                            if completed is not None and _worker_reservation is not None:
+                                completed(func.__name__, _worker_reservation)
+                            _call_completed = True
+                            if recorder is not None and _default_workers and _configuration_lock is not None:
+                                recorder(func.__name__, args, kwargs)
+                            return output
                         finally:
                             _cw_unregister(self, func.__name__, _tracked_refs)
                 else:
@@ -1273,8 +1319,18 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                 notify_exception(_notifier, _ctx, _e, _name)
                 raise
             finally:
-                if _worker_reservation is not None:
-                    self._end_worker_call(_worker_reservation)
+                try:
+                    _finish_dispatch()
+                    if _worker_reservation is not None:
+                        try:
+                            settle = getattr(self, '_settle_worker_controls', None)
+                            if not _call_completed and settle is not None:
+                                settle(func.__name__, _submitted_calls)
+                        finally:
+                            self._end_worker_call(_worker_reservation)
+                finally:
+                    if _configuration_lock is not None:
+                        _configuration_lock.release()
 
         wrapper._execute = execute
         wrapper._collect = collect
