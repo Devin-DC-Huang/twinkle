@@ -1,4 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import asyncio
 import contextlib
 import inspect
 import os
@@ -254,6 +255,7 @@ class VLLMEngine(BaseSamplerEngine):
         self.engine_kwargs = kwargs or {}
 
         self._lora_request_cache: Dict[str, Any] = {}
+        self._lora_load_tasks: Dict[str, asyncio.Task] = {}
         self._next_lora_id = 1
 
         # Cached LoRARequest for the RL-training synced LoRA.
@@ -633,12 +635,26 @@ class VLLMEngine(BaseSamplerEngine):
         Returns:
             ``LoRARequest`` or ``None`` if loading fails.
         """
-        from vllm.lora.request import LoRARequest
-
         # Fast path: return cached request for this path.
         if lora_path in self._lora_request_cache:
             logger.info(f'Using cached LoRA request for {lora_path}')
             return self._lora_request_cache[lora_path]
+
+        load_task = self._lora_load_tasks.get(lora_path)
+        if load_task is None:
+            load_task = asyncio.create_task(self._load_lora(lora_path))
+            self._lora_load_tasks[lora_path] = load_task
+        try:
+            lora_request = await load_task
+        finally:
+            if self._lora_load_tasks.get(lora_path) is load_task:
+                self._lora_load_tasks.pop(lora_path)
+        if lora_request is not None:
+            self._lora_request_cache[lora_path] = lora_request
+        return lora_request
+
+    async def _load_lora(self, lora_path: str):
+        from vllm.lora.request import LoRARequest
 
         if not os.path.exists(lora_path):
             logger.error(f'LoRA path does not exist: {lora_path}')
@@ -660,7 +676,6 @@ class VLLMEngine(BaseSamplerEngine):
 
         try:
             await self.engine.add_lora(lora_request)
-            self._lora_request_cache[lora_path] = lora_request
             return lora_request
         except Exception as e:
             logger.error(f'Failed to load LoRA from {lora_path}: {e}')
