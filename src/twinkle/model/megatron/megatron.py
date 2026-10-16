@@ -125,6 +125,8 @@ _default_adapter_name = ''
 @remote_class(execute='all')
 class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
 
+    _mcore_async_queue = None
+
     def __init__(
         self,
         model_id: str,
@@ -1619,6 +1621,12 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
         safe_serialization = kwargs.pop('safe_serialization', True)
         max_shard_size = kwargs.pop('max_shard_size', '5GB')
         save_total_limit = kwargs.pop('save_total_limit', None)
+        async_save = kwargs.pop('async_save', False)
+        if async_save and save_total_limit is not None:
+            # The rolling delete cannot tell whether an in-flight async write has finished, so the two
+            # would race on the same directory (v4 rejected the same combination).
+            raise ValueError('async_save is incompatible with save_total_limit: the rotation cannot tell '
+                             'whether a background write has completed. Disable one of the two.')
         if not safe_serialization:
             raise NotImplementedError('Megatron HF-format checkpoints require safe_serialization=True.')
         optimizer_config = self.optimizer_group[adapter_name]
@@ -1643,24 +1651,45 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
             self._save_tokenizer(checkpoint_dir, adapter_name=adapter_name)
 
         # Optionally save mcore optimizer state (for training resumption).
+        async_request = None
         if save_optimizer:
-            self._save_mcore_optimizer(
+            async_request = self._save_mcore_optimizer(
                 checkpoint_dir,
                 optimizer_config=optimizer_config,
+                async_save=async_save,
                 **kwargs,
             )
-            trainer_state = {
-                'checkpoint_version': 1,
-                'cur_step': optimizer_config.cur_step,
-                'consumed_train_samples': kwargs.get('consumed_train_samples', 0),
-                'gradient_accumulation_steps': optimizer_config.gradient_accumulation_steps,
-                'component_states': kwargs.get('component_states', {}),
-            }
-            state_path = os.path.join(checkpoint_dir, 'trainer_state.json')
-            rank = dist.get_rank() if dist.is_initialized() else 0
-            if rank == 0:
-                with open(state_path, 'w') as f:
-                    json.dump(trainer_state, f, indent=2)
+        trainer_state = {
+            'checkpoint_version': 1,
+            'cur_step': optimizer_config.cur_step,
+            'consumed_train_samples': kwargs.get('consumed_train_samples', 0),
+            'gradient_accumulation_steps': optimizer_config.gradient_accumulation_steps,
+            'component_states': kwargs.get('component_states', {}),
+        }
+        state_path = os.path.join(checkpoint_dir, 'trainer_state.json')
+        if async_request is not None:
+            # Completion markers ride the async finalize: trainer_state.json + the iteration tracker are
+            # what a resume reads, so they are written only after every rank's shard write landed (the
+            # metadata finalize ahead of this hook already held the completion barrier).
+            def _finalize_async_checkpoint() -> None:
+                rank = dist.get_rank()
+                if rank == 0:
+                    with open(state_path, 'w') as f:
+                        json.dump(trainer_state, f, indent=2)
+                    tracker_path = os.path.join(checkpoint_dir, 'latest_checkpointed_iteration.txt')
+                    with open(tracker_path, 'w') as f:
+                        f.write(str(optimizer_config.cur_step))
+                    copy_checkpoint_args(output_dir, checkpoint_dir)
+
+            async_request.finalize_fns.append(_finalize_async_checkpoint)
+            self._mcore_async_calls_queue().schedule_async_request(async_request)
+            # Join any earlier write that has since completed (mirrors v4's per-step finalize probe).
+            self._maybe_finalize_mcore_async_saves()
+            return checkpoint_dir
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        if rank == 0 and save_optimizer:
+            with open(state_path, 'w') as f:
+                json.dump(trainer_state, f, indent=2)
 
         # Copy the run metadata and rotate only after every checkpoint component has completed. Rank 0
         # removes old directories; the final barrier keeps workers from continuing while rotation is in flight.
@@ -1843,12 +1872,36 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
 
         return state_dict
 
+    def _mcore_async_calls_queue(self):
+        """The mcore-native async write queue, owned per model instance (no megatron global args)."""
+        if self._mcore_async_queue is None:
+            from megatron.core.dist_checkpointing.strategies.async_utils import AsyncCallsQueue
+            self._mcore_async_queue = AsyncCallsQueue(persistent=False)
+        return self._mcore_async_queue
+
+    def _maybe_finalize_mcore_async_saves(self, blocking: bool = False) -> None:
+        """Join completed async shard writes; runs on all ranks (the finalize holds a barrier)."""
+        if self._mcore_async_queue is not None:
+            self._mcore_async_queue.maybe_finalize_async_calls(
+                blocking, no_dist=not dist.is_initialized())
+
+    def wait_async_saves(self) -> None:
+        """Join every in-flight save on both async channels (thread-pool tail + mcore queue)."""
+        super().wait_async_saves()
+        self._maybe_finalize_mcore_async_saves(blocking=True)
+
     def _save_mcore_optimizer(
         self,
         checkpoint_dir: str,
         optimizer_config: 'MegatronOptimizerGroup',
         **kwargs,
     ):
+        """Write the optimizer/scheduler/RNG state in mcore dist-ckpt format.
+
+        With ``async_save=True`` the sharded tensors are staged to host memory here and the shard
+        writes move to an mcore async worker; the caller receives the AsyncRequest (its finalize
+        hooks carry the completion markers) and schedules it. Returns None on the synchronous path.
+        """
         from megatron.core import dist_checkpointing
         from megatron.core import parallel_state as mpu
         from megatron.core.dist_checkpointing.serialization import TorchDistSaveShardedStrategy
@@ -1894,14 +1947,21 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
                 mpu.get_data_parallel_group(with_context_parallel=True),
             )
 
-        dist_checkpointing.save(
+        # Async staging is only sound under an initialized process group (the metadata finalize holds a
+        # barrier); a single-process run saves synchronously, where there is no skew to hide anyway.
+        async_save = kwargs.pop('async_save', False) and dist.is_initialized()
+        async_request = dist_checkpointing.save(
             state_dict,
             iter_dir,
             save_strategy,
-            async_sharded_save=False,
+            async_sharded_save=async_save,
             validate_access_integrity=True,
             content_metadata=sharded_sd_metadata,
         )
+        if async_request is not None:
+            # The strategy already staged the tensors to host memory; the queue's worker performs the
+            # shard writes and runs the metadata finalize (with its barrier) once every rank landed.
+            return async_request
 
         if dist.is_initialized():
             dist.barrier()

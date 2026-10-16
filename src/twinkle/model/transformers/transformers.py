@@ -1917,11 +1917,14 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
                 safe_serialization: Save weights with safetensors instead of torch serialization.
                 max_shard_size: Maximum size of each full-model weight shard.
                 save_total_limit: Maximum number of completed checkpoint directories to retain.
+                async_save: Offload the staged weight/tokenizer/trainer-state file I/O to a background
+                    writer (the state itself is always gathered synchronously).
         """
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         safe_serialization = kwargs.pop('safe_serialization', True)
         max_shard_size = kwargs.pop('max_shard_size', '5GB')
         save_total_limit = kwargs.pop('save_total_limit', None)
+        async_save = kwargs.pop('async_save', False)
         optimizer_config = self.optimizer_group[adapter_name]
         if name is None:
             name = f'checkpoint-step-{optimizer_config.cur_step}'
@@ -1941,34 +1944,57 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         else:
             processed_state_dict = self._get_adapter_state_dict_for_save(adapter_name)
 
-        if isinstance(model, PeftModel):
-            if max_shard_size != '5GB':
-                raise NotImplementedError(
-                    'max_shard_size is not supported for PEFT adapter checkpoints; remove the option or save a '
-                    'full-model checkpoint.')
-            if Platform.is_master():
-                model.peft_config[adapter_name].save_pretrained(checkpoint_dir)
-                contiguous_dict = {k: v.contiguous() for k, v in processed_state_dict.items()}
-                if safe_serialization:
-                    save_file(contiguous_dict, os.path.join(checkpoint_dir, 'adapter_model.safetensors'))
-                else:
-                    torch.save(contiguous_dict, os.path.join(checkpoint_dir, 'adapter_model.bin'))
-        else:
-            model.save_pretrained(
-                checkpoint_dir, state_dict=processed_state_dict, is_main_process=Platform.is_master(), **save_kwargs)
-
-        self._save_tokenizer(checkpoint_dir, adapter_name=adapter_name)
-
+        # The optimizer/scheduler/scaler/rng state goes through the strategy's save protocol (deepspeed's
+        # engine.save_checkpoint / FSDP2's get_optimizer_state_dict perform collectives), so it stays on
+        # the synchronous path; async only offloads the staged weight/tokenizer/trainer-state file I/O.
+        self._deferred_trainer_state_writes = []
         if kwargs.get('save_optimizer', False):
             self._save_training_state(
                 checkpoint_dir,
                 adapter_name=adapter_name,
                 consumed_train_samples=kwargs.get('consumed_train_samples', 0),
                 component_states=kwargs.get('component_states', {}),
+                defer_trainer_state=async_save,
             )
 
-        copy_checkpoint_args(output_dir, checkpoint_dir)
-        rotate_checkpoints(output_dir, checkpoint_dir, save_total_limit)
+        def _write_weights() -> None:
+            """Pure file I/O over the staged CPU payloads; no collectives, no device tensors."""
+            if isinstance(model, PeftModel):
+                if max_shard_size != '5GB':
+                    raise NotImplementedError(
+                        'max_shard_size is not supported for PEFT adapter checkpoints; remove the option or save a '
+                        'full-model checkpoint.')
+                if Platform.is_master():
+                    model.peft_config[adapter_name].save_pretrained(checkpoint_dir)
+                    contiguous_dict = {k: v.contiguous() for k, v in processed_state_dict.items()}
+                    if safe_serialization:
+                        save_file(contiguous_dict, os.path.join(checkpoint_dir, 'adapter_model.safetensors'))
+                    else:
+                        torch.save(contiguous_dict, os.path.join(checkpoint_dir, 'adapter_model.bin'))
+            else:
+                model.save_pretrained(
+                    checkpoint_dir, state_dict=processed_state_dict, is_main_process=Platform.is_master(),
+                    **save_kwargs)
+
+        if async_save:
+            # trainer_state.json doubles as the completion marker a resume reads; the deferred writes run
+            # last so a crash mid-write leaves a directory the resume path cannot mistake for complete.
+            deferred = list(self._deferred_trainer_state_writes)
+
+            def _write_tail() -> None:
+                _write_weights()
+                self._save_tokenizer(checkpoint_dir, adapter_name=adapter_name)
+                copy_checkpoint_args(output_dir, checkpoint_dir)
+                for write in deferred:
+                    write()
+                rotate_checkpoints(output_dir, checkpoint_dir, save_total_limit)
+
+            self.submit_async_write(_write_tail)
+        else:
+            _write_weights()
+            self._save_tokenizer(checkpoint_dir, adapter_name=adapter_name)
+            copy_checkpoint_args(output_dir, checkpoint_dir)
+            rotate_checkpoints(output_dir, checkpoint_dir, save_total_limit)
         return checkpoint_dir
 
     def _get_adapter_state_dict_for_save(self, adapter_name: str) -> dict:
@@ -2011,6 +2037,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
 
     def _save_training_state(self, output_dir, **kwargs):
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
+        defer_trainer_state = kwargs.pop('defer_trainer_state', False)
         self._save_optimizer(output_dir, adapter_name=adapter_name)
 
         optimizer_config = self.optimizer_group[adapter_name]
@@ -2025,8 +2052,17 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             'consumed_train_samples': kwargs.get('consumed_train_samples', 0),
             'component_states': kwargs.get('component_states', {}),
         }
-        with open(os.path.join(output_dir, 'trainer_state.json'), 'w', encoding='utf-8') as f:
-            json.dump(trainer_state, f)
+
+        def _write_trainer_state() -> None:
+            with open(os.path.join(output_dir, 'trainer_state.json'), 'w', encoding='utf-8') as f:
+                json.dump(trainer_state, f)
+
+        # Under async_save the trainer_state.json is the resume completion marker: defer it to the
+        # background write so a crash mid-write cannot leave a directory that looks complete.
+        if defer_trainer_state:
+            self._deferred_trainer_state_writes.append(_write_trainer_state)
+        else:
+            _write_trainer_state()
 
         if optimizer_config.scaler is not None:
             torch.save(

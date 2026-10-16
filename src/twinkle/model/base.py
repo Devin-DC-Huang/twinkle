@@ -10,6 +10,7 @@ from twinkle.data_format import InputFeature, ModelOutput
 from twinkle.hub import HubOperation
 from twinkle.loss.base import Loss
 from twinkle.metric import Metric
+from twinkle.model.async_save import AsyncSaveMixin
 from twinkle.patch import Patch
 from twinkle.perf import timed
 from twinkle.processor import InputProcessor
@@ -140,7 +141,7 @@ class ModelLoaderProtocol(Protocol):
         ...
 
 
-class TrainableModel(ABC):
+class TrainableModel(AsyncSaveMixin, ABC):
 
     _checkpoint_engine = None
 
