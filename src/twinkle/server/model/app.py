@@ -14,7 +14,8 @@ from ray import serve
 from ray.serve.config import RequestRouterConfig
 from typing import Any
 
-from twinkle import DeviceGroup
+from twinkle import DeviceGroup, remote_class
+from twinkle.model.base import TrainableModel
 from twinkle.server.common.router import StickyLoraRequestRouter
 from twinkle.server.deployment import LazyCleanupMixin, bind_deployment, build_deployment_app, init_twinkle_runtime
 from twinkle.server.exceptions import FullModeBusyError
@@ -47,8 +48,30 @@ def _make_mock_model(kw: dict[str, Any]) -> Any:
     return TwinkleCompatMockModel(**kw)
 
 
+def _make_model_class(base: type) -> type:
+    """Compose a model class with twinkle's tinker/twinkle compat mixin.
+
+    This is the composition ``TwinkleCompatTransformersModel`` bakes in at import time, done at runtime
+    for a class that arrives as an import spec. The result is decorated with ``remote_class`` for the
+    same reason the built-in compat classes are: the outermost decorator layer is what names the class
+    the workers hold, so a subclass that only inherits the (already wrapped) base ``__init__`` would
+    spawn workers of the base class and lose every compat method.
+
+    Args:
+        base: The model class named by ``ModelArgs.model_cls``.
+    """
+    from .backends.transformers_model import _TransformersTinkerCompatMixin
+
+    return remote_class()(type(f'TwinkleCompat{base.__name__}', (_TransformersTinkerCompatMixin, base), {}))
+
+
 def _make_transformers_model(kw: dict[str, Any]) -> Any:
     train_mode = kw.pop('train_mode', 'lora')
+    # ``model_cls`` arrives as plain data and is resolved here, so the class object never reaches the
+    # constructor -- it would either be rejected by the remote-class layer in safe mode
+    # (``TWINKLE_TRUST_REMOTE_CODE=0``) or leak into every worker's constructor kwargs. The schema only
+    # allows it for a LoRA-mode transformers deployment.
+    model_cls_spec = kw.pop('model_cls', None)
     if train_mode == 'full':
         from .backends.transformers_model import TwinkleCompatFullTransformersModel
         for key in _LORA_ONLY_CTOR_KWARGS:
@@ -59,6 +82,8 @@ def _make_transformers_model(kw: dict[str, Any]) -> Any:
 
     if train_mode == 'hybrid':
         return TwinkleCompatSpectralHybridTransformersModel(**kw)
+    if model_cls_spec is not None:
+        return _make_model_class(_resolve_model_cls(model_cls_spec))(**kw)
     return TwinkleCompatTransformersModel(**kw)
 
 
@@ -87,6 +112,23 @@ def _resolve_model_loader(spec: str, model_id: str) -> Any:
             f'model_loader must be a "module:callable" import spec naming a loader factory, got {spec!r}')
     factory = getattr(importlib.import_module(module_name), attr)
     return factory(model_id)
+
+
+def _resolve_model_cls(spec: str) -> type:
+    """Resolve a ``module:attr`` import spec into the model class it names.
+
+    The sibling of ``_resolve_model_loader``: the class arrives as plain data (it crosses the Ray
+    boundary), so it is imported generically here -- twinkle never imports a concrete model registry.
+    swift points this at its own class, e.g.
+    ``swift.dev.model.multi_lora_sentence_transformer_model:MultiLoraSentenceTransformerModel``.
+    """
+    module_name, _, attr = spec.partition(':')
+    if not attr:
+        raise ValueError(f'model_cls must be a "module:attr" import spec naming a model class, got {spec!r}')
+    obj = getattr(importlib.import_module(module_name), attr)
+    if not (isinstance(obj, type) and issubclass(obj, TrainableModel)):
+        raise TypeError(f'model_cls must name a TrainableModel subclass, got {spec!r} -> {obj!r}')
+    return obj
 
 
 # Single validate-then-dispatch selector for the model backend.

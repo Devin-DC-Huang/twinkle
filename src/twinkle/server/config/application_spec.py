@@ -86,6 +86,13 @@ class ModelArgs(_ArgsBase):
     hybrid: SpectralHybridArgs | None = None
     data_plane_url: str | None = None
     model_loader: str | None = None
+    #: ``module:attr`` import spec naming the model class to serve, e.g.
+    #: ``swift.dev.model.multi_lora_sentence_transformer_model:MultiLoraSentenceTransformerModel``.
+    #: twinkle resolves it inside the replica and wraps the class in its own tinker/twinkle compat
+    #: layer, so a family whose runtime object is not a plain AutoModel (a sentence-transformers
+    #: pipeline, say) can be served by the same deployment. Only meaningful for a LoRA-mode
+    #: transformers deployment; every other combination is rejected below instead of being ignored.
+    model_cls: str | None = None
 
     @model_validator(mode='after')
     def _validate_spectral_backend(self):
@@ -96,6 +103,10 @@ class ModelArgs(_ArgsBase):
                 raise ValueError('hybrid is only supported by the transformers backend')
             if self.train_mode == 'full':
                 raise ValueError('hybrid is not supported with train_mode="full"')
+        if self.model_cls is not None:
+            if self.backend != 'transformers' or self.train_mode != 'lora' or self.hybrid is not None:
+                raise ValueError('model_cls is only supported by a transformers backend in train_mode="lora" '
+                                 'without hybrid')
         return self
 
 
