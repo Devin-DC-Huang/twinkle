@@ -7,42 +7,65 @@ from twinkle.checkpoint_engine.base import CheckpointEngine
 class CheckpointEngineMixin:
 
     _checkpoint_engine: CheckpointEngine = None
+    _checkpoint_engines = None
+    _checkpoint_engine_key = None
     _bucket_size: int = 3072 << 20  # 2 GB
     # Set by CheckpointEngineManager when the roles share a GPU; see set_checkpoint_engine_backend.
     _checkpoint_engine_backend: str = None
 
+    def _select_checkpoint_engine(self, backend: str, channel: str) -> None:
+        if not isinstance(channel, str) or not channel:
+            raise ValueError(f'checkpoint channel must be a non-empty string, got {channel!r}.')
+        if backend not in {'ipc', 'nccl', 'hccl'}:
+            raise ValueError(f'checkpoint backend must be ipc/nccl/hccl, got {backend!r}.')
+        self._checkpoint_engine_backend = backend
+        self._checkpoint_engine_key = (backend, channel)
+        engines = getattr(self, '_checkpoint_engines', None)
+        self._checkpoint_engine = engines.get(self._checkpoint_engine_key) if engines else None
+
+    @remote_function(dispatch='all', lazy_collect=False)
+    def activate_checkpoint_engine(self, backend: str, channel: str = 'default'):
+        """Select one persistent transport channel without discarding the other channels."""
+        self._select_checkpoint_engine(backend, channel)
+
     @remote_function(dispatch='all', lazy_collect=False)
     def set_checkpoint_engine_backend(self, backend: str):
-        """Choose the transport for the syncs that follow.
-
-        Separate from ``prepare_checkpoint_engine`` because that one dispatches by slicing its
-        arguments across ranks, which would take a backend name apart character by character.
-        """
-        if backend != self._checkpoint_engine_backend:
-            self._checkpoint_engine_backend = backend
-            self._checkpoint_engine = None
+        """Choose the default transport channel for backward-compatible callers."""
+        self._select_checkpoint_engine(backend, 'default')
 
     def _get_or_create_checkpoint_engine(self) -> 'CheckpointEngine':
-        """Get or create the checkpoint engine instance (lazy singleton)."""
-        if self._checkpoint_engine is None:
-            if self._checkpoint_engine_backend == 'ipc':
+        """Get or create the engine for the currently active transport channel."""
+        backend = self._checkpoint_engine_backend
+        if backend is None:
+            backend = 'nccl' if Platform.get_platform().__name__ == 'GPU' else 'hccl'
+        key = self._checkpoint_engine_key or (backend, 'default')
+        engines = getattr(self, '_checkpoint_engines', None)
+        if engines is None:
+            engines = {}
+            self._checkpoint_engines = engines
+        engine = engines.get(key)
+        if engine is None:
+            if backend == 'ipc':
                 # Colocated: the sampler is on this GPU, so weights are mapped, not broadcast. NCCL
                 # is not an option here -- it refuses two ranks on one device.
                 from twinkle.checkpoint_engine import IPCCheckpointEngine
-                self._checkpoint_engine = IPCCheckpointEngine()
-            elif Platform.get_platform().__name__ == 'GPU':
+                engine = IPCCheckpointEngine()
+            elif backend == 'nccl':
                 from twinkle.checkpoint_engine import NCCLCheckpointEngine
-                self._checkpoint_engine = NCCLCheckpointEngine(self._bucket_size)
-            elif Platform.get_platform().__name__ == 'NPU':
+                engine = NCCLCheckpointEngine(self._bucket_size)
+            elif backend == 'hccl':
                 from twinkle.checkpoint_engine import HCCLCheckpointEngine
 
                 # Reusing HCCL communicator across sync steps avoids frequent
                 # stream/channel allocation and reduces resource exhaustion risk.
-                self._checkpoint_engine = HCCLCheckpointEngine(
+                engine = HCCLCheckpointEngine(
                     self._bucket_size,
                     rebuild_group=False,
                 )
-        return self._checkpoint_engine
+            engines[key] = engine
+        self._checkpoint_engine_key = key
+        self._checkpoint_engine = engine
+        return engine
 
     @remote_function(collect='first', lazy_collect=False)
     def prepare_checkpoint_engine(self, is_master):
@@ -71,6 +94,17 @@ class CheckpointEngineMixin:
 
     @remote_function(dispatch='all', lazy_collect=False)
     def finalize_checkpoint_engine(self):
-        """Finalize checkpoint engine: release buffers, optionally destroy group."""
-        if self._checkpoint_engine is not None:
-            self._checkpoint_engine.finalize()
+        """Finalize the active engine while retaining a reusable communication group."""
+        engine = self._get_or_create_checkpoint_engine()
+        engine.finalize()
+
+    @remote_function(dispatch='all', lazy_collect=False)
+    def reset_checkpoint_engine(self, channel: str = 'default', backend: str = None):
+        """Destroy selected persistent channels when their remote peer is retired."""
+        engines = getattr(self, '_checkpoint_engines', None) or {}
+        keys = [key for key in engines if key[1] == channel and (backend is None or key[0] == backend)]
+        for key in keys:
+            engines.pop(key).close()
+        if self._checkpoint_engine_key in keys:
+            self._checkpoint_engine = None
+            self._checkpoint_engine_key = None

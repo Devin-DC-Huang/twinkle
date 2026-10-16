@@ -287,6 +287,7 @@ class RayHelper:
                        instance_id,
                        extra_torch_kwargs: Optional[Dict[str, Any]] = None,
                        max_concurrency: Optional[int] = None,
+                       worker_slots: Optional[List[int]] = None,
                        **kwargs) -> List[T]:
         # TODO when will remote create remote?
         # Should it peer create peer? or peer create all?
@@ -303,6 +304,14 @@ class RayHelper:
         if isinstance(ranks, int):
             ranks = list(range(ranks))
         assert len(placement_groups) == len(ranks)
+        if worker_slots is not None:
+            slots = tuple(worker_slots)
+            if any(type(slot) is not int or not 0 <= slot < len(ranks) for slot in slots) or len(set(slots)) != len(slots):
+                raise ValueError(f'worker_slots must be unique indices in [0, {len(ranks)}), got {slots!r}.')
+            if not slots:
+                return []
+            placement_groups = [placement_groups[slot] for slot in slots]
+            ranks = [ranks[slot] for slot in slots]
         key = f'{group}-{worker_cls.__class__.__name__}-{instance_id}'
         if execute == 'peer':
             # Create the peer worker
@@ -392,7 +401,12 @@ class RayHelper:
                 if max_concurrency is not None:
                     worker_options['max_concurrency'] = max_concurrency
 
-                worker = worker_cls.options(**worker_options).remote(*args, **kwargs)
+                try:
+                    worker = worker_cls.options(**worker_options).remote(*args, **kwargs)
+                except BaseException:
+                    for created in workers:
+                        ray.kill(created, no_restart=True)
+                    raise
                 workers.append(worker)
         else:
             world_size = len(ranks)
@@ -433,6 +447,11 @@ class RayHelper:
                 if max_concurrency is not None:
                     worker_options['max_concurrency'] = max_concurrency
 
-                worker = worker_cls.options(**worker_options).remote(*args, **kwargs)
+                try:
+                    worker = worker_cls.options(**worker_options).remote(*args, **kwargs)
+                except BaseException:
+                    for created in workers:
+                        ray.kill(created, no_restart=True)
+                    raise
                 workers.append(worker)
         return workers

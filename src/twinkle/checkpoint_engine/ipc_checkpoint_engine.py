@@ -94,6 +94,8 @@ class IPCCheckpointEngine(CheckpointEngine):
         trainer_world_size: int,
         rollout_world_size: int,
         metadata: list[dict],
+        *,
+        sender_ranks=None,
     ) -> tuple[dict[str, list[Any]], dict[str, list[Any]]]:
         """Decide which trainer ranks have a sampler to talk to, and pair them up.
 
@@ -113,18 +115,22 @@ class IPCCheckpointEngine(CheckpointEngine):
         ``tp``. Nothing here has to match them up explicitly: the endpoint is derived from the GPU, so
         the pairing falls out of both peers being on it.
         """
-        if rollout_world_size <= 0 or trainer_world_size % rollout_world_size:
-            raise ValueError(
-                f'Colocated weight sync expects each sampler process to cover a whole number of trainer '
-                f'ranks\' GPUs, got trainer={trainer_world_size} and rollout={rollout_world_size}. Unless '
-                f'the two roles are placed on the same devices, this needs the NCCL engine instead.')
-        # How many trainer ranks share one sampler process: 1 without tensor parallelism, tp with it.
-        ranks_per_sampler = trainer_world_size // rollout_world_size
+        if sender_ranks is None:
+            if rollout_world_size <= 0 or trainer_world_size % rollout_world_size:
+                raise ValueError(
+                    f'Colocated weight sync expects each sampler process to cover a whole number of trainer '
+                    f'ranks\' GPUs, got trainer={trainer_world_size} and rollout={rollout_world_size}. Unless '
+                    f'the two roles are placed on the same devices, this needs the NCCL engine instead.')
+            ranks_per_sampler = trainer_world_size // rollout_world_size
+            sender_ranks = tuple(range(0, trainer_world_size, ranks_per_sampler))
+        else:
+            sender_ranks = tuple(sender_ranks)
+            if any(type(rank) is not int or not 0 <= rank < trainer_world_size for rank in sender_ranks):
+                raise ValueError('IPC sender_ranks must identify physical ranks within the trainer world.')
+            if len(sender_ranks) != rollout_world_size or len(set(sender_ranks)) != len(sender_ranks):
+                raise ValueError('Each IPC receiver must have exactly one unique trainer sender rank.')
         trainer_kwargs = {
-            'rank': [
-                _SENDER_RANK if rank % ranks_per_sampler == 0 else _IDLE_RANK
-                for rank in range(trainer_world_size)
-            ],
+            'rank': [_SENDER_RANK if rank in sender_ranks else _IDLE_RANK for rank in range(trainer_world_size)],
             'world_size': [_CHANNEL_SIZE] * trainer_world_size,
             'master_metadata': [None] * trainer_world_size,
         }

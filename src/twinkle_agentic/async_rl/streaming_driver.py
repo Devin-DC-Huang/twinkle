@@ -217,6 +217,15 @@ class DriverStats:
     #: Wall-clock seconds spent in the idle ``sleep`` branch: trajectories in flight, none completed this
     #: pass, buffer not yet trainable -- i.e. the trainer starved for ready work (the trainer bubble).
     idle_time: float = 0.0
+    submit_time: float = 0.0
+    poll_time: float = 0.0
+    collect_time: float = 0.0
+    score_time: float = 0.0
+    publish_time: float = 0.0
+    capacity_blocked_passes: int = 0
+    staleness_blocked_passes: int = 0
+    ready_high_watermark: int = 0
+    inflight_high_watermark: int = 0
     #: Wall-clock seconds for the whole :meth:`StreamingDriver.run`, set in its ``finally`` (so it is
     #: defined on every exit path: drain, budget hit, or error). ``total >= train_active + idle``; the
     #: residual is the driver's own admit/poll/collect/publish overhead.
@@ -274,10 +283,11 @@ class _ContextLedger:
         """Release a pin from :meth:`acquire` (refcount--; a collected/cancelled trajectory's ONLY release)."""
         self._ctx_mgr.release_rollout_policy(policy)
 
-    def open_window(self) -> None:
+    def open_window(self) -> bool:
         """Open one fresh admission window if the staleness gate allows (bounded by ``max_staleness``)."""
-        self._ctx_mgr.request_rollout_partition(
+        admission = self._ctx_mgr.request_rollout_partition(
             self._ctx, target_groups=self._groups_per_partition, num_generations=self._num_generations)
+        return admission is not None
 
     def current_version(self) -> int:
         return self._ctx_mgr.get_rollout_policy(self._ctx).version
@@ -324,8 +334,8 @@ class _NullLedger:
     def release(self, policy: RolloutPolicy) -> None:
         return None
 
-    def open_window(self) -> None:
-        return None
+    def open_window(self) -> bool:
+        return True
 
     def current_version(self) -> int:
         return 0
@@ -562,7 +572,9 @@ class StreamingDriver:
                     if live_windows:
                         window = live_windows[0]
                         self._ledger.begin_publish(window)
+                        _t = time.perf_counter()
                         new_path = push(window)
+                        self.stats.publish_time += time.perf_counter() - _t
                         self._ledger.finish_publish(window, new_path)
                         self.stats.publishes += 1
                         self._drop_stale(ready, group_counts)
@@ -573,8 +585,11 @@ class StreamingDriver:
                 # (2) Admission: open a fresh window while the staleness gate is open, then admit
                 #     per-sample until the stream ends or the backpressure cap is reached.
                 if not stream_done or regen_queue:
-                    self._open_window()
+                    if not self._open_window():
+                        self.stats.staleness_blocked_passes += 1
                     capacity = self._buffer_depth - len(handles) - len(ready)
+                    if capacity <= 0:
+                        self.stats.capacity_blocked_passes += 1
                     while capacity > 0:
                         if partial is None:
                             if regen_queue:
@@ -599,7 +614,9 @@ class StreamingDriver:
                         prompt_ref, trajectory_idx, group_key = partial
                         policy = self._ledger.acquire()
                         try:
+                            _t = time.perf_counter()
                             handle = self._submit(prompt_ref, trajectory_idx, policy)
+                            self.stats.submit_time += time.perf_counter() - _t
                         except BaseException:
                             # A failed submit must not leak the pin it just acquired.
                             self._ledger.release(policy)
@@ -624,13 +641,18 @@ class StreamingDriver:
                     # The version cannot change during collection (a publish is phase (1), never here),
                     # so read it once for the whole poll's staleness decision.
                     current = self._current_version()
-                    for handle in self._poll(list(handles)):
+                    _t = time.perf_counter()
+                    completed = self._poll(list(handles))
+                    self.stats.poll_time += time.perf_counter() - _t
+                    for handle in completed:
                         entry = handles.pop(handle, None)
                         if entry is None:
                             continue  # a handle this driver does not know: ignore, never double-collect
                         _, policy, group_key = entry
                         try:
+                            _t = time.perf_counter()
                             sample = self._collect(handle)
+                            self.stats.collect_time += time.perf_counter() - _t
                         finally:
                             # The sampler is done with this trajectory, so its version pin is released
                             # HERE (acquire's contract is "pin while one sampler request is using it"): the
@@ -659,7 +681,9 @@ class StreamingDriver:
                         # that mutates in place and returns None keeps the original). This is per-SAMPLE, not
                         # per-group -- group-relative advantage is the assembler's job, not this seam's.
                         if self._score is not None:
+                            _t = time.perf_counter()
                             scored = self._score(sample)
+                            self.stats.score_time += time.perf_counter() - _t
                             if scored is not None:
                                 sample = scored
                         ready.append(BufferRecord(sample=sample, version=policy.version, group_key=group_key))
@@ -683,6 +707,8 @@ class StreamingDriver:
                     # needed -- training is done, so there is no further generation to publish to.
                     exhausted = True
 
+                self.stats.ready_high_watermark = max(self.stats.ready_high_watermark, len(ready))
+                self.stats.inflight_high_watermark = max(self.stats.inflight_high_watermark, len(handles))
                 if not progressed and handles:
                     # Generations in flight, none completed, buffer not (yet) trainable: wait briefly
                     # instead of hot-spinning the poll.
@@ -741,7 +767,7 @@ class StreamingDriver:
         """The live admission windows (partitions) of this context, oldest step first (FIFO publish)."""
         return self._ledger.live_windows()
 
-    def _open_window(self) -> None:
+    def _open_window(self) -> bool:
         """Open one fresh admission window if the staleness gate allows (bounded by ``max_staleness``).
 
         ``target_groups`` is the window's sizing DECLARATION (the groups one publish cycle trains,
@@ -750,7 +776,7 @@ class StreamingDriver:
         a specific sample. A no-op under the null ledger (infer: no windows, admission gated only by
         ``buffer_depth``).
         """
-        self._ledger.open_window()
+        return self._ledger.open_window()
 
     def _current_version(self) -> int:
         return self._ledger.current_version()

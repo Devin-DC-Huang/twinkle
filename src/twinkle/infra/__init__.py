@@ -322,6 +322,8 @@ def get_device_placement(device_group=None) -> str:
 
 
 def _get_workers(workers, execute):
+    if not workers:
+        return []
     if execute == 'first':
         return [workers[0]]
     elif execute == 'all':
@@ -388,7 +390,28 @@ def _make_worker_async_companion(func, wrapper):
     return companion
 
 
-def _cw_state(self, n_workers: int):
+def get_worker_id(worker) -> str:
+    """返回 Ray actor 的稳定身份，与它在 handler 中的位置无关。"""
+    return worker._actor_id.hex()
+
+
+def _select_workers(self, worker_ids=None):
+    workers = tuple(self._actors)
+    if worker_ids is None:
+        return workers
+    worker_ids = tuple(worker_ids)
+    if any(not isinstance(worker_id, str) for worker_id in worker_ids):
+        raise ValueError('_worker_ids must contain stable actor ID strings.')
+    if len(set(worker_ids)) != len(worker_ids):
+        raise ValueError('_worker_ids must not contain duplicate actor IDs.')
+    by_id = {get_worker_id(worker): worker for worker in workers}
+    unknown = set(worker_ids) - by_id.keys()
+    if unknown:
+        raise ValueError(f'Unknown actor IDs in _worker_ids: {sorted(unknown)}')
+    return tuple(by_id[worker_id] for worker_id in worker_ids)
+
+
+def _cw_state(self):
     """Driver-side bookkeeping for ``enable_continous_work``, created on first use.
 
     ``load`` counts requests handed to each worker and not yet returned, which is
@@ -402,22 +425,35 @@ def _cw_state(self, n_workers: int):
     holding it, so re-entrance is not needed.
     """
     state = getattr(self, '_continous_work_state', None)
-    if state is not None and len(state['load']) == n_workers:
+    if state is not None:
         return state
     with _CW_CREATE_LOCK:
-        # Re-read: another thread may have created it while this one waited.
         state = getattr(self, '_continous_work_state', None)
-        if state is None or len(state['load']) != n_workers:
+        if state is None:
             state = {
                 'lock': threading.Lock(),
-                'load': [0] * n_workers,
-                'inflight': {},  # method name -> list of pending object refs
+                'load': {},
+                'inflight': {},
+                'owners': {},
             }
             self._continous_work_state = state
         return state
 
 
-def _cw_barrier(self, current_func: str) -> None:
+def _cw_drop_locked(state, refs):
+    for ref in refs:
+        owner = state['owners'].pop(ref, None)
+        if owner is not None:
+            worker_id, charge = owner
+            state['load'][worker_id] = state['load'].get(worker_id, 0) - charge
+        for name, pending in tuple(state['inflight'].items()):
+            if ref in pending:
+                pending.remove(ref)
+            if not pending:
+                state['inflight'].pop(name, None)
+
+
+def _cw_barrier(self, current_func: str, workers, *, materialize=True) -> None:
     """Drain every other method's in-flight work before proceeding.
 
     Best effort by construction: another thread may submit again the moment this
@@ -428,27 +464,28 @@ def _cw_barrier(self, current_func: str) -> None:
     state = getattr(self, '_continous_work_state', None)
     if not state:
         return
+    worker_ids = {get_worker_id(worker) for worker in workers}
     with state['lock']:
-        others = {name: list(refs) for name, refs in state['inflight'].items() if name != current_func and refs}
+        others = {
+            name: [ref for ref in refs if state['owners'][ref][0] in worker_ids]
+            for name, refs in state['inflight'].items() if name != current_func
+        }
+        others = {name: refs for name, refs in others.items() if refs}
     if not others:
         return
     import ray
     flat = [ref for refs in others.values() for ref in refs]
     logger.debug(f'continous_work barrier: {current_func} waits for {len(flat)} pending request(s) '
                  f'from {sorted(others)}')
-    ray.get(flat)
-    # They are finished now, so drop them instead of re-getting them on every
-    # later call. The owning thread's own cleanup tolerates them being gone.
-    with state['lock']:
-        for name, refs in others.items():
-            pending = state['inflight'].get(name)
-            if pending is None:
-                continue
-            for ref in refs:
-                if ref in pending:
-                    pending.remove(ref)
-            if not pending:
-                state['inflight'].pop(name, None)
+    try:
+        if materialize:
+            ray.get(flat)
+        else:
+            ray.wait(flat, num_returns=len(flat))
+    finally:
+        ready, _ = ray.wait(flat, num_returns=len(flat), timeout=0)
+        with state['lock']:
+            _cw_drop_locked(state, ready)
 
 
 def _cw_object_refs(result) -> List[Any]:
@@ -462,7 +499,7 @@ def _cw_object_refs(result) -> List[Any]:
     return refs
 
 
-def _cw_register(self, func_name: str, result) -> List[Any]:
+def _cw_register(self, func_name: str, result, workers) -> List[Any]:
     """Record a non-continuous call's refs so a later different method waits for it.
 
     Needed because a lazily collected method returns before its work finishes:
@@ -473,8 +510,11 @@ def _cw_register(self, func_name: str, result) -> List[Any]:
     refs = _cw_object_refs(result)
     if not refs:
         return refs
-    state = _cw_state(self, len(getattr(self, '_actors', ())) or 1)
+    state = _cw_state(self)
     with state['lock']:
+        for worker, item in zip(workers, result):
+            for ref in _cw_object_refs([item]):
+                state['owners'][ref] = (get_worker_id(worker), 0)
         state['inflight'].setdefault(func_name, []).extend(refs)
     return refs
 
@@ -483,15 +523,10 @@ def _cw_unregister(self, func_name: str, refs: List[Any]) -> None:
     state = getattr(self, '_continous_work_state', None)
     if not state or not refs:
         return
+    import ray
+    ready, _ = ray.wait(refs, num_returns=len(refs), timeout=0)
     with state['lock']:
-        pending = state['inflight'].get(func_name)
-        if pending is None:
-            return
-        for ref in refs:
-            if ref in pending:
-                pending.remove(ref)
-        if not pending:
-            state['inflight'].pop(func_name, None)
+        _cw_drop_locked(state, ready)
 
 
 def _cw_plan(n_workers: int, load: List[int], batch_len: int) -> List[List[int]]:
@@ -543,20 +578,25 @@ def _run_continous_work(self, func_name: str, execute_method, workers, args, kwa
     """
     import ray
 
-    state = _cw_state(self, len(workers))
+    state = _cw_state(self)
+    worker_ids = tuple(get_worker_id(worker) for worker in workers)
     submitted = []
     # The awaitable form, so the worker can hold several of these at once. Book-
     # keeping still uses the plain name, which is what callers and the barrier see.
     remote_name = _WORKER_ASYNC_PREFIX + func_name
     with state['lock']:
-        plan = _cw_plan(len(workers), state['load'], batch_len)
+        load = [state['load'].get(worker_id, 0) for worker_id in worker_ids]
+        plan = _cw_plan(len(workers), load, batch_len)
         for worker_index, indices in enumerate(plan):
             if not indices:
                 continue
             sub_args, sub_kwargs = _cw_sub_args(args, kwargs, indices, batch_len)
             ref = execute_method(remote_name, [(workers[worker_index], sub_args, sub_kwargs)])[0]
+            worker_id = worker_ids[worker_index]
+            state['load'][worker_id] = state['load'].get(worker_id, 0) + len(indices)
+            state['owners'][ref] = (worker_id, len(indices))
+            state['inflight'].setdefault(func_name, []).append(ref)
             submitted.append((worker_index, indices, ref))
-        state['inflight'].setdefault(func_name, []).extend(ref for _, _, ref in submitted)
 
     try:
         ordered: List[Any] = [None] * batch_len
@@ -570,14 +610,7 @@ def _run_continous_work(self, func_name: str, execute_method, workers, args, kwa
                 ordered[original_index] = part[local_index]
         return ordered
     finally:
-        with state['lock']:
-            pending = state['inflight'].get(func_name, [])
-            for worker_index, indices, ref in submitted:
-                state['load'][worker_index] -= len(indices)
-                if ref in pending:
-                    pending.remove(ref)
-            if not pending:
-                state['inflight'].pop(func_name, None)
+        _cw_unregister(self, func_name, [ref for _, _, ref in submitted])
 
 
 def _collect_func(method: Union[Literal['none', 'flatten', 'mean', 'sum', 'first', 'last_pp'], Callable],
@@ -961,6 +994,9 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
                         *args,
                         **kwargs_for_workers)
                     self._actors = _actors
+                    factory_recorder = getattr(self, '_save_worker_factory', None)
+                    if factory_recorder is not None:
+                        factory_recorder(cls, args, kwargs_for_workers, _extra_torch_kwargs)
                     # Remembered so remote_function knows this class's workers run
                     # methods side by side, and that it must therefore track what is
                     # in flight. Without concurrency Ray orders calls per actor and
@@ -1025,7 +1061,8 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                     sync: bool = False,
                     lazy_collect: Optional[bool] = None,
                     timeout: Optional[float] = None,
-                    enable_continous_work: bool = False):
+                    enable_continous_work: bool = False,
+                    worker_selector: Optional[str] = None):
     """Patch each method called from remote(which class should be decorated with `remote_class`) with this decorator.
 
     Args:
@@ -1065,6 +1102,8 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
             need no collective between them -- data-parallel sampling, not a
             method with an all-reduce in it. While one such method has requests in
             flight, calling any other method on the same handle waits for them.
+        worker_selector: 可选的实例方法名，返回本次调用的稳定 actor ID 子集；
+            显式传入的内部参数 ``_worker_ids`` 优先于该选择方法。
     """ # noqa
 
     def decorator(func: Callable[..., T1]) -> Callable[..., T1]:
@@ -1076,8 +1115,11 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
             _caller = _capture_caller() if hasattr(self, '_actors') else None
             if _caller:
                 _ctx = f'{_ctx} <- {_caller}'
+            _worker_reservation = None
             try:
                 device_mesh = getattr(self, 'device_mesh', None)
+                worker_ids = kwargs.pop('_worker_ids', None)
+                dispatch_context = kwargs.pop('_dispatch_context', None)
                 if _mode == 'local':
                     return func(self, *args, **kwargs)
                 elif _mode == 'ray':
@@ -1088,30 +1130,57 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                         if RayHelper.has_ref(args, kwargs):
                             # In this case, driver dispatch is all, redispatch here
                             args, kwargs = RayHelper.do_get_and_collect(args, kwargs)
-                            world_size = Platform.get_world_size()
-                            rank = Platform.get_rank()
-                            # Redispatch here
+                            if dispatch_context is None:
+                                world_size = Platform.get_world_size()
+                                rank = Platform.get_rank()
+                                workers = _get_workers([None] * world_size, execute)
+                                local_dispatch = dispatch
+                                local_mesh = device_mesh
+                            else:
+                                world_size, rank, subset = dispatch_context
+                                workers = [None] * world_size
+                                local_dispatch = (getattr(self, '_dispatch_sampling_inputs', 'slice')
+                                                  if subset and dispatch == 'slice_dp' else dispatch)
+                                local_mesh = None if subset else device_mesh
                             _workers_and_args = _dispatch_args(
-                                _get_workers([None] * world_size, execute), dispatch, execute, device_mesh, args,
-                                kwargs)
+                                workers, local_dispatch, execute, local_mesh, args, kwargs)
                             _, args, kwargs = _workers_and_args[rank]
                         return func(self, *args, **kwargs)
                     else:
                         # This is the driver
                         from ._ray import RayHelper
                         execute_method = RayHelper.execute_all_async if not sync else RayHelper.execute_all_sync
-                        # Only classes whose workers run methods side by side need
-                        # this; elsewhere Ray already orders calls per actor.
+                        _default_workers = worker_ids is None and worker_selector is None
+                        begin_call = getattr(self, '_begin_worker_call', None)
+                        if begin_call is not None:
+                            _worker_reservation = begin_call(worker_ids, worker_selector)
+                        if _worker_reservation is not None:
+                            selected_ids = _worker_reservation
+                            _subset = not _default_workers
+                        else:
+                            if worker_ids is None and worker_selector is not None:
+                                worker_ids = getattr(self, worker_selector)()
+                            selected_ids = worker_ids
+                            _subset = worker_ids is not None
+                        _workers = _get_workers(_select_workers(self, selected_ids), execute)
+                        if not _workers:
+                            return []
+                        if _subset and worker_selector is not None:
+                            args, kwargs = self._normalize_sampling_args(args, kwargs)
+                        _dispatch = (getattr(self, '_dispatch_sampling_inputs', 'slice')
+                                     if _subset and dispatch == 'slice_dp' else dispatch)
+                        _mesh = None if _subset else device_mesh
                         _concurrent_actor = bool(getattr(self, '_max_concurrency', None))
-                        if _concurrent_actor:
+                        _track_calls = _concurrent_actor or _subset or _worker_reservation is not None
+                        if _track_calls:
                             # Every method waits here, not just the continuous ones:
                             # the point is to keep a weight update or a sleep from
                             # reaching a worker that still has generations running.
-                            _cw_barrier(self, func.__name__)
+                            _cw_barrier(self, func.__name__, _workers,
+                                        materialize=not (_subset or _worker_reservation is not None))
                         if enable_continous_work and not RayHelper.has_ref(args, kwargs):
                             assert not sync, (f'{func.__name__}: enable_continous_work cannot be used with sync=True, '
                                               'which exists for collectives that must run in lock step.')
-                            _workers = _get_workers(self._actors, execute)
                             _batch_len = _cw_batch_len(args, kwargs)
                             if _batch_len:
                                 return _run_continous_work(self, func.__name__, execute_method, _workers, args, kwargs,
@@ -1120,24 +1189,29 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                         if RayHelper.has_ref(args, kwargs):
                             # If has any object-ref, dispatch in worker, because we don't know the structure in the ref.
                             # for example, dataloader returns any data list.
-                            _workers_and_args = _dispatch_args(
-                                _get_workers(self._actors, execute), 'all', execute, device_mesh, args, kwargs)
+                            _workers_and_args = [
+                                (worker, args, dict(kwargs, _dispatch_context=(len(_workers), index, _subset)))
+                                for index, worker in enumerate(_workers)
+                            ]
                         else:
                             # dispatch now
                             _workers_and_args = _dispatch_args(
-                                _get_workers(self._actors, execute), dispatch, execute, device_mesh, args, kwargs)
+                                _workers, _dispatch, execute, _mesh, args, kwargs)
 
                         result = execute_method(func.__name__, _workers_and_args)
                         # Tracked from here so that a different method called next
                         # waits for this one. It matters most for the lazily
                         # collected methods, which return while the worker is still
                         # busy.
-                        _tracked_refs = _cw_register(self, func.__name__, result) if _concurrent_actor else []
+                        _tracked_refs = _cw_register(self, func.__name__, result, _workers) if _track_calls else []
                         # This is a result future, call it to get the actual result
                         _rgt = getattr(self, '_ray_get_timeout', None) or timeout
                         result_func = RayHelper.do_get_and_collect_func(
                             _collect_func, collect, result, device_mesh, timeout=_rgt)
                         _local_lazy_collect = _lazy_collect
+                        recorder = getattr(self, '_record_worker_configuration', None)
+                        if recorder is not None and _default_workers:
+                            recorder(func.__name__, args, kwargs)
                         if func.__name__ == '__iter__':
                             # return self
                             return self
@@ -1166,6 +1240,9 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                             # And this is user independent, only decided by the code.
                             _local_lazy_collect = self._lazy_collect
                         if _local_lazy_collect:
+                            if _subset or _worker_reservation is not None:
+                                # 子集调用的载荷跨 Ray 流转时，不捕获 driver handler 的锁与生命周期状态。
+                                return result_func
                             _orig_result_func = result_func
 
                             @functools.wraps(_orig_result_func)
@@ -1179,7 +1256,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                                 finally:
                                     _cw_unregister(self, func.__name__, _tracked_refs)
 
-                            for _attr in ('_futures', ):
+                            for _attr in ('_futures', 'ready'):
                                 if hasattr(_orig_result_func, _attr):
                                     setattr(_notifying_result_func, _attr, getattr(_orig_result_func, _attr))
                             return _notifying_result_func
@@ -1195,6 +1272,9 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                 _tag_exc(_e, _caller)
                 notify_exception(_notifier, _ctx, _e, _name)
                 raise
+            finally:
+                if _worker_reservation is not None:
+                    self._end_worker_call(_worker_reservation)
 
         wrapper._execute = execute
         wrapper._collect = collect
@@ -1202,6 +1282,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
         wrapper._lazy_collect = _lazy_collect
         wrapper._sync = sync
         wrapper._enable_continous_work = enable_continous_work
+        wrapper._worker_selector = worker_selector
         if enable_continous_work:
             # Attached to the class by remote_class, and called instead of this
             # method when the driver routes requests worker by worker.

@@ -1,6 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 # Adapted from https://github.com/volcengine/verl/blob/main/verl/checkpoint_engine/base.py
+import threading
 from typing import List, Literal, Optional
+
+from twinkle.infra import get_worker_id
 
 from twinkle import Platform, get_logger
 from .base import CheckpointEngine
@@ -72,17 +75,41 @@ class CheckpointEngineManager:
         sampler: 'CheckpointEngineMixin',
         platform: str = 'GPU',
         mode: CheckpointEngineMode = 'auto',
+        channel: str = 'default',
+        colocate_trainer_ranks: Optional[List[int]] = None,
+        receiver_worker_ids: Optional[List[str]] = None,
     ) -> None:
         self.model = model
         self.sampler = sampler
         self.requested_mode = mode
         self.mode = self._resolve_mode(mode, model, sampler)
         self.backend_cls = self.decide_backend_engine(platform, self.mode)
+        self._sync_lock = threading.RLock()
+        self.receiver_worker_ids = self._validate_receiver_ids(receiver_worker_ids)
+        self._receiver_snapshot = self.receiver_worker_ids
+        self._channel_closed = False
+        if not isinstance(channel, str) or not channel:
+            raise ValueError(f'checkpoint channel must be a non-empty string, got {channel!r}.')
+        self.channel = channel
+        if colocate_trainer_ranks is not None:
+            if self.mode != 'colocate':
+                raise ValueError('colocate_trainer_ranks is valid only for mode="colocate".')
+            colocate_trainer_ranks = self._validate_colocate_ranks(colocate_trainer_ranks, self.receiver_worker_ids)
+        self.colocate_trainer_ranks = (None if colocate_trainer_ranks is None
+                                       else tuple(colocate_trainer_ranks))
+        self.backend = None if self.mode == 'naive' else ('ipc' if self.mode == 'colocate' else
+                                                           'nccl' if Platform.get_platform(platform).__name__ == 'GPU'
+                                                           else 'hccl')
 
-        if self.mode == 'colocate':
-            # Each side builds its own engine inside its worker, so both have to be told which one.
-            self.model.set_checkpoint_engine_backend('ipc')
-            self.sampler.set_checkpoint_engine_backend('ipc')
+        if self.mode != 'naive':
+            try:
+                self._activate_checkpoint_channel()
+            except BaseException:
+                try:
+                    self.close()
+                except Exception:
+                    logger.warning('初始化失败后未能完整关闭 checkpoint channel %s。', channel, exc_info=True)
+                raise
 
         # LoRA sync state: tracks whether the first full sync has been done.
         # After the first sync, only LoRA adapter weights are transferred.
@@ -140,7 +167,80 @@ class CheckpointEngineManager:
         else:
             raise NotImplementedError
 
+    def _validate_receiver_ids(self, worker_ids):
+        if worker_ids is None:
+            return None
+        if self.mode == 'naive':
+            raise ValueError('receiver_worker_ids requires Ray checkpoint receivers.')
+        worker_ids = tuple(worker_ids)
+        if any(not isinstance(worker_id, str) for worker_id in worker_ids):
+            raise ValueError('receiver_worker_ids must contain stable actor ID strings.')
+        known = {get_worker_id(actor) for actor in self.sampler._actors}
+        if len(set(worker_ids)) != len(worker_ids) or set(worker_ids) - known:
+            raise ValueError(f'receiver_worker_ids contains duplicate or unknown actor IDs: {worker_ids!r}.')
+        return worker_ids
+
+    def _validate_colocate_ranks(self, ranks, worker_ids):
+        ranks = tuple(ranks)
+        count = self.sampler.device_mesh.data_world_size if worker_ids is None else len(worker_ids)
+        if any(type(rank) is not int or not 0 <= rank < self.model.device_mesh.world_size for rank in ranks):
+            raise ValueError('Each IPC receiver requires a physical trainer sender rank within the trainer world.')
+        if len(ranks) != count or len(set(ranks)) != len(ranks):
+            raise ValueError('Each IPC receiver requires one unique physical trainer sender rank.')
+        return ranks
+
+    def set_receiver_workers(self, worker_ids, *, colocate_trainer_ranks=None):
+        """登记下一次同步的接收成员；通信变更只在 sync_weights 内应用。"""
+        with self._sync_lock:
+            worker_ids = self._validate_receiver_ids(worker_ids)
+            if colocate_trainer_ranks is not None:
+                if self.mode != 'colocate':
+                    raise ValueError('colocate_trainer_ranks requires mode="colocate".')
+                self.colocate_trainer_ranks = self._validate_colocate_ranks(colocate_trainer_ranks, worker_ids)
+            self.receiver_worker_ids = worker_ids
+
+    def _sampler_call(self, method, *args, **kwargs):
+        if self._receiver_snapshot is not None:
+            kwargs['_worker_ids'] = self._receiver_snapshot
+        return getattr(self.sampler, method)(*args, **kwargs)
+
+    def _activate_checkpoint_channel(self) -> None:
+        if self._channel_closed:
+            self._receiver_snapshot = self.receiver_worker_ids
+        self._channel_closed = False
+        self.model.activate_checkpoint_engine(self.backend, self.channel)
+        self._sampler_call('activate_checkpoint_engine', self.backend, self.channel)
+
+    def _close_checkpoint_channel(self):
+        if self.mode != 'naive':
+            try:
+                self.model.reset_checkpoint_engine(self.channel, self.backend)
+            finally:
+                self._sampler_call('reset_checkpoint_engine', self.channel, self.backend)
+
+    def close(self) -> None:
+        """只清理最后一次同步使用的接收快照及本 channel。"""
+        with self._sync_lock:
+            if self._channel_closed:
+                return
+            try:
+                self._close_checkpoint_channel()
+            finally:
+                self._receiver_snapshot = ()
+                self._channel_closed = True
+                self.base_sync_done = False
+
     def sync_weights(self, merge_and_sync=True):
+        with self._sync_lock:
+            if self._channel_closed or self.receiver_worker_ids != self._receiver_snapshot:
+                self.close()
+                self._receiver_snapshot = self.receiver_worker_ids
+                self.base_sync_done = False
+            if self._receiver_snapshot == ():
+                return
+            self._sync_weights(merge_and_sync)
+
+    def _sync_weights(self, merge_and_sync=True):
         """
         Synchronize the weights between the model and the sampler.
 
@@ -164,19 +264,27 @@ class CheckpointEngineManager:
             self._sync_weights_naive(merge_and_sync)
             return
 
+        self._activate_checkpoint_channel()
         model_metadata = self.model.prepare_checkpoint_engine([True]
                                                               + [False] * (self.model.device_mesh.world_size - 1))
-        self.sampler.prepare_checkpoint_engine(False)
+        self._sampler_call('prepare_checkpoint_engine', False)
+        model_world_size = self.model.device_mesh.world_size
+        sampler_world_size = (self.sampler.device_mesh.data_world_size if self._receiver_snapshot is None
+                              else len(self._receiver_snapshot))
+        topology_kwargs = {}
+        if self.colocate_trainer_ranks is not None:
+            topology_kwargs['sender_ranks'] = self.colocate_trainer_ranks
         model_kwargs, sampler_kwargs = self.backend_cls.build_topology(
-            self.model.device_mesh.world_size,
-            self.sampler.device_mesh.data_world_size,
+            model_world_size,
+            sampler_world_size,
             [model_metadata],
+            **topology_kwargs,
         )
         # Launch both init calls concurrently — TCPStore server (model rank 0)
         # blocks until all clients (sampler ranks) connect, so these MUST NOT
         # be serialised.  lazy_collect=True makes them return futures.
         model_init = self.model.init_checkpoint_process_group(**model_kwargs)
-        sampler_init = self.sampler.init_checkpoint_process_group(**sampler_kwargs)
+        sampler_init = self._sampler_call('init_checkpoint_process_group', **sampler_kwargs)
         model_init()  # wait for model init to complete
         sampler_init()  # wait for sampler init to complete
 
@@ -190,12 +298,13 @@ class CheckpointEngineManager:
 
         model_result = self.model.send_weights(
             base_sync_done=self.base_sync_done, merge_and_sync=merge_and_sync, model_keys=self._model_keys)
-        sampler_result = self.sampler.receive_weights(base_sync_done=self.base_sync_done, peft_config=peft_config)
+        sampler_result = self._sampler_call('receive_weights', base_sync_done=self.base_sync_done,
+                                           peft_config=peft_config)
         model_result()
         sampler_result()
 
         self.model.finalize_checkpoint_engine()
-        self.sampler.finalize_checkpoint_engine()
+        self._sampler_call('finalize_checkpoint_engine')
 
         if not self.base_sync_done:
             self.base_sync_done = True
@@ -207,7 +316,7 @@ class CheckpointEngineManager:
             return
 
         if hasattr(self.sampler, 'get_state_keys'):
-            self._model_keys = self.sampler.get_state_keys()
+            self._model_keys = self._sampler_call('get_state_keys')
 
         if self._model_keys is None:
             self._model_keys = []
@@ -283,6 +392,7 @@ class CheckpointEngineManager:
             self._sync_ema_naive(alpha)
             return
 
+        self._activate_checkpoint_channel()
         world_size = self.model.device_mesh.world_size
         ref_world_size = self.sampler.device_mesh.world_size
         if world_size != ref_world_size:

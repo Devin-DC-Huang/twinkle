@@ -176,6 +176,14 @@ class HCCLCheckpointEngine(CheckpointEngine):
             self._prepared = False
             self._group_initialized = False
 
+    def close(self):
+        """Destroy the persistent HCCL channel regardless of the reuse setting."""
+        rebuild_group, self.rebuild_group = self.rebuild_group, True
+        try:
+            self.finalize()
+        finally:
+            self.rebuild_group = rebuild_group
+
     @classmethod
     def build_topology(
         cls,

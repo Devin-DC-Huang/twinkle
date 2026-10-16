@@ -137,6 +137,7 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, P
         """Create the engine on the background loop, which sglang then binds its handle loop to."""
         return engine_cls(model_id=model_id, **engine_kwargs)
 
+    @remote_function(dispatch='all', collect='first', lazy_collect=False)
     def apply_patch(self, patch_cls: Union[Patch, Type[Patch], str], **kwargs) -> None:
         apply_patch(self, patch_cls, **kwargs)
 
@@ -242,7 +243,8 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, P
             prompt_logprobs=response.prompt_logprobs,
             topk_prompt_logprobs=response.topk_prompt_logprobs)
 
-    @remote_function(dispatch='slice_dp', collect='flatten', lazy_collect=False, enable_continous_work=True)
+    @remote_function(dispatch='slice_dp', collect='flatten', lazy_collect=False, enable_continous_work=True,
+                     worker_selector='_sampling_worker_ids')
     @timed
     def sample(
         self,
@@ -394,9 +396,9 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, P
             )
             return outcome.response
 
-        return await asyncio.gather(*(
+        return await self._gather_generation_tasks(
             _generate_one(feat, image_data, lora_name)
-            for feat, image_data, lora_name in zip(encoded_inputs, image_data_list, lora_names)))
+            for feat, image_data, lora_name in zip(encoded_inputs, image_data_list, lora_names))
 
     async def _encode_single(
         self,
@@ -414,7 +416,8 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, P
             lora_name=lora_name,
         )
 
-    @remote_function(dispatch='slice_dp', collect='flatten', lazy_collect=False)
+    @remote_function(dispatch='slice_dp', collect='flatten', lazy_collect=False,
+                     worker_selector='_sampling_worker_ids')
     @timed
     def encode(
         self,
@@ -459,6 +462,8 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, P
                                  f'{len(inputs_list)} inputs; they must correspond one-to-one so that DP '
                                  'slicing keeps them aligned.')
 
+        if not inputs_list:
+            return []
         is_trajectory = 'input_ids' not in inputs_list[0]
         image_data_list = [self._extract_image_data(feat) for feat in inputs_list]
 

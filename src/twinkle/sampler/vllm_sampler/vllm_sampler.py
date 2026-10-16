@@ -224,6 +224,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, Par
                 encoded[key] = encoded[key].tolist()
         return encoded
 
+    @remote_function(dispatch='all', collect='first', lazy_collect=False)
     def apply_patch(self, patch_cls: Union[Patch, Type[Patch], str], **kwargs) -> None:
         apply_patch(self, patch_cls, **kwargs)
 
@@ -341,7 +342,8 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, Par
             prompt_logprobs=response.prompt_logprobs,
             topk_prompt_logprobs=response.topk_prompt_logprobs)
 
-    @remote_function(dispatch='slice_dp', collect='flatten', lazy_collect=False, enable_continous_work=True)
+    @remote_function(dispatch='slice_dp', collect='flatten', lazy_collect=False, enable_continous_work=True,
+                     worker_selector='_sampling_worker_ids')
     @timed
     def sample(
         self,
@@ -505,9 +507,9 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, Par
             )
             return outcome.response
 
-        return await asyncio.gather(*(
+        return await self._gather_generation_tasks(
             _generate_one(feat, multi_modal_data, lora_request) for feat, multi_modal_data, lora_request in
-            zip(encoded_inputs, multi_modal_data_list, lora_requests)))
+            zip(encoded_inputs, multi_modal_data_list, lora_requests))
 
     async def _encode_single(
         self,
@@ -526,7 +528,8 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, Par
             mm_processor_kwargs=feat.get('mm_processor_kwargs'),
         )
 
-    @remote_function(dispatch='slice_dp', collect='flatten', lazy_collect=False)
+    @remote_function(dispatch='slice_dp', collect='flatten', lazy_collect=False,
+                     worker_selector='_sampling_worker_ids')
     @timed
     def encode(
         self,
@@ -571,6 +574,8 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, Par
                                  f'{len(inputs_list)} inputs; they must correspond one-to-one so that DP '
                                  'slicing keeps them aligned.')
 
+        if not inputs_list:
+            return []
         is_trajectory = 'input_ids' not in inputs_list[0]
         multi_modal_data_list = [self._extract_multi_modal_data(feat) for feat in inputs_list]
 

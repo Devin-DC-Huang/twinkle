@@ -240,6 +240,14 @@ class NCCLCheckpointEngine(CheckpointEngine):
 
         # When rebuild_group=False: keep everything alive for next sync
 
+    def close(self):
+        """Destroy the persistent NCCL channel regardless of the reuse setting."""
+        rebuild_group, self.rebuild_group = self.rebuild_group, True
+        try:
+            self.finalize()
+        finally:
+            self.rebuild_group = rebuild_group
+
     @classmethod
     def build_topology(
         cls,
