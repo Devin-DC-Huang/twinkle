@@ -7,6 +7,7 @@ both Tinker (/tinker/asample) and Twinkle (/twinkle/*) sampler endpoints.
 """
 from __future__ import annotations
 
+import asyncio
 from fastapi import FastAPI, Request
 from ray import serve
 from typing import Any
@@ -14,11 +15,12 @@ from typing import Any
 from twinkle import DeviceGroup
 from twinkle.server.deployment import LazyCleanupMixin, bind_deployment, build_deployment_app, init_twinkle_runtime
 from twinkle.server.state import ServerState, get_server_state
-from twinkle.server.utils import wrap_builder_with_device_group_env
+from twinkle.server.utils import get_template_for_model, wrap_builder_with_device_group_env
 from twinkle.server.utils.backend_dispatch import BackendSelector
 from twinkle.server.utils.task_queue import TaskQueueConfig, TaskQueueMixin
 from twinkle.server.utils.validation import get_token_from_request
 from twinkle.utils.logger import get_logger
+from .concurrency import SamplerConcurrency
 from .tinker_handlers import _register_tinker_sampler_routes
 from .twinkle_handlers import _register_twinkle_sampler_routes
 
@@ -64,15 +66,15 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
     - Template configuration for trajectory encoding
     """
 
-    def __init__(self,
-                 model_id: str,
-                 nproc_per_node: int,
-                 device_group: dict[str, Any],
-                 device_mesh: dict[str, Any],
-                 sampler_type: str,
-                 engine_args: dict[str, Any] | None = None,
-                 queue_config: TaskQueueConfig | None = None,
-                 **kwargs):
+    async def __init__(self,
+                       model_id: str,
+                       nproc_per_node: int,
+                       device_group: dict[str, Any],
+                       device_mesh: dict[str, Any],
+                       sampler_type: str,
+                       engine_args: dict[str, Any] | None = None,
+                       queue_config: TaskQueueConfig | None = None,
+                       **kwargs):
         self.device_group = DeviceGroup(**device_group)
         self.device_mesh = init_twinkle_runtime(
             is_mock=(sampler_type == 'mock'),
@@ -107,6 +109,36 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
 
         # Initialize task queue mixin
         self._init_task_queue(queue_config, deployment_name='Sampler')
+        self.sampling_guard = SamplerConcurrency()
+        self._stream_jobs: set[asyncio.Task] = set()
+        # Initialise once, not on every Tinker request. Repeated template/cache
+        # mutations would otherwise serialize generations again.
+        if sampler_type != 'mock':
+            await self.call_backend(self.sampler.set_template, get_template_for_model(model_id), model_id=model_id)
+
+    async def call_backend(self, fn, /, *args, **kwargs):
+        """Never run blocking Ray result collection on Serve's event loop."""
+        return await asyncio.to_thread(fn, *args, **kwargs)
+
+    async def run_sample(self, factory, *, exclusive=False):
+        return await self.sampling_guard.run(factory, exclusive=exclusive or self.sampler_type == 'torch')
+
+    async def load_sample_weights(self, path):
+        try:
+            await self.call_backend(self.sampler.load_full_weights_from_path, path)
+        except Exception as error:
+            # A failed full-model swap may have modified some tensors already.
+            self.sampling_guard.invalidate_weights(error)
+            raise
+
+    async def shutdown(self):
+        self.sampling_guard.close()
+        await self.shutdown_task_queue()
+        await asyncio.gather(*self._stream_jobs, return_exceptions=True)
+        await self.sampling_guard.wait_closed()
+
+    async def check_health(self):
+        self.sampling_guard.check_available()
 
     @serve.multiplexed(max_num_models_per_replica=5)
     async def _sticky_entry(self, sticky_key: str):
@@ -117,6 +149,7 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
         await self._sticky_entry(sticky_key)
 
     async def _on_request_start(self, request: Request) -> str:
+        self.sampling_guard.check_available()
         await self._ensure_sticky()
         await self._ensure_state_cleanup_started()
         token = get_token_from_request(request)
@@ -172,6 +205,7 @@ def build_sampler_app(model_id: str,
             'version': '1.0.0',
         },
         attach_replica_id_header=True,
+        on_shutdown=lambda servable: servable.shutdown(),
     )
 
     return bind_deployment(

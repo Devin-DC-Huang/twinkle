@@ -86,6 +86,8 @@ applications:
         rps_limit: 20                               # Max requests per second
         tps_limit: 131072                            # Max tokens per second
         max_input_tokens: 32768
+        concurrent_task_limit: 32                   # Admit at most 32 live sampler jobs; excess gets 429
+        execution_timeout: 120                     # Bounds client waiting, not CUDA cancellation
     deployments:
       - name: SamplerManagement
         autoscaling_config:

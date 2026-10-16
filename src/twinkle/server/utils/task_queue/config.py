@@ -21,6 +21,7 @@ class TaskQueueConfig(BaseModel):
         window_seconds: Sliding window for rate-limit calculations. Must be > 0.
         queue_timeout: Maximum time a task can wait in queue (seconds).
         execution_timeout: Maximum time a task can execute (seconds). 0 means no limit.
+        concurrent_task_limit: Maximum live sampler tasks, including timed-out work still running.
         enabled: Whether rate limiting is enabled.
         token_cleanup_multiplier: Multiplier for token cleanup threshold.
         token_cleanup_interval: How often to run cleanup task (seconds).
@@ -34,6 +35,7 @@ class TaskQueueConfig(BaseModel):
     window_seconds: float = Field(default=1.0, gt=0)
     queue_timeout: float = Field(default=300.0, ge=0)
     execution_timeout: float = Field(default=120.0, ge=0)
+    concurrent_task_limit: int = Field(default=32, ge=1)
     enabled: bool = True
     token_cleanup_multiplier: float = Field(default=10.0, ge=0)
     token_cleanup_interval: float = Field(default=60.0, ge=0)

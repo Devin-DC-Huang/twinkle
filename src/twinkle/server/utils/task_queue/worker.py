@@ -12,6 +12,8 @@ import asyncio
 import time
 import traceback
 from collections import deque
+from dataclasses import replace
+from fastapi import HTTPException
 from typing import TYPE_CHECKING, Any, Deque
 
 from twinkle.server.telemetry.correlation import MODEL_ID, TOKEN_ID
@@ -59,6 +61,9 @@ class ComputeWorker:
         self._worker_task: asyncio.Task | None = None
         self._started = False
         self._start_lock = asyncio.Lock()
+        self._stopping = False
+        self._detached_tasks: dict[asyncio.Task, QueuedTask] = {}
+        self._detached_reserved = 0
 
     async def ensure_started(self) -> None:
         """Ensure the background worker coroutine is running."""
@@ -72,16 +77,71 @@ class ComputeWorker:
 
     async def stop(self) -> None:
         """Cancel the worker and wait for it to exit cleanly."""
+        self._stopping = True
         if self._worker_task and not self._worker_task.done():
             self._worker_task.cancel()
             try:
                 await self._worker_task
             except asyncio.CancelledError:
                 pass
+        detached = list(self._detached_tasks)
+        for task in detached:
+            task.cancel()
+        await asyncio.gather(*detached, return_exceptions=True)
         self._worker_task = None
         self._started = False
         self.task_queues.clear()
         self.queue_order.clear()
+
+    async def submit_detached(self, task: QueuedTask, queue_key: str) -> None:
+        """Backport #303 admission without changing the legacy future protocol."""
+        if self._stopping or self._detached_reserved >= self._config.concurrent_task_limit:
+            raise HTTPException(
+                status_code=429, detail='Sampling capacity is full. Retry later.', headers={'Retry-After': '1'})
+        self._detached_reserved += 1
+        try:
+            await self._state.store_future_status(
+                task.request_id, TaskStatus.PENDING.value, task.model_id, queue_state=QueueState.ACTIVE.value)
+        except BaseException:
+            self._detached_reserved -= 1
+            raise
+
+        execution = None
+
+        def start():
+            nonlocal execution
+            execution = asyncio.create_task(task.coro_factory())
+            return asyncio.shield(execution)
+
+        async def run():
+            try:
+                await self._execute_task(replace(task, coro_factory=start), queue_key, None)
+            finally:
+                # Timing out the client does not stop a Ray/CUDA operation. Keep
+                # its capacity reserved until its owned sampling job really exits.
+                if execution is not None:
+                    if not execution.done():
+                        execution.cancel()
+                    while not execution.done():
+                        try:
+                            await asyncio.shield(execution)
+                        except asyncio.CancelledError:
+                            continue
+                        except Exception:
+                            break
+                    if not execution.cancelled():
+                        execution.exception()
+
+        running = asyncio.create_task(run())
+        self._detached_tasks[running] = task
+
+        def done(completed):
+            self._detached_tasks.pop(completed, None)
+            self._detached_reserved -= 1
+            if not completed.cancelled() and completed.exception() is not None:
+                logger.error('Concurrent sampling task %s failed: %s', task.request_id, completed.exception())
+
+        running.add_done_callback(done)
 
     def ensure_queue_registered(self, queue_key: str) -> None:
         """Register a new per-key queue if it does not yet exist."""
@@ -185,7 +245,7 @@ class ComputeWorker:
         self._record_tasks_total(task.task_type or 'unknown', 'timeout')
         q.task_done()
 
-    async def _execute_task(self, task: QueuedTask, queue_key: str, q: asyncio.Queue) -> None:
+    async def _execute_task(self, task: QueuedTask, queue_key: str, q: asyncio.Queue | None) -> None:
         """Execute a single task: update status, run coroutine, record metrics.
 
         Handles execution timeout, general exceptions, and always calls
@@ -227,6 +287,12 @@ class ComputeWorker:
                 task.model_id,
                 result=result,
                 queue_state=QueueState.ACTIVE.value)
+        except asyncio.CancelledError:
+            task_status = 'cancelled'
+            exec_time = time.monotonic() - exec_start
+            if q is None:
+                await self._store_task_failed(task, 'Sampling task stopped during shutdown.', QueueState.ACTIVE.value)
+            raise
         except asyncio.TimeoutError:
             task_status = 'timeout'
             exec_time = time.monotonic() - exec_start
@@ -243,7 +309,8 @@ class ComputeWorker:
                          f'type={task_type}:\n{traceback.format_exc(limit=3)}')
             await self._store_task_failed(task, error, QueueState.ACTIVE.value)
         finally:
-            q.task_done()
+            if q is not None:
+                q.task_done()
             self._record_execution_time(task_type, exec_time)
             self._record_tasks_total(task_type, task_status)
 

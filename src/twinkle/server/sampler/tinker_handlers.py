@@ -18,7 +18,6 @@ if TYPE_CHECKING:
 
 from twinkle.data_format import SamplingParams
 from twinkle.server.checkpoint import create_checkpoint_manager
-from twinkle.server.utils import get_template_for_model
 from twinkle.utils.logger import get_logger
 
 logger = get_logger()
@@ -50,12 +49,6 @@ def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerM
                 # Extract prompt token IDs from ModelInput
                 prompt_inputs = {'input_ids': body.prompt.to_ints()}
 
-                # Set template for sampler based on model type
-                template = get_template_for_model(self.model_id)
-                self.sampler.set_template(template, model_id=self.model_id)
-                # Reset prefix cache for new weights
-                self.sampler.reset_prefix_cache()
-
                 # Get model_path from body or sampling session
                 model_path = body.model_path
                 if not model_path and body.sampling_session_id:
@@ -80,11 +73,14 @@ def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerM
                 sampling_params = None
                 if body.sampling_params:
                     sampling_params = SamplingParams(
-                        max_tokens=body.sampling_params.max_tokens or 256,
-                        temperature=body.sampling_params.temperature or 1.0,
+                        max_tokens=body.sampling_params.max_tokens
+                        if body.sampling_params.max_tokens is not None else 256,
+                        temperature=body.sampling_params.temperature
+                        if body.sampling_params.temperature is not None else 1.0,
                         top_p=body.sampling_params.top_p,
                         top_k=body.sampling_params.top_k,
                         stop=body.sampling_params.stop,
+                        logprobs=1,
                     )
 
                 # A resolved checkpoint is either a LoRA adapter dir (has
@@ -95,14 +91,22 @@ def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerM
                 if adapter_uri:
                     if os.path.exists(os.path.join(adapter_uri, 'adapter_config.json')):
                         lora_path = adapter_uri
-                    else:
-                        self.sampler.load_full_weights_from_path(adapter_uri)
+                full_checkpoint = bool(adapter_uri and lora_path is None)
 
-                responses = self.sampler.sample(
-                    inputs=[prompt_inputs] * body.num_samples,
-                    sampling_params=sampling_params,
-                    adapter_path=lora_path,
-                )
+                async def generate():
+                    if full_checkpoint:
+                        await self.load_sample_weights(adapter_uri)
+                    return await self.call_backend(
+                        self.sampler.sample,
+                        inputs=[prompt_inputs] * body.num_samples,
+                        sampling_params=sampling_params,
+                        adapter_path=lora_path,
+                        **({
+                            'token_only': True
+                        } if self.sampler_type == 'vllm' else {}),
+                    )
+
+                responses = await self.run_sample(generate, exclusive=full_checkpoint)
 
                 tinker_sequences = []
                 for response in responses:
@@ -137,7 +141,7 @@ def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerM
                 )
 
         input_tokens = len(body.prompt.to_ints())
-        return await self.schedule_task(
+        return await self.schedule_concurrent_task(
             _do_sample,
             token=token,
             input_tokens=input_tokens,

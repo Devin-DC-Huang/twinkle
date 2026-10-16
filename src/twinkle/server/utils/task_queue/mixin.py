@@ -288,6 +288,50 @@ class TaskQueueMixin:
 
         return record['result']
 
+    async def schedule_concurrent_task(
+        self,
+        coro_factory: Callable[[], Coroutine],
+        *,
+        token: str | None = None,
+        input_tokens: int = 0,
+        task_type: str = 'sample',
+    ) -> dict[str, Any]:
+        """Backport #303's bounded sampler path; training stays serial."""
+        request_id = f'req_{uuid.uuid4().hex}'
+        rejected = await self._perform_preflight_checks(request_id, None, token, input_tokens)
+        if rejected is not None:
+            return rejected
+        await self._compute_worker.submit_detached(
+            QueuedTask(
+                request_id=request_id,
+                coro_factory=coro_factory,
+                model_id=None,
+                token=token,
+                input_tokens=input_tokens,
+                task_type=task_type,
+                created_at=time.monotonic()), self._queue_key(model_id=None, token=token))
+        logger.info('[TaskQueue] Task %s started concurrently, type=%s, input_tokens=%s', request_id, task_type,
+                    input_tokens)
+        return {'request_id': request_id, 'model_id': None}
+
+    async def schedule_concurrent_task_and_wait(self, coro_factory, **kwargs):
+        """Keep the old Twinkle synchronous result while Tinker uses futures."""
+        from fastapi import HTTPException
+
+        ref = await self.schedule_concurrent_task(coro_factory, **kwargs)
+        while True:
+            record = await self.state.get_future(ref['request_id'])
+            if record and record.get('status') in ('completed', 'failed'):
+                break
+            await asyncio.sleep(0.05)
+        if record['status'] == 'failed':
+            error = record.get('result', {}).get('error', 'Sampling failed')
+            status_code = 504 if error.startswith('Execution timeout exceeded:') else 500
+            if record.get('queue_state') == QueueState.PAUSED_RATE_LIMIT.value:
+                status_code = 429
+            raise HTTPException(status_code=status_code, detail=error)
+        return record['result']
+
     async def schedule_background_task(
         self,
         coro_factory: Callable[[], Coroutine],

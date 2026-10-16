@@ -13,6 +13,7 @@ StopReason = Literal['length', 'stop', 'abort', 'error']
 class SampleRequest(BaseModel):
     """Request body for the /sample endpoint."""
     inputs: Any = Field(..., description='List of Trajectory or InputFeature dicts')
+    num_samples: int = Field(default=1, ge=1)
     sampling_params: Optional[Dict[str, Any]] = Field(
         None, description='Sampling parameters (max_tokens, temperature, num_samples, etc.)')
     adapter_name: str = Field('', description='Adapter name for LoRA inference')

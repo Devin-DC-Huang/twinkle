@@ -45,11 +45,18 @@ class _DummyManagement:
         self.model_id = 'mock-model'
         self.state = _DummyState()
         self.sampler = _DummySampler()
+        self.sampler_type = 'mock'
 
     async def _on_request_start(self, request):
         return 'EMPTY_TOKEN'
 
-    async def schedule_task(self, task, **kwargs):
+    async def schedule_concurrent_task(self, task, **kwargs):
+        return await task()
+
+    async def call_backend(self, fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    async def run_sample(self, task, **kwargs):
         return await task()
 
 

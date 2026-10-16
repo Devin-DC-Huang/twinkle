@@ -36,7 +36,10 @@ def _convert_ndarray_to_list(obj: Any) -> Any:
     return obj
 
 
-@remote_class()
+SAMPLER_MAX_CONCURRENCY = max(1, int(os.environ.get('TWINKLE_SAMPLER_MAX_CONCURRENCY') or 24))
+
+
+@remote_class(max_concurrency=SAMPLER_MAX_CONCURRENCY)
 class vLLMSampler(Sampler, CheckpointEngineMixin):
     """A vLLM-based sampler using VLLMEngine (AsyncLLM).
 
@@ -229,10 +232,12 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         multi_modal_data: Optional[Dict[str, Any]] = None,
         logprobs_only: bool = False,
         disable_lora: bool = False,
+        token_only: bool = False,
     ) -> SampleResponse:
         """Sample a single input asynchronously."""
         response = await self.engine.sample(
-            prompt=self.template.get_vllm_input_ids(feat['input_ids']) if self.template else feat['input_ids'],
+            prompt=self.template.get_vllm_input_ids(feat['input_ids'])
+            if self.template and not token_only else feat['input_ids'],
             sampling_params=sampling_params,
             lora_request=lora_request,
             multi_modal_data=multi_modal_data,
@@ -248,9 +253,25 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
             else:
                 feat['input_ids'] = response.prompt_token_ids
                 feat['labels'] = [-100] * len(response.prompt_token_ids)
+        # A sampling prompt (e.g. a tinker ModelInput) carries input_ids but no labels;
+        # concat_input_feature would then derive a zero-length prefix completion_mask
+        # and raise. The prompt is pure context, so materialise aligned all-context
+        # labels when they are missing or length-mismatched. Present, aligned labels are
+        # left untouched (preserving provenance), and the logprobs-only path -- which
+        # never concatenates -- is not touched.
+        if not token_only and not logprobs_only and 'input_ids' in feat and len(feat.get('labels') or []) != len(
+                feat['input_ids']):
+            feat['labels'] = [-100] * len(feat['input_ids'])
         sequences = []
         for seq in response.sequences:
-            if logprobs_only:
+            if token_only:
+                sampled_seq = SampledSequence(
+                    stop_reason=seq.stop_reason,
+                    tokens=[] if logprobs_only else seq.tokens,
+                    logprobs=None if logprobs_only else seq.logprobs,
+                    sampling_mask=seq.sampling_mask,
+                )
+            elif logprobs_only:
                 new_input_feature = _convert_ndarray_to_list(feat)
                 if seq.routed_experts is not None:
                     new_input_feature['routed_experts'] = _convert_ndarray_to_list(seq.routed_experts)
@@ -278,7 +299,23 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
             prompt_logprobs=response.prompt_logprobs,
             topk_prompt_logprobs=response.topk_prompt_logprobs)
 
-    @remote_function(dispatch='slice_dp', collect='flatten', lazy_collect=False)
+    @staticmethod
+    async def _gather_samples(samples) -> List[SampleResponse]:
+        """Finish every prompt before exposing the batch's result or failure."""
+        tasks = [asyncio.create_task(sample) for sample in samples]
+        batch = asyncio.gather(*tasks)
+        try:
+            return await asyncio.shield(batch)
+        except BaseException:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            if not batch.cancelled():
+                batch.exception()
+            raise
+
+    @remote_function(dispatch='slice_dp', collect='flatten', lazy_collect=False, enable_continous_work=True)
     def sample(
         self,
         inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
@@ -288,6 +325,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         *,
         return_encoded: bool = False,
         use_base_model: bool = False,
+        token_only: bool = False,
     ) -> List[SampleResponse]:
         """Sample responses for given inputs.
 
@@ -301,6 +339,9 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
             adapter_name: Optional LoRA adapter name.
 
             adapter_path: Optional LoRA adapter path.
+
+            token_only: Return token IDs and logprobs without template processing
+                or training features. Inputs must already contain input_ids.
 
             num_samples: Number of completions to generate per input prompt.
                 When > 1, returns num_samples sequences for each input.
@@ -323,6 +364,8 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
 
         # Check if inputs are Trajectory (not encoded) - aligned with Model.forward logic
         is_trajectory = 'input_ids' not in inputs_list[0]
+        if token_only and is_trajectory:
+            raise ValueError('Token-only sampling requires encoded input_ids.')
         logprobs_only = False
         if sampling_params.max_tokens == 0:
             sampling_params = copy(sampling_params)
@@ -362,9 +405,10 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
                     multi_modal_data=multi_modal_data,
                     logprobs_only=logprobs_only,
                     disable_lora=use_base_model,
+                    token_only=token_only,
                 ) for feat, multi_modal_data in zip(encoded_inputs, multi_modal_data_list)
             ]
-            return await asyncio.gather(*tasks)
+            return await self._gather_samples(tasks)
 
         sample_results = self._run_in_loop(_sample_all())
         return sample_results

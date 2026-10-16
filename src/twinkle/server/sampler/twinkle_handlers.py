@@ -97,6 +97,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         async def _task():
             # Resolve adapter
             adapter_path = None
+            resolved_uri = None
             adapter_name = body.adapter_name or ''
             full_adapter_name = _get_twinkle_sampler_adapter_name(request, adapter_name) or ''
 
@@ -106,14 +107,10 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
                 from twinkle.server.checkpoint import create_checkpoint_manager
                 checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
                 _, resolved_uri = checkpoint_manager.parse_adapter_uri(body.adapter_uri)
-                # Reset prefix cache only when new weights are loaded
-                self.sampler.reset_prefix_cache()
                 # LoRA adapter dir (has adapter_config.json) vs full-parameter
                 # HF checkpoint. Full checkpoints replace the sampler base model.
                 if resolved_uri and os.path.exists(os.path.join(resolved_uri, 'adapter_config.json')):
                     adapter_path = resolved_uri
-                elif resolved_uri:
-                    self.sampler.load_full_weights_from_path(resolved_uri)
 
             # Parse inputs
             inputs = body.inputs
@@ -130,17 +127,20 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
                     inputs = [Trajectory(**inputs)]
 
             # Build sampling params
-            params = None
-            if body.sampling_params:
-                params = SamplingParams.from_dict(body.sampling_params)
+            params_dict = dict(body.sampling_params or {})
+            params_dict.setdefault('num_samples', body.num_samples)
+            params = SamplingParams.from_dict(params_dict)
 
             # Sample
-            responses = self.sampler.sample(
-                inputs,
-                params,
-                adapter_name=full_adapter_name,
-                adapter_path=adapter_path,
-            )
+            full_checkpoint = bool(resolved_uri and adapter_path is None)
+
+            async def generate():
+                if full_checkpoint:
+                    await self.load_sample_weights(resolved_uri)
+                return await self.call_backend(
+                    self.sampler.sample, inputs, params, adapter_name=full_adapter_name, adapter_path=adapter_path)
+
+            responses = await self.run_sample(generate, exclusive=full_checkpoint)
 
             sample_models = []
             for response in responses:
@@ -166,7 +166,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         inputs_list = body.inputs if isinstance(body.inputs, list) else [body.inputs]
         input_tokens = sum(len(inp.get('input_ids', [])) if isinstance(inp, dict) else 0 for inp in inputs_list)
         return await run_task(
-            self.schedule_task_and_wait(
+            self.schedule_concurrent_task_and_wait(
                 _task,
                 token=token,
                 input_tokens=input_tokens,
@@ -182,7 +182,8 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         """Set the chat template for encoding Trajectory inputs."""
         extra_kwargs = body.model_extra or {}
         with traced_operation('sampler.set_template'):
-            self.sampler.set_template(body.template_cls, **extra_kwargs)
+            await self.run_sample(
+                lambda: self.call_backend(self.sampler.set_template, body.template_cls, **extra_kwargs), exclusive=True)
         return types.SetTemplateResponse()
 
     @app.post('/twinkle/add_adapter_to_sampler', response_model=types.AddAdapterResponse)
@@ -199,7 +200,9 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         config = LoraConfig(**body.config) if isinstance(body.config, dict) else body.config
 
         with traced_operation('sampler.add_adapter_to_sampler', attrs={MODEL_ID: self.model_id}):
-            self.sampler.add_adapter_to_sampler(full_adapter_name, config)
+            await self.run_sample(
+                lambda: self.call_backend(self.sampler.add_adapter_to_sampler, full_adapter_name, config),
+                exclusive=True)
 
         return types.AddAdapterResponse(adapter_name=full_adapter_name)
 
@@ -212,7 +215,8 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         extra_kwargs = body.model_extra or {}
         patch_cls = deserialize_object(body.patch_cls)
         with traced_operation('sampler.apply_patch'):
-            self.sampler.apply_patch(patch_cls, **extra_kwargs)
+            await self.run_sample(
+                lambda: self.call_backend(self.sampler.apply_patch, patch_cls, **extra_kwargs), exclusive=True)
 
     @app.post('/twinkle/sample_stream')
     async def sample_stream(
@@ -231,6 +235,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         token = await self._on_request_start(request)
 
         adapter_path = None
+        resolved_uri = None
         adapter_name = body.adapter_name or ''
         full_adapter_name = _get_twinkle_sampler_adapter_name(request, adapter_name) or ''
 
@@ -240,11 +245,8 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             from twinkle.server.checkpoint import create_checkpoint_manager
             checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
             _, resolved_uri = checkpoint_manager.parse_adapter_uri(body.adapter_uri)
-            self.sampler.reset_prefix_cache()
             if resolved_uri and os.path.exists(os.path.join(resolved_uri, 'adapter_config.json')):
                 adapter_path = resolved_uri
-            elif resolved_uri:
-                self.sampler.load_full_weights_from_path(resolved_uri)
 
         inputs = body.inputs
         if isinstance(inputs, list):
@@ -263,30 +265,66 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         if body.sampling_params:
             params = SamplingParams.from_dict(body.sampling_params)
 
-        from ray.util.queue import Queue
+        from ray.util.queue import Empty, Queue
 
         from .backends import STREAM_SENTINEL
 
         q = Queue(maxsize=128)
         actor = self.sampler._actors[0]
-        actor.sample_stream_to_queue.remote(
-            q,
-            inputs_parsed,
-            params,
-            adapter_name=full_adapter_name,
-            adapter_path=adapter_path,
-        )
+        output = asyncio.Queue()
+        disconnected = False
+
+        async def produce():
+
+            async def stream_job():
+                if resolved_uri and adapter_path is None:
+                    await self.load_sample_weights(resolved_uri)
+                ref = actor.sample_stream_to_queue.remote(
+                    q, inputs_parsed, params, adapter_name=full_adapter_name, adapter_path=adapter_path)
+                while True:
+                    try:
+                        item = await asyncio.to_thread(q.get, timeout=0.5)
+                    except Empty:
+                        # A dead worker cannot put the stream sentinel. Surface
+                        # its failure instead of holding the write guard forever.
+                        if ref.future().done():
+                            await ref
+                            break
+                        continue
+                    if item == STREAM_SENTINEL:
+                        break
+                    if not disconnected:
+                        output.put_nowait(item)
+                # Do not release the exclusive guard while the actor is still running.
+                await ref
+
+            try:
+                # The legacy streaming worker is synchronous: keep it exclusive
+                # without blocking Serve, even if its HTTP consumer disconnects.
+                await self.run_sample(stream_job, exclusive=True)
+            except Exception as error:
+                output.put_nowait(error)
+            finally:
+                output.put_nowait(STREAM_SENTINEL)
+                q.shutdown()
+
+        producer = asyncio.create_task(produce())
+        self._stream_jobs.add(producer)
+        producer.add_done_callback(self._stream_jobs.discard)
 
         async def _stream_generator():
-            loop = asyncio.get_event_loop()
-            while True:
-                item = await loop.run_in_executor(None, q.get)
-                if item == STREAM_SENTINEL:
-                    break
-                if isinstance(item, Exception):
-                    yield json.dumps({'error': str(item)}) + '\n'
-                    break
-                delta, reason = item
-                yield json.dumps({'delta': delta, 'finish_reason': reason}) + '\n'
+            nonlocal disconnected
+            try:
+                while True:
+                    item = await output.get()
+                    if item == STREAM_SENTINEL:
+                        break
+                    if isinstance(item, Exception):
+                        yield json.dumps({'error': str(item)}) + '\n'
+                        break
+                    delta, reason = item
+                    yield json.dumps({'delta': delta, 'finish_reason': reason}) + '\n'
+            finally:
+                disconnected = True
 
         return StreamingResponse(_stream_generator(), media_type='application/x-ndjson')
