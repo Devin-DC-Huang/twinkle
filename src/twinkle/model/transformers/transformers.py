@@ -1904,6 +1904,59 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
     # equivalence.
     @remote_function(collect='first', lazy_collect=False)
     @timed
+    def save_initial_adapter(self, initial_dir: str, adapter_name: Optional[str] = None) -> bool:
+        """Save the adapter's *initial* (pre-training) weights as a plain-LoRA checkpoint.
+
+        An init strategy that rewrites the base weight at injection (peft: pissa / olora / corda ...)
+        leaves the trained adapter only mergeable into the residual base the run produced; this
+        snapshot, taken before any training step, is what the post-training conversion folds against
+        (see ``save_converted_adapter``). False when there is nothing worth snapshotting.
+        """
+        model = self.strategy.unwrap_model(self.model)
+        if not isinstance(model, PeftModel):
+            return False
+        adapter_name = adapter_name or self._get_default_group()
+        config = model.peft_config.get(adapter_name)
+        if not isinstance(config.init_lora_weights, str):
+            return False
+        init_lora_weights = config.init_lora_weights
+        config.init_lora_weights = True
+        try:
+            os.makedirs(initial_dir, exist_ok=True)
+            model.save_pretrained(initial_dir)
+        finally:
+            config.init_lora_weights = init_lora_weights
+        return True
+
+    @remote_function(collect='first', lazy_collect=False)
+    @timed
+    def save_converted_adapter(self, converted_dir: str, initial_model_dir: str,
+                               adapter_name: Optional[str] = None) -> None:
+        """Save a *converted* copy of the adapter: its delta re-expressed against the ORIGINAL base.
+
+        peft's ``path_initial_model_for_weight_conversion`` folds the init factor back out using the
+        initial snapshot, producing a plain LoRA that merges into any copy of the original base --
+        the raw adapter of a base-modifying init instead only fits the residual base it trained on.
+        """
+        model = self.strategy.unwrap_model(self.model)
+        if not isinstance(model, PeftModel):
+            raise TypeError('save_converted_adapter requires a peft-wrapped model.')
+        adapter_name = adapter_name or self._get_default_group()
+        saved_config = copy(model.peft_config[adapter_name])
+        # The conversion loads the initial snapshot through peft's inject_adapter, which freezes the
+        # active adapter as a side effect; save + restore the requires_grad flags around it.
+        requires_grad_state = {name: p.requires_grad for name, p in model.named_parameters()}
+        os.makedirs(os.path.dirname(converted_dir), exist_ok=True)
+        model.save_pretrained(
+            converted_dir, path_initial_model_for_weight_conversion=os.path.abspath(initial_model_dir))
+        # peft replaces the adapter's config entry during conversion; restore the live one.
+        model.peft_config[adapter_name] = saved_config
+        for name, p in model.named_parameters():
+            if name in requires_grad_state:
+                p.requires_grad = requires_grad_state[name]
+
+    @remote_function(collect='first', lazy_collect=False)
+    @timed
     def save(self, name: Optional[str] = None, output_dir: Optional[str] = None, interval: int = 1, **kwargs):
         """Save model.
 

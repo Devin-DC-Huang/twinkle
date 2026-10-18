@@ -1065,6 +1065,24 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
     return decorator
 
 
+def remote_map(func: Callable, args_list: List[tuple]) -> List[Any]:
+    """Fan a picklable function out over short-lived CPU tasks, returning results in input order.
+
+    Unlike remote_class/remote_function (which drive the resident training worker pool bound to
+    device groups), this serves stateless embarrassingly-parallel jobs: each tuple in ``args_list``
+    runs ``func(*tuple)`` on its own Ray CPU task. Starts a local head if no cluster is running.
+    """
+    if not args_list:
+        return []
+    import ray
+
+    if not ray.is_initialized():
+        from twinkle.server.launcher import build_ray_runtime_env
+        ray.init(runtime_env=build_ray_runtime_env(), ignore_reinit_error=True)
+    worker = ray.remote(func)
+    return ray.get([worker.remote(*args) for args in args_list])
+
+
 def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp_first'], Callable] = 'slice',
                     execute: Literal['first', 'peer', 'all'] = 'all',
                     collect: Union[Literal['none', 'flatten', 'mean', 'sum', 'first', 'last_pp'], Callable] = 'none',
