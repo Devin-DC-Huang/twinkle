@@ -117,9 +117,10 @@ class NativeFSDPStrategy:
         )
         return ep_mesh.to_torch_device_mesh()
 
-    def wrap_model(self, model, optimizer=None):
+    def wrap_model(self, model, optimizer=None, *additional_optimizers):
+        optimizers = (optimizer, *additional_optimizers)
         if self.device_mesh is None:
-            return model, optimizer
+            return (model, *optimizers)
         fsdp_mesh = _build_fsdp_mesh(self.device_mesh)
         if fsdp_mesh is None:
             # FSDP has nothing to shard with a single rank, but callers still
@@ -130,8 +131,9 @@ class NativeFSDPStrategy:
             ep_enabled = (self.enable_ep and self.ep_fsdp_device_mesh is not None)
 
             # Drop optimizer references to pre-shard params before fully_shard to reduce peak memory.
-            if optimizer is not None:
-                _unbind_optimizer_params(optimizer)
+            for optimizer in optimizers:
+                if optimizer is not None:
+                    _unbind_optimizer_params(optimizer)
 
             use_meta = self.use_rank0_pretrained_broadcast()
 
@@ -239,10 +241,8 @@ class NativeFSDPStrategy:
             if ep_enabled:
                 _rebuild_ep_param_groups(model)
 
-        if optimizer is not None:
-            optimizer = _rebind_optimizer(optimizer, model)
-
-        return model, optimizer
+        return (model, *(_rebind_optimizer(optimizer, model) if optimizer is not None else None
+                         for optimizer in optimizers))
 
     def _prepare_optimizer_state_dict_options(self, *, for_load: bool):
         from torch.distributed.checkpoint.state_dict import StateDictOptions
@@ -374,9 +374,11 @@ class NativeFSDPStrategy:
         """
         if self.device_mesh is not None:
             from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
+
+            from .weight_state import with_tied_weight_aliases
             set_model_state_dict(
                 model,
-                state_dict,
+                with_tied_weight_aliases(self.unwrap_model(model), state_dict),
                 options=StateDictOptions(full_state_dict=True, broadcast_from_rank0=True),
             )
             return
@@ -711,7 +713,7 @@ def _rebind_optimizer(optimizer: torch.optim.Optimizer, model: nn.Module) -> tor
                            'or reinitialize it before training.')
     name_to_param = dict(model.named_parameters())
     ep_patched = any(getattr(module, '_ep_patched', False) for module in model.modules())
-    if len(optimizer.param_groups) != 1:
+    if len(optimizer.param_groups) != 1 or 'param_names' in optimizer.param_groups[0]:
         for group in optimizer.param_groups:
             if 'param_names' not in group:
                 raise RuntimeError('NativeFSDPStrategy cannot rebind optimizer param_groups without param_names. '

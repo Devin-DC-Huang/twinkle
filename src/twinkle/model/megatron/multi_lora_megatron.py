@@ -298,7 +298,7 @@ class MultiLoraMegatronModel(MegatronModel):
         if optimizer_config is not None and 'iteration' in state_dict:
             optimizer_config.cur_step = state_dict['iteration']
 
-    @remote_function(dispatch='all', collect='first', sync=True)
+    @remote_function(dispatch='all', collect='first', sync=True, timeout=3600)
     def save(self, name, output_dir: Optional[str] = None, interval=1, **kwargs):
         adapter_name = kwargs.pop('adapter_name', None)
         self._check_adapter_valid(adapter_name)
@@ -373,6 +373,9 @@ class MultiLoraMegatronModel(MegatronModel):
                 adapter_name=real_adapter_name,
                 converter=self.multi_adapter.load_lora_converter)
 
+        optimizer_config = self.optimizer_group.get(adapter_name)
+        if optimizer_config is not None and optimizer_config.optimizer is not None:
+            optimizer_config.optimizer.reload_model_params()
         if load_optimizer:
             with self.optimizer_context(real_adapter_name):
                 self._load_multi_lora_optimizer(checkpoint_dir, adapter_name=adapter_name, **kwargs)
@@ -383,7 +386,7 @@ class MultiLoraMegatronModel(MegatronModel):
     # lazy_collect=False: see TransformersModel.resume_from_checkpoint -- the driver consumes the returned
     # training-state dict immediately, so the lazy callable default would break it. Keeps this multi-LoRA
     # megatron variant backend-equivalent with the others.
-    @remote_function(dispatch='all', collect='first', sync=True, lazy_collect=False)
+    @remote_function(dispatch='all', collect='first', sync=True, lazy_collect=False, timeout=3600)
     def resume_from_checkpoint(self, checkpoint_dir, *, resume_only_model=False, **kwargs):
         adapter_name = kwargs.pop('adapter_name', None)
         self._check_adapter_valid(adapter_name)
@@ -423,7 +426,7 @@ class MultiLoraMegatronModel(MegatronModel):
         self._check_adapter_valid(kwargs.get('adapter_name'))
         return self.multi_adapter.get_state_dict(**kwargs)
 
-    @remote_function(dispatch='all', sync=True)
+    @remote_function(dispatch='all', sync=True, timeout=3600)
     def add_adapter_to_model(
         self,
         adapter_name: str,

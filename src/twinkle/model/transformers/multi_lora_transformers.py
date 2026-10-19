@@ -340,8 +340,9 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
     # must block until it lands, or the run's final save is torn down with the actor before writing.
     @remote_function(collect='first', lazy_collect=False)
     def save(self, name, output_dir: Optional[str] = None, interval=1, **kwargs):
-        self._check_adapter_valid(kwargs.get('adapter_name'))
-        with self.multi_adapter.save_context(kwargs.get('adapter_name')):
+        adapter_name = kwargs.get('adapter_name')
+        self._check_adapter_valid(adapter_name)
+        with self._adapter_context(adapter_name), self.multi_adapter.save_context(adapter_name):
             checkpoint_dir = super().save(name, output_dir, interval, **kwargs)
         if dist.is_initialized():
             dist.barrier()
@@ -351,7 +352,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
     def load(self, name: str, output_dir: Optional[str] = None, **kwargs):
         adapter_name = kwargs.get('adapter_name')
         self._check_adapter_valid(adapter_name)
-        with self.multi_adapter.save_context(kwargs.get('adapter_name')):
+        with self._adapter_context(adapter_name), self.multi_adapter.save_context(adapter_name):
             load_optimizer = kwargs.get('load_optimizer', False)
             if output_dir is None:
                 if os.path.exists(name):

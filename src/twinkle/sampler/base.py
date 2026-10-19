@@ -10,7 +10,7 @@ from typing import Any, List, Optional, Type, Union
 import twinkle
 from twinkle import remote_function
 from twinkle.data_format import (InputFeature, PoolingParams, PoolingResponse, SampleResponse, SamplingParams,
-                                 Trajectory)
+                                 Trajectory, is_encoded)
 from twinkle.infra import get_worker_id
 from twinkle.patch import Patch
 from twinkle.sampler import generation
@@ -478,10 +478,11 @@ class Sampler(ABC):
     def _not_encoded(inputs: Any) -> bool:
         """Check if inputs are not yet encoded (i.e., is Trajectory, not InputFeature).
 
-        Shared with ``TransformersModel`` via :func:`twinkle.sampler.generation.not_encoded` so every
-        caller agrees on where the encode boundary is.
+        Delegates to the single shared predicate so the three backends and the wire
+        schema cannot drift apart.
         """
-        return generation.not_encoded(inputs)
+        assert isinstance(inputs, dict), f'Expected dict, got {type(inputs)}'
+        return not is_encoded(inputs)
 
     def _is_trajectory(self, inputs: Any) -> bool:
         """Check if inputs are Trajectory type (not encoded)."""

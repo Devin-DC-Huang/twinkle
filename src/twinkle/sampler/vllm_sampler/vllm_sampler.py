@@ -12,6 +12,7 @@ from twinkle import DeviceMesh, get_logger, remote_class, remote_function, requi
 from twinkle.checkpoint_engine import CheckpointEngineMixin
 from twinkle.data_format import (InputFeature, PoolingParams, PoolingResponse, SampledSequence, SampleResponse,
                                  SamplingParams, Trajectory)
+from twinkle.exceptions import FullWeightLoadError
 from twinkle.hub import HubOperation
 from twinkle.patch import Patch, apply_patch
 from twinkle.patch.vllm_lora_weights import VLLMLoraWeights
@@ -280,6 +281,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, Par
         multi_modal_data: Optional[Dict[str, Any]] = None,
         logprobs_only: bool = False,
         disable_lora: bool = False,
+        token_only: bool = False,
         request_id: Optional[str] = None,
     ) -> SampleResponse:
         """Sample a single input asynchronously.
@@ -293,7 +295,8 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, Par
         response = await self._sample_engine_request(
             request_id,
             self.engine.sample(
-                prompt=self.template.get_vllm_input_ids(feat['input_ids']) if self.template else feat['input_ids'],
+                prompt=self.template.get_vllm_input_ids(feat['input_ids'])
+                if self.template and not token_only else feat['input_ids'],
                 sampling_params=sampling_params,
                 lora_request=lora_request,
                 multi_modal_data=multi_modal_data,
@@ -311,9 +314,25 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, Par
             else:
                 feat['input_ids'] = response.prompt_token_ids
                 feat['labels'] = [-100] * len(response.prompt_token_ids)
+        # A sampling prompt (e.g. a tinker ModelInput) carries input_ids but no labels;
+        # concat_input_feature would then derive a zero-length prefix completion_mask
+        # and raise. The prompt is pure context, so materialise aligned all-context
+        # labels when they are missing or length-mismatched. Present, aligned labels are
+        # left untouched (preserving provenance), and the logprobs-only path -- which
+        # never concatenates -- is not touched.
+        if not token_only and not logprobs_only and 'input_ids' in feat and len(feat.get('labels') or []) != len(
+                feat['input_ids']):
+            feat['labels'] = [-100] * len(feat['input_ids'])
         sequences = []
         for seq in response.sequences:
-            if logprobs_only:
+            if token_only:
+                sampled_seq = SampledSequence(
+                    stop_reason=seq.stop_reason,
+                    tokens=[] if logprobs_only else seq.tokens,
+                    logprobs=None if logprobs_only else seq.logprobs,
+                    sampling_mask=seq.sampling_mask,
+                )
+            elif logprobs_only:
                 new_input_feature = _convert_ndarray_to_list(feat)
                 if seq.routed_experts is not None:
                     new_input_feature['routed_experts'] = _convert_ndarray_to_list(seq.routed_experts)
@@ -341,6 +360,22 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, Par
             prompt_logprobs=response.prompt_logprobs,
             topk_prompt_logprobs=response.topk_prompt_logprobs)
 
+    @staticmethod
+    async def _gather_samples(samples) -> List[SampleResponse]:
+        """Finish every prompt before exposing the batch's result or failure."""
+        tasks = [asyncio.create_task(sample) for sample in samples]
+        batch = asyncio.gather(*tasks)
+        try:
+            return await asyncio.shield(batch)
+        except BaseException:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            if not batch.cancelled():
+                batch.exception()
+            raise
+
     @remote_function(dispatch='slice_dp', collect='flatten', lazy_collect=False, enable_continous_work=True,
                      worker_selector='_sampling_worker_ids')
     @timed
@@ -355,6 +390,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, Par
         use_base_model: bool = False,
         adapter_paths: Optional[List[Optional[str]]] = None,
         allow_partial_rollout: bool = False,
+        token_only: bool = False,
     ) -> List[SampleResponse]:
         """Sample responses for given inputs.
 
@@ -375,6 +411,9 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, Par
                 one running batch, so a multi-tenant server does not have to serialize by adapter.
                 Requires the engine to have been built with ``enable_lora=True``. Mutually exclusive
                 with ``adapter_path``.
+
+            token_only: Return token IDs and logprobs without template processing
+                or training features. Inputs must already contain input_ids.
 
             num_samples: Number of completions to generate per input prompt.
                 When > 1, returns num_samples sequences for each input.
@@ -449,6 +488,8 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, Par
 
         # Check if inputs are Trajectory (not encoded) - aligned with Model.forward logic
         is_trajectory = 'input_ids' not in inputs_list[0]
+        if token_only and is_trajectory:
+            raise ValueError('Token-only sampling requires encoded input_ids.')
         logprobs_only = False
         if sampling_params.max_tokens == 0:
             sampling_params = copy(sampling_params)
@@ -493,6 +534,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, Par
                     multi_modal_data=multi_modal_data,
                     logprobs_only=logprobs_only,
                     disable_lora=use_base_model,
+                    token_only=token_only,
                 )
                 return response, None
 
@@ -602,7 +644,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, Par
                     multi_modal_data=multi_modal_data,
                 ) for feat, multi_modal_data, lora_request in zip(encoded_inputs, multi_modal_data_list, lora_requests)
             ]
-            return await asyncio.gather(*tasks)
+            return await self._gather_samples(tasks)
 
         return self._run_in_loop(_encode_all())
 
@@ -758,7 +800,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, Par
         """Unload policy snapshots from vLLM and clear cached requests."""
         self._run_in_loop(self.engine.unload_lora_paths(adapter_paths))
 
-    @remote_function(dispatch='all', collect='first', lazy_collect=False)
+    @remote_function(dispatch='all', collect='first', lazy_collect=False, timeout=3600)
     @timed
     def load_full_weights_from_path(self, path: Optional[str] = None) -> int:
         """Load a full (non-LoRA) HF checkpoint into the engine's base model.
@@ -809,6 +851,11 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, Par
             shards = sorted(glob.glob(os.path.join(resolved, '*.safetensors')))
         if not shards:
             raise FileNotFoundError(f'No .safetensors weights found under {resolved}')
+        # Check every shard header before changing any live weights.
+        for shard in shards:
+            with safe_open(shard, framework='pt', device='cpu') as f:
+                if not list(f.keys()):
+                    raise ValueError(f'Empty checkpoint shard: {shard}')
 
         def _iter_weights():
             # safe_open + get_tensor reads one tensor at a time (mmap-backed), so peak
@@ -825,11 +872,12 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, Par
             self.engine.invalidate_synced_lora()
 
         logger.info(f'Loading full-parameter weights into sampler base model from {resolved}')
-        self._run_in_loop(_load())
+        try:
+            self._run_in_loop(_load())
+            self.reset_prefix_cache()
+        except Exception as error:
+            raise FullWeightLoadError(f'Failed to install checkpoint {resolved}') from error
         self._loaded_full_weights_path = resolved
-        # Prefixes cached under the previous weights would decode against a model
-        # that no longer exists; drop them before the next sample().
-        self.reset_prefix_cache()
         logger.info(f'Reloaded base weights from {resolved} ({len(shards)} shard(s))')
         return 1
 

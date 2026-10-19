@@ -663,6 +663,17 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             tokenizer_id=self.tokenizer_id,
         )
 
+    def _ensure_gdn_padding_free_patch(self) -> None:
+        """Install the non-SP GatedDeltaNet patch before wrapping the model."""
+        self._gdn_padding_free_enabled = False
+        if getattr(self, '_enable_sp', False):
+            return
+        if not getattr(self.model, '_twinkle_gdn_padding_free_patched', False):
+            from twinkle.patch.gdn_padding_free import GatedDeltaNetPaddingFreePatch
+
+            apply_patch(self.model, GatedDeltaNetPaddingFreePatch, hf_config=self.hf_config, enable_sp=False)
+        self._gdn_padding_free_enabled = bool(getattr(self.model, '_twinkle_gdn_padding_free_patched', False))
+
     def _get_default_group(self):
         """Get the only group, else return the default one"""
         if len(self.optimizer_group) == 1:
@@ -703,14 +714,14 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             self._ensure_sp_strategy()
             if self.sp_strategy is not None:
                 self.sp_strategy.initialize()
+            self._ensure_gdn_padding_free_patch()
 
-            if len(optimizer_groups) == 1:
-                optimizer_group = optimizer_groups[0]
-                optimizer = optimizer_group.optimizer
-                assert optimizer is not None
-                self.model, optimizer = self.strategy.wrap_model(self.model, optimizer)
-                optimizer_group.optimizer = optimizer
-                self.register_mm_forward_hook(optimizer_group)
+            if optimizer_groups:
+                result = self.strategy.wrap_model(self.model, *(group.optimizer for group in optimizer_groups))
+                self.model = result[0]
+                for optimizer_group, optimizer in zip(optimizer_groups, result[1:], strict=True):
+                    optimizer_group.optimizer = optimizer
+                    self.register_mm_forward_hook(optimizer_group)
             else:
                 # maybe forward_only, no optimizer_group available
                 result = self.strategy.wrap_model(self.model)
@@ -724,7 +735,24 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         model = self.strategy.unwrap_model(self.model)
         template = optimizer_group.template
         assert template is not None
-        optimizer_group._handler = model.register_forward_pre_hook(template.pre_forward_hook, with_kwargs=True)
+
+        def forward_hook(model, args, kwargs):
+            selected_group = getattr(self, '_forward_optimizer_group', None)
+            if selected_group is None:
+                selected_group = self.optimizer_group.get(self._get_default_group())
+            if selected_group is optimizer_group:
+                return template.pre_forward_hook(model, args, kwargs)
+
+        optimizer_group._handler = model.register_forward_pre_hook(forward_hook, with_kwargs=True)
+
+    @contextlib.contextmanager
+    def _mm_forward_context(self, optimizer_group: OptimizerGroup):
+        previous = getattr(self, '_forward_optimizer_group', None)
+        self._forward_optimizer_group = optimizer_group
+        try:
+            yield
+        finally:
+            self._forward_optimizer_group = previous
 
     def unregister_mm_forward_hook(self, optimizer_group: OptimizerGroup):
         if optimizer_group._handler is not None:
@@ -873,9 +901,9 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         inputs: Dict[str, Any] = processor(
             inputs,
             sp_strategy=self.sp_strategy,
-            model=self.model,
             hf_config=self.hf_config,
             enable_sp=getattr(self, '_enable_sp', False),
+            gdn_padding_free_enabled=self._gdn_padding_free_enabled,
         )
         labels: torch.Tensor = inputs.pop('labels', None)
         loss_scale = inputs.pop('loss_scale', None)
@@ -1021,9 +1049,9 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             inputs: Dict[str, Any] = processor(
                 inputs,
                 sp_strategy=self.sp_strategy,
-                model=self.model,
                 hf_config=self.hf_config,
                 enable_sp=getattr(self, '_enable_sp', False),
+                gdn_padding_free_enabled=self._gdn_padding_free_enabled,
             )
             labels = inputs.pop('labels', None)
             loss_scale = inputs.pop('loss_scale', None)
@@ -2056,6 +2084,17 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         adapter_state = self.strategy.get_adapter_state_dict(self.model, adapter_name)
         adapter_suffix = f'.{adapter_name}.'
         modules_to_save_infix = f'.modules_to_save.{adapter_name}.'
+        # Strategies collect parameters without materializing the full backbone state.
+        # PEFT modules_to_save also require persistent buffers (e.g. calibration state).
+        model = self.strategy.unwrap_model(self.model)
+        for module_name, module in model.named_modules():
+            if modules_to_save_infix not in f'{module_name}.':
+                continue
+            for buffer_name, buffer in module.named_buffers(recurse=False):
+                if buffer_name in module._non_persistent_buffers_set:
+                    continue
+                key = f'{module_name}.{buffer_name}'
+                adapter_state[key] = Torch.to_local_tensor(buffer).detach().cpu()
         processed_state_dict = {}
         for key, value in adapter_state.items():
             if modules_to_save_infix in key:
@@ -2224,7 +2263,8 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             state_dict = torch.load(scheduler_path, map_location='cpu', weights_only=True)
             optimizer_config.lr_scheduler.load_state_dict(state_dict)
 
-    def _ensure_lora_dtype(self, model):
+    @staticmethod
+    def _ensure_lora_dtype(model):
         """Force LoRA parameters to use the same dtype as base model for FSDP2 compatibility."""
         base_dtype = None
         is_npu_device = Platform.device_prefix() == 'npu'
@@ -2307,16 +2347,12 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
     # raises "'function' object is not subscriptable". Mirrors forward_only/calculate_metric, the other
     # methods whose return value the driver reads. sync=True orders the workers but does not materialize
     # the result; the megatron/hybrid/multi_lora variants are non-lazy for the same backend equivalence.
-    @remote_function(dispatch='all', collect='first', sync=True, lazy_collect=False)
+    @remote_function(dispatch='all', collect='first', sync=True, lazy_collect=False, timeout=3600)
     @timed
     def resume_from_checkpoint(self, checkpoint_dir, *, resume_only_model=False, **kwargs):
         adapter_name = kwargs.get('adapter_name', '')
 
-        has_adapter = (
-            os.path.exists(os.path.join(checkpoint_dir, 'adapter_model.safetensors'))
-            or os.path.exists(os.path.join(checkpoint_dir, 'adapter_model.bin')))
-        if has_adapter:
-            self.load(checkpoint_dir, adapter_name=adapter_name)
+        self.load(checkpoint_dir, adapter_name=adapter_name)
 
         if resume_only_model:
             optimizer_config = self.optimizer_group[adapter_name]

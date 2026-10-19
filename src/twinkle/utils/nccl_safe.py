@@ -33,6 +33,19 @@ from twinkle.utils.logger import get_logger
 logger = get_logger()
 
 
+# Errors are logged with at most this many trailing characters of traceback.
+_TRACEBACK_LIMIT = 8192
+
+
+def _global_rank() -> int:
+    """Best-effort global rank for failure attribution; -1 if unavailable."""
+    try:
+        from twinkle.utils import Platform
+        return Platform.get_rank()
+    except Exception:
+        return -1
+
+
 def _is_fail_fast() -> bool:
     """Check if fail-fast mode is enabled (default: enabled).
 
@@ -90,9 +103,12 @@ class SafeLossWrapper(Loss):
             return self._loss_instance(inputs, outputs, **kwargs)
         except Exception as e:
             import traceback
+            tb = traceback.format_exc()
+            if len(tb) > _TRACEBACK_LIMIT:
+                tb = tb[-_TRACEBACK_LIMIT:]
             logger.warning('[nccl_safe] Loss computation skipped due to error: '
                            '%s: %s\n%s',
-                           type(e).__name__, e, traceback.format_exc())
+                           type(e).__name__, e, tb)
             return _zero_loss(outputs)
 
     def micro_batch_scale(self, inputs, indices):
@@ -320,11 +336,21 @@ def nccl_safe_megatron(func=None, *, tinker=False, forward_only=False):
 
             try:
                 return fn(self, *args, **kwargs)
-            except Exception as e:
+            except Exception as exc:
                 import traceback
-                logger.warning(f'[nccl_safe_megatron] Exception in Megatron method '
-                               f'{fn.__name__}: {type(e).__name__}: {e}\n'
-                               f'{traceback.format_exc()}')
+                rank = _global_rank()
+                context = f'twinkle backend method={fn.__name__}, global_rank={rank}'
+                if hasattr(exc, 'add_note'):
+                    exc.add_note(context)
+                elif exc.args:
+                    exc.args = (f'{exc.args[0]} [{context}]', *exc.args[1:])
+                else:
+                    exc.args = (context, )
+                tb = traceback.format_exc()
+                if len(tb) > _TRACEBACK_LIMIT:
+                    tb = tb[-_TRACEBACK_LIMIT:]
+                logger.error('[nccl_safe_megatron] %s in %s on global rank %s:\n%s',
+                             type(exc).__name__, fn.__name__, rank, tb)
 
                 # Return safe fallback to prevent NCCL hang on other ranks
                 if tinker:

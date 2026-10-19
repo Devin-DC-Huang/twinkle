@@ -4,7 +4,7 @@ import os
 
 import torch
 import torch.nn as nn
-from transformers import PreTrainedConfig
+from transformers import PretrainedConfig
 from typing import Any, Dict, List, Literal, Optional
 
 from twinkle import DeviceMesh, Platform, torch_util
@@ -102,7 +102,7 @@ class MegatronStrategy:
         mixed_precision: Literal['no', 'fp16', 'bf16'] = 'bf16',
         seed: int = 42,
         variable_seq_lengths: bool = True,
-        config: PreTrainedConfig = None,
+        config: PretrainedConfig = None,
         ddp_config: Dict[str, Any] = None,
         bridge_backend='mcore-bridge',
         align_grad_reduce: bool = True,
@@ -473,7 +473,7 @@ class MegatronStrategy:
 
     def get_model_config(
         self,
-        hf_config: PreTrainedConfig,
+        hf_config: PretrainedConfig,
         parallel_kwargs: Dict[str, Any],
         **kwargs,
     ):

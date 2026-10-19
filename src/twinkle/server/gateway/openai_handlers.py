@@ -16,7 +16,7 @@ from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from typing import TYPE_CHECKING, Any
 
-from twinkle_client.http.headers import H_AUTH, H_AUTH_TWINKLE, build_routing_headers
+from twinkle.protocol.headers import H_AUTH, H_AUTH_TWINKLE, build_routing_headers
 
 if TYPE_CHECKING:
     from .app import GatewayServer
@@ -25,6 +25,7 @@ import httpx
 
 from twinkle.server.utils import get_template_for_model
 from twinkle.utils.logger import get_logger
+from . import routes
 from .openai_bridge import (make_error, translate_chat_request, translate_completion_request,
                             translate_completion_response, translate_embedding_request, translate_embedding_response,
                             translate_infer_request, translate_infer_response, translate_response,
@@ -244,12 +245,12 @@ async def _resolve_base_model(gateway: GatewayServer, model: str) -> str | None:
         pass
 
     # Check if it's directly a supported base model
-    if model in gateway._supported_model_names:
+    if model in gateway.supported_model_names:
         return model
 
     # Fallback: if there's exactly one supported model, use it
-    if len(gateway._supported_model_names) == 1:
-        return next(iter(gateway._supported_model_names))
+    if len(gateway.supported_model_names) == 1:
+        return next(iter(gateway.supported_model_names))
 
     return None
 
@@ -370,10 +371,10 @@ async def _ensure_template(
 ) -> None:
     """Ensure the sampler has a chat template set for encoding Trajectory inputs.
 
-    Called once per base_model (cached in-process). On failure, logs a warning
-    but doesn't block — the sampler will return its own error if needed.
+    Called once per base_model (cached on the ``GatewayServer`` instance). On failure,
+    logs a warning but doesn't block -- the sampler will return its own error if needed.
     """
-    if base_model in _template_initialized:
+    if base_model in gateway._template_initialized:
         return
 
     template_cls = get_template_for_model(base_model)
@@ -386,14 +387,14 @@ async def _ensure_template(
     try:
         resp = await gateway.proxy.proxy_request(
             request,
-            endpoint='twinkle/set_template',
+            endpoint=routes.TWINKLE_SET_TEMPLATE,
             base_model=base_model,
             service_type='sampler',
             body_override=set_template_body,
             extra_headers=sticky_headers,
         )
         if resp.status_code == 200:
-            _template_initialized.add(base_model)
+            gateway._template_initialized.add(base_model)
         else:
             logger.warning('set_template failed: %s', resp.body.decode()[:200])
     except Exception as e:

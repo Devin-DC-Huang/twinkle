@@ -18,7 +18,7 @@ from peft import LoraConfig, PeftConfig, PeftModel, get_peft_model
 from peft.tuners.lora import Linear as LoraLinear
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
-from transformers import PreTrainedConfig
+from transformers import PretrainedConfig
 from typing import Any, Callable, Dict, Generator, List, Literal, Optional, Tuple, Type, Union
 
 import twinkle
@@ -26,7 +26,7 @@ import twinkle.metric
 import twinkle.patch
 from twinkle import DeviceMesh, Platform, remote_class, remote_function, requires, torch_util
 from twinkle.checkpoint_engine.mixin import CheckpointEngineMixin
-from twinkle.data_format import InputFeature, ModelOutput, Trajectory
+from twinkle.data_format import InputFeature, ModelOutput, Trajectory, is_encoded
 from twinkle.hub import HubOperation
 from twinkle.infra import collect_tensor_dict, remote_function
 from twinkle.infra._torch_setup import seed_from_env
@@ -38,8 +38,8 @@ from twinkle.patch import Patch, apply_context, apply_patch
 from twinkle.perf import timed
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
-from twinkle.utils import construct_class, get_logger, selective_log_softmax
 from twinkle.utils.nccl_safe import _is_fail_fast
+from twinkle.utils import construct_class, get_logger, selective_log_softmax
 from ._mindspeed_runtime import ensure_mindspeed_adaptor_patched
 from .strategy import MegatronStrategy
 
@@ -130,7 +130,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
     def __init__(
         self,
         model_id: str,
-        config: Optional[PreTrainedConfig] = None,
+        config: Optional[PretrainedConfig] = None,
         ddp_config: Optional[Dict[str, Any]] = None,
         device_mesh: Optional[DeviceMesh] = None,
         mixed_precision: Literal['no', 'fp16', 'bf16'] = 'bf16',
@@ -1590,7 +1590,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
         self.zero_grad(**kwargs)
         self.lr_step(**kwargs)
 
-    @remote_function(dispatch='all', collect='first', sync=True)
+    @remote_function(dispatch='all', collect='first', sync=True, timeout=3600)
     @timed
     def save(self,
              name: Optional[str] = None,
@@ -1741,6 +1741,9 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
                 checkpoint_dir,
                 peft_format=(adapter_name != _default_adapter_name),
             )
+            optimizer_config = self.optimizer_group.get(adapter_name)
+            if optimizer_config is not None and optimizer_config.optimizer is not None:
+                optimizer_config.optimizer.reload_model_params()
 
         if dist.is_initialized():
             dist.barrier()
@@ -1774,7 +1777,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
     # lazy_collect=False: see TransformersModel.resume_from_checkpoint -- the driver consumes the returned
     # training-state dict immediately (loop.resume subscripts state['cur_step']), so the lazy callable
     # default would break it. Keeps megatron backend-equivalent with the transformers variant.
-    @remote_function(dispatch='all', lazy_collect=False)
+    @remote_function(dispatch='all', collect='first', sync=True, lazy_collect=False, timeout=3600)
     @timed
     def resume_from_checkpoint(self, checkpoint_dir, *, resume_only_model=False, **kwargs):
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
@@ -2366,7 +2369,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
         self._default_tokenizer = self.optimizer_group[adapter_name].template.processor
         self.active_group = adapter_name
 
-    @remote_function(dispatch='all', sync=True)
+    @remote_function(dispatch='all', sync=True, timeout=3600)
     def add_adapter_to_model(
         self,
         adapter_name: str,

@@ -22,6 +22,7 @@ from .manager import CheckpointEngineManager, CheckpointEngineMode
 from .mixin import CheckpointEngineMixin
 # Import backend implementations to register them
 from .nccl_checkpoint_engine import NCCLCheckpointEngine
+from .zmq_auth import generate_auth_key, recv_auth_pyobj, send_auth_pyobj
 
 __all__ = [
     'CheckpointEngine',
@@ -32,4 +33,7 @@ __all__ = [
     'HCCLCheckpointEngine',
     'IPCCheckpointEngine',
     'TensorMeta',
+    'generate_auth_key',
+    'send_auth_pyobj',
+    'recv_auth_pyobj',
 ]
