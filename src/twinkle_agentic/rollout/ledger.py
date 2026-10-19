@@ -26,12 +26,102 @@ prompt ids against what is already banked and refuses a prompt that does not
 extend it, rather than re-encoding to make it fit.
 """
 import threading
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from twinkle.data_format import Trajectory
 from twinkle.data_format.sampling import SampledSequence
 from twinkle.template.base import Template
 from twinkle_agentic.utils.token_utils import _to_plain, append_ids, extend_with_bridge
+
+
+def _input_order_labels(labels: List[int]) -> List[int]:
+    """Undo twinkle's output-order roll to get labels aligned with ``input_ids``.
+
+    ``append_ids`` stores labels shifted, so ``labels[i]`` is the target for position
+    ``i + 1``; shifting right by one recovers input order, where a trainable position
+    ``j`` holds ``in_labels[j] == input_ids[j]``.
+    """
+    return (labels[-1:] + labels[:-1]) if labels else []
+
+
+def _trainable_positions(input_ids: List[int], labels: List[int], completion_mask: Any) -> List[int]:
+    """Input-order positions of the policy-produced tokens, in order.
+
+    ``labels != -100`` intersected with ``completion_mask`` when one is present. Labels AND
+    the mask both arrive in output/shifted order, so both are unrolled before the
+    position-wise intersection.
+    """
+    in_labels = _input_order_labels(list(labels or []))
+    mask = (_input_order_labels(list(completion_mask))
+            if completion_mask is not None and len(completion_mask) == len(in_labels) else None)
+    positions: List[int] = []
+    for j, lab in enumerate(in_labels):
+        if lab == -100:
+            continue
+        if mask is not None and not mask[j]:
+            continue
+        positions.append(j)
+    return positions
+
+
+def trainable_runs(encoded: Dict[str, Any]) -> List[List[int]]:
+    """Contiguous runs of trainable input_ids positions, one run per assistant turn.
+
+    The ledger records a whole generation as trainable and every observation as
+    masked, so the runs alternate one-to-one with the assistant turns.
+    """
+    input_ids = list(encoded.get('input_ids') or [])
+    labels = list(encoded.get('labels') or [])
+    completion_mask = encoded.get('completion_mask')
+    positions = _trainable_positions(input_ids, labels, completion_mask)
+    runs: List[List[int]] = []
+    for j in positions:
+        if runs and j == runs[-1][-1] + 1:
+            runs[-1].append(j)
+        else:
+            runs.append([j])
+    return runs
+
+
+def turn_token_spans(encoded: Dict[str, Any]) -> List[Tuple[int, int]]:
+    """Per-assistant-turn ``[start, end)`` spans within the flat response tokens.
+
+    The k-th contiguous trainable run occupies a contiguous slice of the flat
+    response array, so this returns those slices as half-open spans -- the turn
+    boundaries multi-turn PRM step segmentation needs.
+    """
+    spans: List[Tuple[int, int]] = []
+    cursor = 0
+    for run in trainable_runs(encoded):
+        spans.append((cursor, cursor + len(run)))
+        cursor += len(run)
+    return spans
+
+
+def sampled_token_logprobs(tokens: List[int], logprobs) -> List[float]:
+    """Normalize sampler logprobs to one scalar for each sampled token."""
+    if logprobs is None:
+        return []
+    result: List[float] = []
+    for token, position in zip(tokens, logprobs):
+        if isinstance(position, (int, float)):
+            result.append(float(position))
+            continue
+        candidates = list(position or [])
+        matched = next((value for token_id, value in candidates if int(token_id) == int(token)), None)
+        if matched is None:
+            raise RuntimeError(f'sampled token {token} is missing from its returned logprobs: {candidates!r}.')
+        result.append(float(matched))
+    return result
+
+
+def last_assistant_text(messages: Optional[List[dict]]) -> str:
+    """The newest assistant turn's text, for logging / rule-based reward."""
+    for message in reversed(messages or []):
+        if message.get('role') == 'assistant':
+            content = message.get('content')
+            return content if isinstance(content, str) else ''
+    return ''
 
 
 class TurnLedger:
@@ -72,6 +162,7 @@ class TurnLedger:
         self.max_tokens = max_tokens
         self._pif: Dict[str, Any] = {}
         self._logprobs: List[Any] = []
+        self._sampling_mask: Any = None
         self._turns = 0
 
     # ---------------------------------------------------------------- reading
@@ -183,6 +274,11 @@ class TurnLedger:
         self._pif = _to_plain(dict(seq.new_input_feature))
         self._turns += 1
         self._extend_logprobs(seq)
+        # The sampler's per-token sampling support set (sampling replay); banked per turn,
+        # and merge exposes it only for a single-generation episode whose one CSR covers
+        # the whole response -- a multi-turn episode would need the per-turn blocks
+        # concatenated, which no consumer asks for yet.
+        self._sampling_mask = getattr(seq, 'sampling_mask', None)
 
     def _extend_logprobs(self, seq: SampledSequence) -> None:
         """Append one generation's logprobs -- one per sampled token, or raise.
@@ -280,13 +376,29 @@ class TurnLedger:
         """The trajectory plus the account, with the account checked first.
 
         Token fields land at top level, which is what tells a sampler downstream
-        that this is already encoded and must not be encoded again.
+        that this is already encoded and must not be encoded again. The TRAINING
+        VIEW comes with it: ``response_token_ids`` (the policy-produced tokens,
+        input order), ``rollout_logprobs`` (one scalar per response token -- the
+        old_logps a consumer like GRPO needs), and ``replay_mask`` beside a routed
+        ``routed_experts`` -- so no caller has to re-derive them from the labels.
         """
         self.audit()
         out = dict(trajectory)
         out.update(self._pif)
         out['messages'] = list(self._pif.get('messages') or trajectory.get('messages') or [])
         out['logprobs'] = self._logprobs if self._logprobs else None
+        labels = self._pif.get('labels') or []
+        input_ids = self._pif.get('input_ids') or []
+        completion_mask = self._pif.get('completion_mask')
+        positions = _trainable_positions(input_ids, labels, completion_mask)
+        out['response_token_ids'] = [input_ids[j] for j in positions]
+        out['rollout_logprobs'] = (sampled_token_logprobs(out['response_token_ids'], self._logprobs)
+                                   if self._logprobs else [])
+        if 'routed_experts' in self._pif:
+            out['replay_mask'] = (list(completion_mask) if completion_mask is not None
+                                  else [int(label != -100) for label in labels])
+        if self._turns == 1 and self._sampling_mask is not None:
+            out['sampling_mask'] = self._sampling_mask
         out.update(fields)
         return out
 
@@ -570,4 +682,4 @@ class LedgerBook:
         return TurnLedger(self.template, label=label, max_tokens=self.max_tokens)
 
 
-__all__ = ['LedgerBook', 'MessageLedger', 'TurnLedger']
+__all__ = ['LedgerBook', 'MessageLedger', 'TurnLedger', 'turn_token_spans']

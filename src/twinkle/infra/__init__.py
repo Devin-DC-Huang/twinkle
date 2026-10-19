@@ -1004,6 +1004,10 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
                         *args,
                         **kwargs_for_workers)
                     self._actors = _actors
+                    # Recorded unconditionally (an actor-native elasticity input: re-running this
+                    # factory on a pre-reserved slot grows the replica set, see Sampler.add_workers);
+                    # classes that need richer bookkeeping layer their own _save_worker_factory on top.
+                    self._worker_factory = (cls, tuple(args), dict(kwargs_for_workers), _extra_torch_kwargs)
                     factory_recorder = getattr(self, '_save_worker_factory', None)
                     if factory_recorder is not None:
                         factory_recorder(cls, args, kwargs_for_workers, _extra_torch_kwargs)

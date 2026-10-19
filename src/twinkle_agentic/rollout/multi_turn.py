@@ -1,8 +1,12 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import copy
 import json
 import re
-from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Literal, Optional
+import threading
+import uuid
+from concurrent.futures import Future
+from dataclasses import dataclass, field, replace
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 from twinkle.data_format import Trajectory
 from twinkle.data_format.sampling import SampledSequence, SampleResponse, SamplingParams
@@ -12,7 +16,7 @@ from twinkle_agentic.protocol.api_sampler import APIGenerationError, APISampler
 from twinkle_agentic.protocol.base import API
 from twinkle_agentic.tools.tool_manager import ToolManager
 from .base import MAX_FOLLOWUPS, STOP_GENERATION_ERROR, STOP_NO_TOOL, Rollout
-from .ledger import MessageLedger, TurnLedger
+from .ledger import MessageLedger, TurnLedger, last_assistant_text
 from .trace import TraceWriter
 
 ResponseCallback = Callable[..., SampledSequence]
@@ -35,6 +39,172 @@ class StreamToolCall:
 class StreamDone:
     """The finished episode: a message-level transcript trajectory (NOT trainable -- no token fields)."""
     trajectory: Trajectory
+
+
+@dataclass
+class RolloutSample:
+    """One on-policy rollout trajectory, pre-collation (the RL training-sample layer).
+
+    ``encoded`` carries the full prompt+completion feature with the ledger's already-shifted
+    labels; ``rollout_logprobs`` are the sampling-policy old_logps, one per response token.
+    ``response_loss_mask`` mirrors ``response_token_ids``.
+    """
+
+    encoded: dict
+    response_token_ids: List[int]
+    rollout_logprobs: List[float]
+    prompt_id: str
+    extra: Dict[str, Any] = field(default_factory=dict)
+    decoded: str = ''
+    truncated: bool = False
+    response_loss_mask: List[int] = field(default_factory=list)
+    messages: Optional[List[dict]] = None
+    rollout_infos: Dict[str, Any] = field(default_factory=dict)
+    # The sampler's per-token sampling support set (twinkle SamplingMask); assembled into the
+    # top-level sampling_masks forward kwarg by the consumer, never into encoded.
+    sampling_mask: Optional[Any] = None
+    # The policy version this trajectory was generated under (the admission pin); 0 when the
+    # producing path does not track versions.
+    policy_version: int = 0
+    # How many publishes the policy advanced between admission and collection; in_place only
+    # (adapter_snapshot pins one frozen path, so the span is always 0).
+    version_span: int = 0
+    # The ORIGINAL prompt messages, stamped on the streaming collect path for PRM scoring and
+    # the teacher privileged view; None on the blocking generate path.
+    prompt: Optional[List[dict]] = None
+    # Per-sample outcome-reward row (one value per scorer), scored by the streaming layer before
+    # the sample enters the ready buffer; None until then.
+    orm_reward: Optional[List[float]] = None
+    # Per-token process reward in the response-token frame, scored by the same seam; None when
+    # no PRM channel is wired.
+    prm_process: Optional[List[float]] = None
+    # The kernel's group identity (the admission expansion key), stamped when the trajectory enters
+    # the ready buffer; positions are the training contract, this is provenance/debugging.
+    group_key: Optional[str] = None
+    # A group-level baseline (e.g. ReMax's greedy reward), written by the group-completion hook;
+    # one value shared by every sibling of the group.
+    baseline: Optional[float] = None
+
+    @property
+    def input_feature(self) -> dict:
+        """Back-compat alias: the training feature is ``encoded`` (was ``input_feature``)."""
+        return self.encoded
+
+    @property
+    def old_logps(self) -> List[float]:
+        """The sampling-policy logprobs, already flat (one per response token)."""
+        return list(self.rollout_logprobs)
+
+    @property
+    def prompt_index(self) -> str:
+        """Back-compat alias for the group id."""
+        return self.prompt_id
+
+
+@dataclass(eq=False)
+class SampleHandle:
+    """One in-flight trajectory admitted by :meth:`MultiTurnRollout.admit`.
+
+    Carries the submit-time facts collect/cancel need; identity is ``submission_id``
+    (two handles for one submission are the same trajectory).
+    """
+
+    submission_id: str
+    prompt_idx: Any
+    trajectory_idx: int
+    prompt_extras: Optional[Dict[str, Any]] = None
+    require_logprobs: bool = True
+    policy_version: int = 0
+    # The ORIGINAL prompt messages, stamped onto the collected sample (sample.prompt).
+    prompt: Optional[List[dict]] = None
+    # Ref-only remote result (a LazyCollect the driver never resolves early); the local
+    # engine shape leaves it unset and runs the episode on a Future instead.
+    payload: Any = None
+    # The admission pin's adapter path. None marks the in_place strategy, whose collect
+    # stamps a version span; a pinned path (adapter_snapshot) spans nothing.
+    adapter_path: Optional[str] = None
+
+    def __hash__(self) -> int:
+        return hash(self.submission_id)
+
+    def __eq__(self, other: Any) -> bool:
+        return isinstance(other, SampleHandle) and self.submission_id == other.submission_id
+
+
+def _build_sampling_params(num_samples: int, sampling_params: Optional[dict], force_logprobs: bool) -> SamplingParams:
+    """Assemble the twinkle SamplingParams shared by every rollout entry point.
+
+    One contract (temperature default, forced old_logps, per-submission num_samples) so no
+    path can silently sample under different params than another; the engine drives one
+    trajectory per turn, hence num_samples is always 1 here.
+    """
+    sp = dict(sampling_params or {})
+    sp.setdefault('temperature', 1.0)
+    if force_logprobs:
+        # Contract 15: these logprobs ARE old_logps, so requesting them is forced, not defaulted.
+        sp['logprobs'] = max(int(sp.get('logprobs') or 0), 1)
+    sp['num_samples'] = num_samples
+    return SamplingParams(**sp)
+
+
+#: Prompt-row media columns threaded onto the Trajectory so the sampler encodes them.
+_MULTIMODAL_PROMPT_KEYS = ('images', 'videos', 'audios', 'objects', 'tools')
+
+#: Keys of the flat trajectory a training forward consumes: the encoded feature proper
+#: plus the MoE replay pair the sampler reported.
+_TRAIN_FEATURE_KEYS = ('input_ids', 'labels', 'completion_mask', 'routed_experts', 'replay_mask')
+
+
+def _vision_feature_keys() -> frozenset:
+    """The multimodal feature keys to lift from the engine's feature into ``encoded``."""
+    from twinkle.processor.base import InputProcessor
+    return frozenset(InputProcessor.VLM_CONCAT_FIELDS) | frozenset(
+        ('mm_token_type_ids', 'second_per_grid_ts'))
+
+
+def trajectory_to_rollout_sample(traj: Dict[str, Any], prompt_id: str, extra: Dict[str, Any]) -> RolloutSample:
+    """Translate one ledger-merged Trajectory into a RolloutSample.
+
+    The token fields arrive ready-made from the ledger's ``merge`` (labels already
+    next-token shifted; ``response_token_ids`` / ``rollout_logprobs`` the flat training
+    view); message-only mode (a text-only backend) has no token fields, so only
+    ``messages`` / ``decoded`` / ``rollout_infos`` carry anything.
+    """
+    input_ids = list(traj.get('input_ids') or [])
+    labels = list(traj.get('labels') or [])
+    messages = copy.deepcopy(traj.get('messages'))
+    encoded: Dict[str, Any] = {}
+    response_token_ids: List[int] = []
+    rollout_logprobs: List[float] = []
+    if input_ids and labels:
+        keys = set(_TRAIN_FEATURE_KEYS) | _vision_feature_keys()
+        encoded = {key: traj[key] for key in keys if key in traj}
+        response_token_ids = list(traj.get('response_token_ids') or [])
+        rollout_logprobs = list(traj.get('rollout_logprobs') or [])
+    rollout_infos = {
+        key: traj[key]
+        for key in ('turns', 'stop_reason', 'truncated', 'stuck_stop', 'tool_stop', 'followups') if key in traj
+    }
+    if traj.get('error') is not None:
+        rollout_infos['error'] = traj['error']
+    return RolloutSample(
+        encoded=encoded,
+        response_token_ids=response_token_ids,
+        rollout_logprobs=rollout_logprobs,
+        response_loss_mask=[1] * len(response_token_ids),
+        prompt_id=prompt_id,
+        extra=extra,
+        decoded=last_assistant_text(messages),
+        truncated=bool(traj.get('truncated')),
+        messages=messages,
+        rollout_infos=rollout_infos,
+        sampling_mask=traj.get('sampling_mask'))
+
+
+#: Ray runs a decorated actor's methods one at a time unless max_concurrency is raised; each
+#: in-flight episode is a separate generate call. A PERFORMANCE ceiling only, never a second
+#: admission cap: the sole admission truth is the driver's backpressure (buffer over handles).
+_MAX_CONCURRENT_EPISODES = 1024
 
 
 def _default_response_callback(sampler, api, sampling_params, *, input_feature, adapter_kwargs,
@@ -156,7 +326,10 @@ def _malformed_tool_message(errors: List[str]) -> Dict[str, Any]:
     }
 
 
-@remote_class()
+# execute='first': a deployed rollout is ONE payload actor running every episode thread-side;
+# max_concurrency lifts Ray's one-method-at-a-time default so in-flight episodes overlap (a
+# PERFORMANCE ceiling only -- the admission truth stays with the driver's backpressure).
+@remote_class(execute='first', max_concurrency=_MAX_CONCURRENT_EPISODES)
 class MultiTurnRollout(Rollout):
     """Agentic multi-turn rollout with tool use, one episode per thread.
 
@@ -219,6 +392,9 @@ class MultiTurnRollout(Rollout):
         response_callback: Optional[ResponseCallback] = None,
         api_appended_as: Literal['demonstration', 'context'] = 'demonstration',
         api_kwargs: Optional[Dict[str, Any]] = None,
+        allow_partial_rollout: bool = False,
+        tools_factory: Optional[Callable[[Any], Tuple[Any, List[Any], Any]]] = None,
+        tools_config: Any = None,
     ):
         super().__init__()
         if isinstance(sampler, (API, APISampler)):
@@ -273,6 +449,19 @@ class MultiTurnRollout(Rollout):
                 raise ValueError('api_kwargs requires an API backend')
             self.api = None
         self.response_callback = response_callback or _default_response_callback
+        if tools_factory is not None and tool_manager is not None:
+            raise ValueError('tools_factory builds a per-episode sandbox manager; a shared '
+                             'tool_manager cannot also be set. Pass one or the other.')
+        # A sandbox env pool holds live locks/queues and cannot cross the Ray boundary, so it is
+        # built HERE (engine-side) via the injected factory, never handed in pre-built. A sandbox
+        # binds tools per episode (each trajectory leases its own env), so the shared tool_manager
+        # is dropped then and every episode passes its own leased manager.
+        self.env_pool, self.tool_plugins, self._tool_manager_for = (
+            (None, [], None) if tools_factory is None else tools_factory(tools_config))
+        self._per_episode_tools = self.env_pool is not None and bool(self.tool_plugins)
+        # Every RL entry (generate/admit) threads this into each per-turn sample call: it makes
+        # a turn resumable across an in-place weight republish instead of returning truncated.
+        self._allow_partial_rollout = allow_partial_rollout
         self.tool_manager = tool_manager
         # An optional AgentHarness (a pool exposing ``.lease()``, or a 1:1 list)
         # that shapes messages each turn. The ledger still owns every token id;
@@ -442,6 +631,205 @@ class MultiTurnRollout(Rollout):
         out = ledger.merge(trajectory, turns=ledger.turns, stop_reason=stop_reason, truncated=truncated)
         yield StreamDone(out)
 
+    # ---------------------------------------------------------- RL entries
+    #
+    # The batch and streaming faces over the same engine: ``generate`` is the blocking
+    # (locally) / lazy (over Ray) batch entry, and admit/poll/collect/cancel is the
+    # four-call protocol the streaming driver's engine seams default-bind to. Both
+    # translate each episode's ledger-merged trajectory into a RolloutSample.
+
+    @remote_function(dispatch='all', collect='none', lazy_collect=True)
+    def generate(self,
+                 prompts: List[List[dict]],
+                 num_samples: int = 1,
+                 sampling_params: Optional[dict] = None,
+                 prompt_extras: Optional[List[Dict[str, Any]]] = None,
+                 force_logprobs: bool = True,
+                 adapter_path: Optional[str] = None,
+                 allow_partial_rollout: Optional[bool] = None) -> List[RolloutSample]:
+        """Run one episode per (prompt, sample) pair and translate each output.
+
+        ``num_samples`` completions per prompt, grouped by prompt -- a GRPO group is one
+        prompt's slice of the returned list. ``lazy_collect=True`` makes a REMOTE call
+        return a LazyCollect handle immediately (what :meth:`admit` parks on its
+        payload); a local call still blocks.
+        """
+        if num_samples < 1:
+            raise ValueError('num_samples must be >= 1.')
+        if prompt_extras is not None and len(prompt_extras) != len(prompts):
+            raise ValueError('prompt_extras must contain exactly one mapping per prompt.')
+        extras = prompt_extras or [{} for _ in prompts]
+        trajectories, metadata = [], []
+        for prompt_index, prompt in enumerate(prompts):
+            for _ in range(num_samples):
+                extra = copy.deepcopy(extras[prompt_index])
+                trajectory: Dict[str, Any] = {'messages': copy.deepcopy(prompt)}
+                # Thread the prompt row's media columns so a multimodal episode samples its media.
+                for key in _MULTIMODAL_PROMPT_KEYS:
+                    if extra.get(key):
+                        trajectory[key] = copy.deepcopy(extra[key])
+                trajectories.append(trajectory)
+                metadata.append((str(prompt_index), extra))
+        sp = self._rl_sampling_params(sampling_params, force_logprobs)
+        # adapter_path threads into every per-turn sampler.sample (a LoRA run must not sample
+        # from the base); allow_partial_rollout rides the same kwargs channel (False reads as
+        # omitted).
+        kwargs: Dict[str, Any] = {
+            'sampling_params': sp,
+            'allow_partial_rollout': (self._allow_partial_rollout if allow_partial_rollout is None
+                                      else allow_partial_rollout),
+        }
+        if adapter_path:
+            kwargs['adapter_path'] = adapter_path
+        outputs = self(trajectories, **kwargs)
+        if len(outputs) != len(metadata):
+            raise RuntimeError(f'multi-turn rollout returned {len(outputs)} trajectories for '
+                               f'{len(metadata)} inputs.')
+        return [
+            trajectory_to_rollout_sample(output, prompt_id, extra)
+            for output, (prompt_id, extra) in zip(outputs, metadata)
+        ]
+
+    def _rl_sampling_params(self, sampling_params: Any, force_logprobs: bool) -> SamplingParams:
+        """The one SamplingParams every RL entry samples under (contract 15).
+
+        A per-call dict replaces the construction-time params wholesale; either way
+        old_logps are forced and num_samples is 1 -- the engine drives one trajectory
+        per call, so no path can silently sample under different params than another.
+        """
+        if isinstance(sampling_params, SamplingParams):
+            sp = sampling_params
+        elif sampling_params is None:
+            sp = self.sampling_params or SamplingParams()
+        else:
+            sp = _build_sampling_params(1, sampling_params, force_logprobs)
+        if force_logprobs and not sp.logprobs:
+            sp = replace(sp, logprobs=1)
+        if sp.num_samples != 1:
+            sp = replace(sp, num_samples=1)
+        return sp
+
+    def admit(self,
+              prompt: List[dict],
+              trajectory_idx: int = 0,
+              *,
+              prompt_idx: Any = 0,
+              sampling_params: Optional[dict] = None,
+              prompt_extras: Optional[Dict[str, Any]] = None,
+              adapter_path: Optional[str] = None,
+              policy_version: int = 0) -> SampleHandle:
+        """Admit ONE trajectory without blocking; poll/collect/cancel complete the protocol.
+
+        ``prompt_idx`` / ``trajectory_idx`` are carried for the collect-side group
+        stamping; ``policy_version`` is the admission pin, stamped onto the sample. A
+        REMOTE deployment parks the lazy generate on the handle's payload; a local one
+        runs the episode on a daemon-thread Future. This method also runs on a Ray
+        proxy whose ``__init__`` never executed, which is why every state it touches
+        is either on the handle or lazy.
+        """
+        handle = SampleHandle(
+            submission_id=uuid.uuid4().hex, prompt_idx=prompt_idx, trajectory_idx=trajectory_idx,
+            prompt_extras=dict(prompt_extras) if prompt_extras else None,
+            policy_version=policy_version, prompt=list(prompt) if prompt is not None else None,
+            adapter_path=adapter_path)
+        if hasattr(self, '_actors'):
+            # The remote episode runs on the actor: the generate call itself returns a
+            # LazyCollect immediately, so admission never blocks the driver thread.
+            handle.payload = self.generate(
+                [prompt], num_samples=1, sampling_params=sampling_params,
+                prompt_extras=[prompt_extras] if prompt_extras else None,
+                force_logprobs=True, adapter_path=adapter_path)
+            return handle
+        futures: Dict[str, Future] = self.__dict__.setdefault('_episode_futures', {})
+        future: Future = Future()
+        futures[handle.submission_id] = future
+
+        def _work() -> None:
+            try:
+                future.set_result(self.generate(
+                    [prompt], num_samples=1, sampling_params=sampling_params,
+                    prompt_extras=[prompt_extras] if prompt_extras else None,
+                    force_logprobs=True, adapter_path=adapter_path))
+            except Exception as exc:  # surfaced at poll/collect; the thread must not die silently
+                future.set_exception(exc)
+
+        threading.Thread(target=_work, name=f'episode-{handle.submission_id[:8]}', daemon=True).start()
+        return handle
+
+    def poll(self, handles: List[SampleHandle]) -> List[SampleHandle]:
+        """Non-blocking as-completed query; a failed local episode raises here, fail-loudly."""
+        futures: Dict[str, Future] = getattr(self, '_episode_futures', {})
+        completed: List[SampleHandle] = []
+        for handle in handles:
+            if handle.payload is not None:
+                # ready() is a ray.wait(timeout=0) status probe, never a fetch; a FAILED episode
+                # still reports ready and its exception surfaces at collect.
+                if handle.payload.ready():
+                    completed.append(handle)
+                continue
+            future = futures.get(handle.submission_id)
+            if future is None or not future.done():
+                continue
+            error = future.exception()
+            if error is not None:
+                raise RuntimeError(f'streaming episode {handle.submission_id} failed: {error}') from error
+            completed.append(handle)
+        return completed
+
+    def collect(self, handle: SampleHandle) -> RolloutSample:
+        """Collect ONE completed trajectory, stamped with its group id / pin version / prompt."""
+        if handle.payload is not None:
+            samples = handle.payload()
+        else:
+            future = getattr(self, '_episode_futures', {}).pop(handle.submission_id, None)
+            if future is None:
+                raise RuntimeError(f'collect called for an unknown or already-collected submission '
+                                   f'{handle.submission_id}.')
+            samples = future.result()
+        if len(samples) != 1:
+            raise RuntimeError(f'episode collect expected exactly 1 sample (submission '
+                               f'{handle.submission_id}), got {len(samples)}.')
+        sample = samples[0]
+        sample.prompt_id = str(handle.prompt_idx)
+        sample.policy_version = handle.policy_version
+        sample.prompt = handle.prompt
+        return sample
+
+    def cancel(self, handle: Optional[SampleHandle]) -> None:
+        """Drop an admitted-but-uncollected episode: remote drops the ref, local abandons.
+
+        A concurrent.futures.Future silently discards an unretrieved exception, so an
+        abandoned episode that later fails needs no drain here.
+        """
+        if handle is None:
+            return
+        if handle.payload is not None:
+            # The in-actor episode finishes on its own; its result is discarded with the ref.
+            return
+        getattr(self, '_episode_futures', {}).pop(handle.submission_id, None)
+
+    @remote_function(dispatch='first', collect='none', lazy_collect=False)
+    def abort_all_inflight(self) -> None:
+        """Abort every in-flight sampler generation so an in-place republish can resume them.
+
+        Distinct from cancel (which DROPS a submission): abort keeps it alive and
+        resumable on the fresh weights. Runs where the sampler handle is reachable --
+        on a Ray proxy the driver instance has no sampler attribute, so the decorated
+        dispatch is what carries the call to the worker that holds one.
+        """
+        abort = getattr(getattr(self, 'sampler', None), 'abort_all_inflight', None)
+        if not callable(abort):
+            raise RuntimeError('abort-on-publish needs a sampler with abort_all_inflight (twinkle '
+                               'PartialRolloutMixin): the core vLLM/SGLang samplers provide it.')
+        return abort()
+
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
+    def close(self) -> None:
+        """Release the sandbox env pool; the sampler's lifecycle is not owned here."""
+        getattr(self, '_episode_futures', {}).clear()
+        if self.env_pool is not None:
+            self.env_pool.close()
+
     def _resolve_call(self, kwargs: Dict[str, Any], n: int) -> Dict[str, Any]:
         adapter_path = kwargs.get('adapter_path', self.adapter_path)
         # Left out entirely when unset, so a sampler without LoRA enabled sees the
@@ -499,6 +887,18 @@ class MultiTurnRollout(Rollout):
         return TurnLedger(self.template, label=label, max_tokens=self.max_trajectory_tokens)
 
     def _run_one(self, trajectory: Trajectory, index: int, ctx: Dict[str, Any]) -> Trajectory:
+        if self._per_episode_tools:
+            # A sandbox env holds one workspace: the trajectory drives alone with its
+            # tools bound to the env it leased; the lease blocks when the pool empties
+            # (the sandbox's own concurrency bound) and is held for the whole episode.
+            with self.env_pool.lease() as env:
+                scoped = dict(ctx)
+                scoped['tool_managers'] = [
+                    self._tool_manager_for(env, self.tool_plugins)] * len(ctx['tool_managers'])
+                return self._run_with_harness(trajectory, index, scoped)
+        return self._run_with_harness(trajectory, index, ctx)
+
+    def _run_with_harness(self, trajectory: Trajectory, index: int, ctx: Dict[str, Any]) -> Trajectory:
         # A harness from a pool is leased for the episode and returned after, so
         # its per-episode state (an agent's memory, say) never leaks into the
         # next one. Anything else is used as passed.

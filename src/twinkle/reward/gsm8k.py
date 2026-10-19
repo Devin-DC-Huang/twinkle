@@ -2,7 +2,7 @@ import re
 from typing import Any, Dict, List
 
 from twinkle.data_format import user_data_get
-from twinkle.reward.base import Reward
+from twinkle.reward.base import Reward, ground_truth, last_assistant_text
 
 
 def _extract_last_boxed(text: str) -> str:
@@ -84,9 +84,11 @@ class GSM8KAccuracyReward(Reward):
 class MathVerifyAccuracyReward(Reward):
     """Use the same math-verify parsing and equivalence check as AReaL."""
 
-    def __init__(self, *, precision: int = 6, try_extract_without_anchor: bool = True):
+    def __init__(self, *, precision: int = 6, try_extract_without_anchor: bool = True,
+                 ground_truth_key: str = 'ground_truth'):
         self.precision = precision
         self.try_extract_without_anchor = try_extract_without_anchor
+        self.ground_truth_key = ground_truth_key
 
     def __call__(self, trajectories: List[Dict[str, Any]], **kwargs) -> List[float]:
         from math_verify.grader import verify
@@ -104,12 +106,13 @@ class MathVerifyAccuracyReward(Reward):
                 if message.get('role') == 'assistant':
                     completion = str(message.get('content', ''))
                     break
-            ground_truth = str(user_data_get(trajectory.get('user_data'), 'ground_truth', ''))
+            gold = ground_truth(trajectory, self.ground_truth_key)
+            gold = '' if gold is None else str(gold)
             try:
                 # Disable signal-based timeouts because rollout rewards run on
                 # the sampler's background event-loop thread.
                 gold = parse(
-                    ground_truth,
+                    gold,
                     extraction_config=extraction_config,
                     parsing_timeout=None,
                 )
