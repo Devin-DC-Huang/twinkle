@@ -1,11 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Serializable identities and states. Ray handles never enter these records."""
+"""Serializable training identities and states shared by controller and model layers."""
 from __future__ import annotations
 
 from pydantic import BaseModel, Field
 from typing import Any, Literal
 
-from twinkle.server.state.models import ModelRecord
+from .models import ModelRecord
 
 TrainingState = Literal['PENDING', 'ACTIVE', 'CLOSING', 'RELEASED', 'EXPIRED', 'FAILED', 'CANCELLED']
 InstanceState = Literal['ALLOCATING', 'STARTING', 'READY', 'RESETTING', 'DRAINING', 'STOPPED', 'QUARANTINED']

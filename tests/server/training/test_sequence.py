@@ -30,7 +30,7 @@ async def state(request):
 
 @pytest.mark.asyncio
 async def test_expired_retry_receipts_cannot_execute_old_sequences_again(state, monkeypatch):
-    backend = state.backend
+    backend = state._backend
     now = time.time()
     monkeypatch.setattr('twinkle.server.state.server_state.time.time', lambda: now)
     assert await state.claim_training_seq('training', 'native::session::step', 1, 'first', 10) is None
@@ -58,13 +58,13 @@ async def test_out_of_order_sequences_and_preflight_release_remain_retryable(sta
 @pytest.mark.asyncio
 async def test_retiring_a_handle_removes_native_and_tinker_stream_ledgers(state):
     from tests.server.training.test_controller import create, setup
-    controller, state, _, _ = await setup(backend=state.backend)
+    controller, state, _, _ = await setup(backend=state._backend)
     try:
         identity = await create(controller, state, 'dedup-retirement')
         for stream in ('native::session::step', 'tinker::optim_step'):
             await state.claim_training_seq(identity, stream, 1, stream, 10)
-        assert len(await state.backend.keys(f'seq_ledger::{identity}::*')) == 2
+        assert len(await state._backend.keys(f'seq_ledger::{identity}::*')) == 2
         await controller.release(identity, 'owner', 'session')
-        assert await state.backend.keys(f'seq_ledger::{identity}::*') == []
+        assert await state._backend.keys(f'seq_ledger::{identity}::*') == []
     finally:
         await controller.shutdown()

@@ -11,9 +11,9 @@ from twinkle.server.exceptions import RequestRejectedError, ResourceNotFoundErro
 from twinkle.server.state import ServerState
 from twinkle.server.state.backend.memory_backend import RayActorBackend
 from twinkle.server.training.controller import TrainingController
-from twinkle.server.training.errors import CapacityUnavailableError, TrainingExpiredError
-from twinkle.server.training.records import CreateTraining
-from twinkle.server.training.store import TrainingStore
+from twinkle.server.training.errors import TrainingExpiredError
+from twinkle.server.resources.allocation import CapacityUnavailableError
+from twinkle.server.state.training_records import CreateTraining
 
 
 class Clock:
@@ -37,7 +37,7 @@ class Runtime:
         self.fail_start = False
         self.fail_shutdown = False
 
-    async def start(self, instance, spec):
+    async def allocate(self, instance, spec):
         self.starts += 1
         if self.fail_start:
             raise RuntimeError('injected startup failure')
@@ -45,8 +45,10 @@ class Runtime:
         if used + spec.config.num_devices > self.devices:
             raise CapacityUnavailableError('No devices available')
         self.allocations[instance.instance_id] = spec.config.num_devices
-        await self.start_gate.wait()
         return {}
+
+    async def deploy(self, instance, spec):
+        await self.start_gate.wait()
 
     async def create_training(self, instance, training, request):
         assert instance.instance_id in self.allocations
@@ -252,7 +254,7 @@ async def setup(*, devices=16, min_replicas=0, max_replicas=None, quota=100, bac
     state = ServerState(backend=backend or RayActorBackend(), per_token_model_limit=quota)
     await state.create_session({'session_id': 'session'})
     runtime, clock = Runtime(devices), Clock()
-    controller = TrainingController(config, TrainingStore(state, 'unit'), runtime, clock=clock)
+    controller = TrainingController(config, state.create_training_store('unit'), runtime, clock=clock)
     await controller.initialize()
     return controller, state, runtime, clock
 
@@ -453,7 +455,7 @@ async def test_managed_records_are_not_deleted_by_generic_training_ttl():
 async def test_restart_invalidates_handles_and_cleans_old_allocation():
     controller, state, runtime, clock = await setup()
     identity = await create(controller, state, 1)
-    replacement = TrainingController(controller.config, TrainingStore(state, 'unit'), runtime, clock=clock)
+    replacement = TrainingController(controller.config, state.create_training_store('unit'), runtime, clock=clock)
     await replacement.initialize()
     assert replacement.epoch != controller.epoch
     assert not runtime.allocations and not runtime.users
@@ -527,7 +529,7 @@ async def test_restart_fails_pending_operations_and_fences_old_controller():
     identity = await create(controller, state, 1)
     await controller.admit(identity, 'owner', 'session', 'queued')
     await controller.store.future('queued', 'queued', identity)
-    replacement = TrainingController(controller.config, TrainingStore(state, 'unit'), runtime, clock=clock)
+    replacement = TrainingController(controller.config, state.create_training_store('unit'), runtime, clock=clock)
     await replacement.initialize()
     assert (await state.get_future('queued'))['failure']['reason_code'] == 'orphaned_replica'
     with pytest.raises(ResourceNotFoundError, match='epoch'):
@@ -604,12 +606,12 @@ async def test_dirty_resident_is_rebuilt_after_last_user_leaves():
 async def test_late_startup_result_cannot_publish_success(late_phase):
     controller, state, runtime, clock = await setup()
     if late_phase == 'runtime':
-        original = runtime.start
+        original = runtime.deploy
         async def late(instance, spec):
             result = await original(instance, spec)
             clock.now = instance.startup_deadline + 1
             return result
-        runtime.start = late
+        runtime.deploy = late
     else:
         original = runtime.create_training
         async def late(instance, training, request):
@@ -629,7 +631,7 @@ async def test_failed_resident_startup_rolls_back_previously_loaded_residents():
     controller, state, runtime, clock = await setup(devices=2)
     raw = controller.config.model_dump()
     raw['models'][0]['modes']['lora']['min_replicas'] = 2
-    replacement = TrainingController(TrainingConfig.model_validate(raw), TrainingStore(state, 'unit'), runtime, clock=clock)
+    replacement = TrainingController(TrainingConfig.model_validate(raw), state.create_training_store('unit'), runtime, clock=clock)
     with pytest.raises(CapacityUnavailableError):
         await replacement.initialize()
     assert not replacement._ready and not runtime.allocations

@@ -1,5 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Single-node device allocation. Only the owner removes placement groups."""
+"""Single-node device allocation; only the resource owner removes placement groups."""
 from __future__ import annotations
 
 import asyncio
@@ -7,8 +7,11 @@ from dataclasses import dataclass
 
 from twinkle import Platform
 from twinkle.infra._ray.resource_manager import _gpu_placement_group_cpus
-from .catalog import TrainingSpec
-from .errors import CapacityUnavailableError
+from twinkle.server.exceptions import RequestRejectedError
+
+
+class CapacityUnavailableError(RequestRejectedError):
+    error_code = 409
 
 
 @dataclass(frozen=True)
@@ -39,15 +42,17 @@ class DevicePool:
         self.shutdown_timeout = shutdown_timeout
 
     def name(self, epoch: str, instance_id: str) -> str:
-        return f'training-{self.namespace}-{epoch}-{instance_id}'
+        return f'resources-{self.namespace}-{epoch}-{instance_id}'
 
-    async def allocate(self, spec: TrainingSpec, epoch: str, instance_id: str) -> DeviceAllocation:
+    async def allocate(self, num_devices: int, device_type: str, epoch: str, instance_id: str) -> DeviceAllocation:
         import ray
         from ray.util.placement_group import placement_group
         from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
-        resource = 'CPU' if spec.model.device_type == 'cpu' else Platform.get_platform(spec.model.device_type).__name__
-        count = spec.config.num_devices
+        if type(num_devices) is not int or num_devices <= 0:
+            raise ValueError('num_devices must be a positive integer')
+        resource = 'CPU' if device_type == 'cpu' else Platform.get_platform(device_type).__name__
+        count = num_devices
         candidates = [node for node in ray.nodes() if node.get('Alive') and node['Resources'].get(resource, 0) >= count]
         available = ray.available_resources()
         if not candidates or available.get(resource, 0) < count:
@@ -64,7 +69,7 @@ class DevicePool:
             elif resource != 'CPU':
                 options['resources'] = {resource: count}
             node, devices = await asyncio.wait_for(
-                ray.remote(_probe_allocation).options(**options).remote(resource, spec.model.device_type),
+                ray.remote(_probe_allocation).options(**options).remote(resource, device_type),
                 self.shutdown_timeout)
             if resource == 'CPU':
                 devices = [str(index) for index in range(count)]

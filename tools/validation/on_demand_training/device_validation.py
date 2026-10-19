@@ -132,8 +132,10 @@ class Handle:
         if protocol == 'native':
             from peft import LoraConfig
             self.client = MultiLoraTransformersModel(alias, transport=self.transport)
-            self.client.add_adapter_to_model('same',
-                                             LoraConfig(r=8, target_modules='all-linear') if mode == 'lora' else None)
+            self.client.add_adapter_to_model(
+                'same',
+                LoraConfig(r=8, target_modules='all-linear') if mode == 'lora' else None,
+                gradient_accumulation_steps=2)
             self.identity = self.client._training_ids['same']
             self.client.set_loss('CrossEntropyLoss')
             self.client.set_optimizer('Adam', lr=self.rate)
@@ -179,8 +181,9 @@ class Handle:
 
     def step(self):
         if self.protocol == 'native':
-            self.client.forward_backward(self.inputs)
-            self.client.clip_grad_and_step()
+            for _ in range(2):
+                self.client.forward_backward(self.inputs, gradient_accumulation_steps=2)
+                self.client.clip_grad_and_step(gradient_accumulation_steps=2)
         else:
             from tinker import types
             self.client.forward_backward(self.datum(), 'cross_entropy').result()
@@ -196,6 +199,23 @@ class Handle:
 
 def active_instances(controller):
     return [row for row in ray.get(controller.diagnostics.remote())['instances'] if row['state'] != 'STOPPED']
+
+
+@pytest.fixture(autouse=True)
+def cleanup_failed_case(server):
+    from twinkle.server.state.models import FutureFailureRecord
+    _, controller, _, _ = server
+    yield
+    # Release this case's resources even when a numeric assertion fails, so later combinations start clean.
+    for instance in active_instances(controller):
+        ray.get(
+            controller.fail_instance.remote(
+                instance['instance_id'],
+                FutureFailureRecord(
+                    reason_code='orphaned_replica', attribution='server', message='Device test teardown')),
+            timeout=180)
+    assert not active_instances(controller)
+    assert ray.available_resources().get('GPU', 0) == 4
 
 
 @pytest.mark.parametrize('protocol', ['native', 'tinker'])
@@ -215,7 +235,9 @@ def test_dp_resource_lifecycle(server, protocol, mode):
     trained = first.evaluate()
     assert float(trained.mean()) > float(baseline.mean()) + 1e-4
     np.testing.assert_allclose(second.evaluate(), untouched, rtol=0, atol=2e-3)
-    second.step()
+    # A single LoRA update may be invisible in BF16 outputs, so both tenants use the same training window.
+    for _ in range(4):
+        second.step()
     peer_trained = second.evaluate()
     assert float(peer_trained.mean()) > float(untouched.mean()) + 1e-4
     np.testing.assert_allclose(first.evaluate(), trained, rtol=0, atol=2e-3)
@@ -236,7 +258,8 @@ def test_dp_resource_lifecycle(server, protocol, mode):
     assert len(active_instances(controller)) == 1
     assert ray.available_resources().get('GPU', 0) == 2
     np.testing.assert_allclose(second.evaluate(), peer_trained, rtol=0, atol=2e-3)
-    second.step()
+    for _ in range(4):
+        second.step()
     peer_continued = second.evaluate()
     assert float(peer_continued.mean()) > float(peer_trained.mean()) + 1e-4
     second.close()

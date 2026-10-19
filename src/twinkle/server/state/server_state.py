@@ -173,9 +173,25 @@ class ServerState:
     async def get_capacity_info(self) -> dict[str, int]:
         return await self._model_mgr.get_capacity_info()
 
-    @property
-    def backend(self) -> StateBackend:
-        return self._backend
+    def create_training_store(self, namespace: str):
+        from .training_store import TrainingStore
+        return TrainingStore(self, namespace, self._backend)
+
+    async def save_model_record(self, model_id: str, record: ModelRecord) -> None:
+        await self._model_mgr.save_record(model_id, record)
+
+    async def get_training_records(self, namespace: str):
+        return await self._model_mgr.get_training_records(namespace)
+
+    async def set_future_owner(self, request_id: str, token: str) -> None:
+        await self._backend.set(f'future_owner::{request_id}', token, ttl=max(1, int(self.expiration_timeout)))
+
+    async def delete_training_sequences(self, training_id: str) -> None:
+        for key in await self._backend.keys(f'seq_ledger::{training_id}::*'):
+            await self._backend.delete(key)
+
+    async def unregister_replica_capacity(self, replica_id: str) -> None:
+        await self._model_mgr.unregister_replica_capacity(replica_id)
 
     async def register_model_record(self, model_id: str, record: ModelRecord) -> None:
         """Reserve quota for a complete model record, including managed training state."""
@@ -223,6 +239,9 @@ class ServerState:
             Last heartbeat timestamp, or None if the session does not exist.
         """
         return await self._session_mgr.get_last_heartbeat(session_id)
+
+    async def get_session_last_heartbeats(self, session_ids: list[str]) -> dict[str, float | None]:
+        return await self._session_mgr.get_last_heartbeats(session_ids)
 
     # ----- Model Registration -----
 

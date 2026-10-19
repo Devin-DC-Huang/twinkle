@@ -6,9 +6,12 @@ import asyncio
 import os
 import re
 
-from twinkle.server.launcher.env_propagation import build_propagated_env_vars
-from .allocation import DevicePool
-from .records import InstanceRecord
+from twinkle.server.env_propagation import build_propagated_env_vars
+from twinkle.server.resources.allocation import DevicePool
+from twinkle.server.state.training_records import InstanceRecord
+from twinkle.utils.logger import get_logger
+
+logger = get_logger()
 
 
 class RayInstanceDriver:
@@ -16,25 +19,30 @@ class RayInstanceDriver:
     def __init__(self, config, store, namespace, controller_name):
         self.config, self.store = config, store
         self.namespace, self.controller_name = namespace, controller_name
+        self._cleanup_tasks: set[asyncio.Task] = set()
         self.pool = DevicePool(
             namespace, allocation_timeout=config.allocation_timeout_s, shutdown_timeout=config.shutdown_timeout_s)
 
     def application_name(self, instance):
         return self.pool.name(instance.controller_epoch, instance.instance_id)
 
-    async def start(self, instance, spec):
+    async def allocate(self, instance, spec):
+        allocation = await self.pool.allocate(spec.config.num_devices, spec.model.device_type,
+                                              instance.controller_epoch, instance.instance_id)
+        return {
+            'application_name': allocation.name,
+            'placement_group_id': allocation.placement_group_id,
+            'node_id': allocation.node_id,
+            'devices': list(allocation.devices)
+        }
+
+    async def deploy(self, instance, spec):
         from ray import serve
         from ray.util.placement_group import get_placement_group
 
         from twinkle.server.model.app import build_model_app
 
-        allocation = await self.pool.allocate(spec, instance.controller_epoch, instance.instance_id)
         name = self.application_name(instance)
-        # Persist ownership before the first worker can be constructed.
-        instance.application_name = name
-        instance.placement_group_id = allocation.placement_group_id
-        instance.node_id, instance.devices = allocation.node_id, list(allocation.devices)
-        await self.store.save_instance(instance)
         env = build_propagated_env_vars()
         env.update(spec.model.env_vars)
         for key in ('PYTHONPATH', 'TWINKLE_DEFAULT_SAVE_DIR', 'TMPDIR', 'OMP_NUM_THREADS'):
@@ -78,8 +86,8 @@ class RayInstanceDriver:
             queue_config=spec.config.queue_config,
             data_plane_url=spec.model.data_plane_url,
             training_context=context,
-            placement_group=get_placement_group(allocation.name),
-            allocation_devices=list(allocation.devices),
+            placement_group=get_placement_group(name),
+            allocation_devices=list(instance.devices),
             **kwargs)
         # Shield the actual thread so its late return can still be cleaned.
         deployment = asyncio.create_task(
@@ -96,14 +104,18 @@ class RayInstanceDriver:
                     pass
                 await self.shutdown(instance)
 
-            asyncio.create_task(clean_late())
+            task = asyncio.create_task(clean_late())
+            self._cleanup_tasks.add(task)
+
+            def done(completed):
+                self._cleanup_tasks.discard(completed)
+                if not completed.cancelled():
+                    exc = completed.exception()
+                    if exc is not None:
+                        logger.error('Late deployment cleanup failed', exc_info=(type(exc), exc, exc.__traceback__))
+
+            task.add_done_callback(done)
             raise
-        return {
-            'application_name': name,
-            'placement_group_id': allocation.placement_group_id,
-            'node_id': allocation.node_id,
-            'devices': list(allocation.devices)
-        }
 
     def handle(self, instance):
         from ray import serve
@@ -146,7 +158,7 @@ class RayInstanceDriver:
             except ray.exceptions.RayActorError:
                 continue
             raise RuntimeError('Owned worker death could not be confirmed')
-        await self.store.state.unregister_replica(instance.instance_id)
+        await self.store.state.unregister_replica_capacity(instance.instance_id)
 
     async def health(self, instance):
         return await asyncio.wait_for(self.handle(instance).runtime_identity.remote(), 5)
@@ -155,7 +167,7 @@ class RayInstanceDriver:
         """Ownership names survive loss of the memory state actor."""
         from ray import serve
         from ray.util.placement_group import placement_group_table
-        pattern = re.compile(r'training-' + re.escape(self.namespace)
+        pattern = re.compile(r'resources-' + re.escape(self.namespace)
                              + r'-(controller_[0-9a-f]{32})-(instance_[0-9a-f]{32})$')
         names = set(serve.status().applications)
         names.update(row.get('name', '') for row in placement_group_table().values() if row.get('state') != 'REMOVED')

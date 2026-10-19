@@ -77,6 +77,9 @@ instance/
 # Sphinx documentation
 docs/_build/
 
+# Internal design notes are local-only and must not be committed.
+/docs/design/
+
 # PyBuilder
 target/
 

@@ -17,9 +17,9 @@ from twinkle.server.exceptions import ResourceNotFoundError
 from twinkle.server.lifecycle.submit import backend_kwargs
 from twinkle.server.middleware.auth import get_session_id_from_request, get_token_from_request
 from twinkle.server.state.models import FutureFailureRecord
+from twinkle.server.state.training_records import CreateTraining, TrainingRecord
 from twinkle.server.utils import get_template_for_model
 from twinkle.utils.logger import get_logger
-from .records import CreateTraining, TrainingRecord
 
 _tinker_operation = ContextVar('managed_tinker_operation', default=None)
 logger = get_logger()
@@ -28,9 +28,6 @@ logger = get_logger()
 class ManagedTrainingRuntime:
 
     async def wait_for_training_workers(self):
-        # Constructing a remote_class returns actor handles before its worker
-        # constructors (including model loading) finish. Full creation otherwise
-        # performs no backend call to establish this readiness barrier.
         actors = getattr(self.model, '_actors', None) or []
         await asyncio.gather(*(actor.__ray_ready__.remote() for actor in actors))
 
@@ -69,7 +66,7 @@ class ManagedTrainingRuntime:
         training_id, seq_id = operation
         task_type = kwargs.get('task_type')
         stream = f'tinker::{task_type}'
-        request_id = 'req_' + uuid.uuid4().hex
+        request_id = kwargs.pop('request_id', None) or 'req_' + uuid.uuid4().hex
         retention = self.sequence_retention_s
         previous = await self.state.claim_training_seq(training_id, stream, seq_id, request_id, retention)
         if previous is not None:
@@ -93,7 +90,11 @@ class ManagedTrainingRuntime:
             renew=task.task_type not in ('get_info', 'get_train_configs'))
 
         async def enqueued():
-            await self._training_controller.commit_operation.remote(task.model_id, task.request_id, context['epoch'])
+            try:
+                await self._training_controller.commit_operation.remote(task.model_id, task.request_id,
+                                                                        context['epoch'])
+            except Exception:
+                logger.exception('Training enqueue notification failed for %s', task.request_id)
 
         async def finished(executed, unsafe):
             if unsafe:
@@ -109,8 +110,6 @@ class ManagedTrainingRuntime:
                     await self._training_controller.finish_operation.remote(
                         task.model_id, task.request_id, context['epoch'], executed=executed)
                 except Exception:
-                    # The terminal future and queue membership allow the controller
-                    # to reconcile a lost notification without stopping compute.
                     logger.exception('Training completion notification failed for %s', task.request_id)
 
         task.on_enqueued, task.on_finished = enqueued, finished
@@ -141,7 +140,8 @@ class ManagedTrainingRuntime:
             self.set_resource_state(adapter, 'grad_ready', False)
             if request.client_type == 'twinkle':
                 body = native.AddAdapterRequest.model_validate(request.payload)
-                config = deserialize_object(body.config)
+                # Dynamic imports (e.g. PEFT) and deserialization must not block the health-probe event loop.
+                config = await asyncio.to_thread(deserialize_object, body.config)
                 if not self.is_full_mode:
                     await self.call_backend(self.model.add_adapter_to_model, adapter, config, **backend_kwargs(body))
                 lora = None if config is None else RunLoraConfig(
@@ -152,14 +152,16 @@ class ManagedTrainingRuntime:
                     save_dir=body.save_dir,
                     user_metadata={'adapter_name': training.adapter_label})
             else:
-                from peft import LoraConfig
                 from tinker import types
                 run_config = types.CreateModelRequest.model_validate(request.payload)
                 if not self.is_full_mode:
+                    def build_lora_config():
+                        from peft import LoraConfig
+                        return LoraConfig(r=run_config.lora_config.rank, target_modules='all-linear')
+
+                    config = await asyncio.to_thread(build_lora_config)
                     await self.call_backend(
-                        self.model.add_adapter_to_model,
-                        adapter_name=adapter,
-                        config_or_dir=LoraConfig(r=run_config.lora_config.rank, target_modules='all-linear'))
+                        self.model.add_adapter_to_model, adapter_name=adapter, config_or_dir=config)
                 await self.call_backend(
                     self.model.set_template,
                     get_template_for_model(self.base_model),
@@ -167,7 +169,10 @@ class ManagedTrainingRuntime:
                     model_id=self.base_model)
                 await self.call_backend(self.model.set_processor, 'InputProcessor', adapter_name=backend_adapter)
                 await self.call_backend(self.model.set_optimizer, 'Adam', adapter_name=backend_adapter)
-            create_training_run_manager(training.token, client_type=request.client_type).save(adapter, run_config)
+            def save_training_metadata():
+                create_training_run_manager(training.token, client_type=request.client_type).save(adapter, run_config)
+
+            await asyncio.to_thread(save_training_metadata)
 
         await self._managed_serial(initialize, 'initialize_training')
 

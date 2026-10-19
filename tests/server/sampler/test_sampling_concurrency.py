@@ -21,7 +21,7 @@ from twinkle.server.sampler.concurrency import SamplerConcurrency
 from twinkle.server.sampler.tinker_handlers import _register_tinker_sampler_routes
 from twinkle.server.sampler.twinkle_handlers import _register_twinkle_sampler_routes
 from twinkle.server.task_queue.backend_gate import BackendGate
-from twinkle.server.task_queue.config import TaskQueueConfig
+from twinkle.server.config.task_queue import TaskQueueConfig
 from twinkle.server.task_queue.types import BackendBusyError
 from twinkle.server.task_queue.worker import ComputeWorker
 

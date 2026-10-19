@@ -65,10 +65,8 @@ class FutureFailureRecord(BaseModel):
 # in one place lets a consistency test catch a map that drifts out of coverage.
 FAILURE_REASON_CODES: frozenset[str] = frozenset({
     'capacity_unavailable',
-    'training_expired',
     'startup_failed',
     'startup_timeout',
-    'protocol_mismatch',
     'invalid_request',
     'request_rejected',
     'resource_not_found',

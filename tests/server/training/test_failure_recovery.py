@@ -1,0 +1,292 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
+"""Fault injection ensures persistence and notification failures do not leak resources."""
+import asyncio
+import logging
+from unittest.mock import AsyncMock
+
+import pytest
+
+from tests.server.state.fake_backend import FakeBackend
+from tests.server.training.test_controller import create, request, setup
+from tests.server.training.test_runtime_queue import RPC, RuntimeQueue, settle
+from twinkle.protocol.types.errors import ErrorCategory
+from twinkle.server.exceptions import ResourceExhaustedError, ResourceNotFoundError
+from twinkle.server.state.models import FAILURE_REASON_CODES, FutureFailureRecord
+
+
+async def wait_idle(queue):
+    worker = queue._compute_worker
+    for _ in range(100):
+        if not worker._request_ids and not worker.new_task_event.is_set():
+            await asyncio.sleep(0)
+            return
+        await asyncio.sleep(0.001)
+    raise AssertionError('Worker did not enter idle wait')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('fault', ['commit', 'queued_status'])
+async def test_warm_idle_worker_wakes_after_enqueue_failure(fault, monkeypatch):
+    controller, state, _, _ = await setup(backend=FakeBackend())
+    identity = await create(controller, state, 'queue-failure')
+    instance = controller.instances[controller.trainings[identity].instance_id]
+    queue = RuntimeQueue(controller, state, instance)
+    executed = []
+
+    async def operation():
+        executed.append(True)
+        return {'ok': True}
+
+    try:
+        warmup = await queue.schedule_task(operation, model_id=identity, token='owner', task_type='step')
+        await settle(state, warmup['request_id'])
+        await wait_idle(queue)
+        executed.clear()
+        if fault == 'commit':
+            async def broken(*args):
+                raise RuntimeError('injected commit failure')
+            queue._training_controller.commit_operation = RPC(broken)
+            ref = await queue.schedule_task(operation, model_id=identity, token='owner', task_type='step')
+        else:
+            previous = state.store_future_status
+
+            async def broken(request_id, status, *args, **kwargs):
+                if status == 'queued':
+                    raise RuntimeError('injected queued write failure')
+                return await previous(request_id, status, *args, **kwargs)
+
+            monkeypatch.setattr(state, 'store_future_status', broken)
+            with pytest.raises(RuntimeError, match='queued write'):
+                await queue.schedule_task(operation, model_id=identity, token='owner', task_type='step',
+                                          request_id='queued-failure')
+            ref = {'request_id': 'queued-failure'}
+        assert (await settle(state, ref['request_id']))['status'] == 'completed'
+        await wait_idle(queue)
+        assert executed == [True]
+        assert not controller.trainings[identity].pending_operation_ids
+        assert queue._compute_worker.total_queued() == 0
+    finally:
+        await queue.shutdown_task_queue()
+        await controller.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('fault,mode', [
+    ('retire', 'lora'), ('save_draining', 'full'), ('save_stopped', 'full'),
+    ('close_retire', 'full'), ('post_retire_save', 'lora')
+])
+async def test_cleanup_storage_failure_is_retryable(fault, mode, monkeypatch):
+    controller, state, runtime, _ = await setup(backend=FakeBackend())
+    identity = await create(controller, state, fault, mode=mode)
+    training = controller.trainings[identity]
+    instance = controller.instances[training.instance_id]
+    previous_retire = controller.store.retire
+    previous_save = controller.store.save_instance
+    failed = False
+
+    async def retire(record):
+        nonlocal failed
+        if fault in ('retire', 'close_retire') and not failed:
+            failed = True
+            raise RuntimeError('injected retirement failure')
+        return await previous_retire(record)
+
+    async def save(record):
+        nonlocal failed
+        matches = ((fault == 'save_draining' and record.state == 'DRAINING')
+                   or (fault == 'save_stopped' and record.state == 'STOPPED')
+                   or (fault == 'post_retire_save' and not record.training_ids))
+        if matches and not failed:
+            failed = True
+            raise RuntimeError('injected instance write failure')
+        return await previous_save(record)
+
+    monkeypatch.setattr(controller.store, 'retire', retire)
+    monkeypatch.setattr(controller.store, 'save_instance', save)
+    with pytest.raises(RuntimeError, match='injected'):
+        await controller.release(identity, 'owner', 'session')
+    assert failed
+    assert identity not in controller._cleaning
+    assert instance.instance_id not in controller._closing
+    assert training.state == 'CLOSING'
+    assert instance.state != 'STOPPED'
+    for _ in range(3):
+        await controller.sweep()
+        await controller.wait_for_jobs()
+        if training.state == 'RELEASED':
+            break
+    assert training.state == 'RELEASED'
+    assert not instance.training_ids
+    assert instance.state == 'STOPPED'
+    assert not runtime.allocations
+    assert await state.get_model_metadata(identity) is None
+    assert (await state._backend.get('token_count::owner') or 0) == 0
+    await controller.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_failure_transition_write_is_retried_and_admission_fenced(monkeypatch):
+    controller, state, runtime, _ = await setup(backend=FakeBackend())
+    identity = await create(controller, state, 'failure-transition')
+    training = controller.trainings[identity]
+    instance = controller.instances[training.instance_id]
+    await controller.admit(identity, 'owner', 'session', 'pending-op')
+    await controller.store.future('pending-op', 'pending', identity)
+    original = controller.store.save_instance
+    failed = False
+
+    async def save(record):
+        nonlocal failed
+        if record.state == 'DRAINING' and not failed:
+            failed = True
+            raise RuntimeError('injected draining write failure')
+        return await original(record)
+
+    monkeypatch.setattr(controller.store, 'save_instance', save)
+    failure = FutureFailureRecord(reason_code='orphaned_replica', attribution='server', message='Worker died')
+    with pytest.raises(RuntimeError, match='draining write'):
+        await controller.fail_instance(instance.instance_id, failure)
+    assert instance.state == 'READY'
+    with pytest.raises(ResourceNotFoundError):
+        await controller.route(identity, 'owner')
+    await controller.sweep()
+    await controller.wait_for_jobs()
+    assert instance.state == 'STOPPED' and training.state == 'FAILED'
+    assert not runtime.allocations and not training.pending_operation_ids
+    assert (await state.get_future('pending-op'))['failure']['reason_code'] == 'orphaned_replica'
+    assert not controller._failed_instances
+    await controller.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_failed_resident_is_excluded_when_rebuilding_minimum_replicas(monkeypatch):
+    controller, _, runtime, _ = await setup(backend=FakeBackend(), min_replicas=1)
+    failed_instance = next(iter(controller.instances.values()))
+    original = controller.store.save_instance
+    failed = False
+
+    async def save(record):
+        nonlocal failed
+        if record.state == 'DRAINING' and not failed:
+            failed = True
+            raise RuntimeError('injected draining write failure')
+        return await original(record)
+
+    monkeypatch.setattr(controller.store, 'save_instance', save)
+    failure = FutureFailureRecord(reason_code='orphaned_replica', attribution='server', message='Worker died')
+    with pytest.raises(RuntimeError, match='draining write'):
+        await controller.fail_instance(failed_instance.instance_id, failure)
+
+    assert failed_instance.state == 'READY'
+    assert failed_instance.instance_id in controller._failed_instances
+    await controller.sweep()
+    await controller.wait_for_jobs()
+
+    ready_residents = [
+        instance for instance in controller.instances.values() if instance.resident and instance.state == 'READY'
+    ]
+    assert failed_instance.state == 'STOPPED'
+    assert len(ready_residents) == 1
+    assert ready_residents[0].instance_id != failed_instance.instance_id
+    assert set(runtime.allocations) == {ready_residents[0].instance_id}
+    await controller.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_error_is_not_classified_as_startup_failure():
+    controller, state, runtime, _ = await setup(backend=FakeBackend())
+    identity = await create(controller, state, 'release-failure')
+    instance = controller.instances[controller.trainings[identity].instance_id]
+    runtime.release_training = AsyncMock(side_effect=TimeoutError('release timed out'))
+    await controller.release(identity, 'owner')
+    assert instance.failure == 'Training cleanup failed: release timed out'
+    assert controller.trainings[identity].terminal_reason == 'internal_error'
+    await controller.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_unready_service_is_503_server_and_reason_sets_have_no_dead_codes():
+    controller, _, _, _ = await setup(backend=FakeBackend())
+    controller._ready = False
+    with pytest.raises(ResourceExhaustedError) as error:
+        await controller.create(request('unready'))
+    assert error.value.error_code == 503 and error.value.category is ErrorCategory.Server
+    assert not {'protocol_mismatch', 'training_expired'} & FAILURE_REASON_CODES
+    await controller.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_spawn_logs_exception_with_traceback(caplog, monkeypatch):
+    # The ``twinkle`` logger disables propagation, so attach caplog to the controller logger directly.
+    target = logging.getLogger('twinkle.server.training.controller')
+    monkeypatch.setattr(target, 'handlers', [*target.handlers, caplog.handler])
+    controller, _, _, _ = await setup(backend=FakeBackend())
+
+    async def broken():
+        raise RuntimeError('background sentinel')
+
+    with caplog.at_level(logging.ERROR):
+        controller._spawn(broken())
+        await controller.wait_for_jobs()
+    records = [record for record in caplog.records if record.message == 'Training background job failed']
+    assert records and records[0].exc_info[1].args == ('background sentinel',)
+    assert not controller._jobs
+    await controller.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_sweep_heartbeat_io_does_not_hold_route_lock(monkeypatch):
+    controller, state, _, _ = await setup(backend=FakeBackend())
+    identity = await create(controller, state, 'slow-heartbeat')
+    entered, resume = asyncio.Event(), asyncio.Event()
+    original = state.get_session_last_heartbeats
+
+    async def slow(identities):
+        entered.set()
+        await resume.wait()
+        return await original(identities)
+
+    monkeypatch.setattr(state, 'get_session_last_heartbeats', slow)
+    sweeping = asyncio.create_task(controller.sweep())
+    try:
+        await entered.wait()
+        assert await asyncio.wait_for(controller.route(identity, 'owner'), 0.1)
+    finally:
+        resume.set()
+        await sweeping
+        await controller.wait_for_jobs()
+        await controller.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_explicit_tinker_request_id_is_preserved():
+    from twinkle.server.model.managed_runtime import _tinker_operation
+    controller, state, _, _ = await setup(backend=FakeBackend())
+    identity = await create(controller, state, 'explicit-id')
+    instance = controller.instances[controller.trainings[identity].instance_id]
+    queue = RuntimeQueue(controller, state, instance)
+    context = _tinker_operation.set((identity, 10))
+    try:
+        ref = await queue.schedule_task(AsyncMock(return_value='ok'), model_id=identity, token='owner',
+                                        task_type='step', request_id='explicit-id')
+        assert ref['request_id'] == 'explicit-id'
+        assert (await settle(state, 'explicit-id'))['status'] == 'completed'
+    finally:
+        _tinker_operation.reset(context)
+        await queue.shutdown_task_queue()
+        await controller.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_capacity_unregister_does_not_retire_managed_model():
+    controller, state, _, _ = await setup(backend=FakeBackend())
+    identity = await create(controller, state, 'capacity-only')
+    instance = controller.instances[controller.trainings[identity].instance_id]
+    await state.register_replica(instance.instance_id, 5)
+    await state.unregister_replica_capacity(instance.instance_id)
+    assert await state.get_model_metadata(identity) is not None
+    assert await state._backend.get('token_count::owner') == 1
+    await controller.release(identity, 'owner')
+    assert await state.get_model_metadata(identity) is None
+    assert await state._backend.get('token_count::owner') == 0
+    await controller.shutdown()

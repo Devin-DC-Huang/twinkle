@@ -16,6 +16,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Callable, Deque
 
 from twinkle.protocol.types.errors import ErrorCategory
+from twinkle.server.config.task_queue import TaskQueueConfig
 from twinkle.server.exceptions import (BatchSizeError, EndpointUnavailableError, FullModeBusyError,
                                        InputTokensExceededError, RateLimitExceededError, RequestRejectedError,
                                        ResourceExhaustedError, ResourceNotFoundError, ResourceQuotaExceededError,
@@ -25,7 +26,6 @@ from twinkle.server.state.models import FutureFailureRecord
 from twinkle.server.telemetry.correlation import MODEL_ID, TOKEN_ID
 from twinkle.server.telemetry.tracing import traced_operation
 from twinkle.utils.logger import get_logger
-from .config import TaskQueueConfig
 from .types import BACKEND_TIMEOUT_EXCEPTIONS, BackendBusyError, QueuedTask, QueueState, TaskStatus, UserTaskError
 
 if TYPE_CHECKING:

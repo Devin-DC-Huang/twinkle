@@ -30,10 +30,8 @@ logger = get_logger()
 # Keys must equal ``state.models.FAILURE_REASON_CODES`` (guarded by test_envelope).
 _TINKER_FAILURE_WIRE: dict[str, tuple[int, str]] = {
     'capacity_unavailable': (409, 'user'),
-    'training_expired': (404, 'user'),
     'startup_failed': (500, 'server'),
     'startup_timeout': (504, 'server'),
-    'protocol_mismatch': (400, 'user'),
     'invalid_request': (400, 'user'),
     'request_rejected': (400, 'user'),
     'resource_not_found': (404, 'user'),

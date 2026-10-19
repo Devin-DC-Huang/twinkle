@@ -8,9 +8,8 @@ from ray.cluster_utils import Cluster
 from ray.util.placement_group import placement_group, placement_group_table, remove_placement_group
 
 from twinkle.server.config.training import TrainingConfig
-from twinkle.server.training.allocation import DevicePool
+from twinkle.server.resources.allocation import CapacityUnavailableError, DevicePool
 from twinkle.server.training.catalog import TrainingCatalog
-from twinkle.server.training.errors import CapacityUnavailableError
 
 
 async def main():
@@ -44,7 +43,7 @@ async def main():
             await asyncio.wait_for(pg.ready(), 20)
         assert ray.available_resources()['GPU'] == 2
         try:
-            await pool.allocate(spec, 'epoch', 'fragmented')
+            await pool.allocate(spec.config.num_devices, spec.model.device_type, 'epoch', 'fragmented')
         except CapacityUnavailableError:
             pass
         else:
@@ -59,7 +58,7 @@ async def main():
             await asyncio.sleep(0.05)
         else:
             raise AssertionError('Owned GPU reservation was not released')
-        allocated = await pool.allocate(spec, 'epoch', 'available')
+        allocated = await pool.allocate(spec.config.num_devices, spec.model.device_type, 'epoch', 'available')
         assert len(set(allocated.devices)) == 2
         print(
             json.dumps({

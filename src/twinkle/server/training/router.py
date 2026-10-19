@@ -17,17 +17,16 @@ from twinkle.protocol.types import model as native
 from twinkle.server.checkpoint import _resolve_client_save_dir, create_checkpoint_manager, validate_user_path
 from twinkle.server.deployment import LazyCleanupMixin, bind_deployment, build_deployment_app
 from twinkle.server.exceptions import RequestRejectedError, ResourceNotFoundError
-from twinkle.server.gateway.proxy import ServiceProxy
 from twinkle.server.lifecycle.envelope import envelope_from_record
 from twinkle.server.middleware.auth import get_session_id_from_request, get_token_from_request
+from twinkle.server.service_proxy import ServiceProxy
 from twinkle.server.state import get_server_state
+from twinkle.server.state.training_records import CreateTraining
 from twinkle.server.task_queue import TaskQueueMixin
 from twinkle.server.validation import assert_request_supported
 from .actor import controller_name
 from .catalog import TrainingCatalog
 from .errors import ProtocolMismatchError
-from .records import CreateTraining
-from .store import TrainingStore
 
 NATIVE_REQUESTS = {
     'forward': native.ForwardRequest,
@@ -80,7 +79,7 @@ class TrainingRouter(TaskQueueMixin, LazyCleanupMixin):
         self.model = model
         self.backend = model.backend
         self.state = get_server_state()
-        self.store = TrainingStore(self.state, namespace)
+        self.store = self.state.create_training_store(namespace)
         self.controller = ray.get_actor(controller_name(namespace), namespace=namespace)
         self.proxy = ServiceProxy(http_options)
         self.replica_id = 'training-router_' + uuid.uuid4().hex

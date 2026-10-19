@@ -13,10 +13,10 @@ from typing import Any
 
 import twinkle.protocol.types as types
 from twinkle.server.deployment import LazyCleanupMixin, bind_deployment, build_deployment_app
+from twinkle.server.service_proxy import ServiceProxy
 from twinkle.server.state import get_server_state
 from twinkle.utils.logger import get_logger
 from .openai_handlers import _register_openai_routes
-from .proxy import ServiceProxy
 from .tinker_handlers import _register_gateway_tinker_routes
 from .twinkle_handlers import _register_gateway_twinkle_routes
 

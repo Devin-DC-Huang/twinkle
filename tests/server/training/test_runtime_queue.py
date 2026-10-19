@@ -6,8 +6,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from twinkle.server.task_queue import TaskQueueConfig, TaskQueueMixin
-from twinkle.server.training.runtime import ManagedTrainingRuntime, _tinker_operation
+from twinkle.server.config.task_queue import TaskQueueConfig
+from twinkle.server.task_queue import TaskQueueMixin
+from twinkle.server.model.managed_runtime import ManagedTrainingRuntime, _tinker_operation
 from tests.server.training.test_controller import create, setup
 
 

@@ -11,7 +11,6 @@ from tests.server.training.test_runtime_queue import settle
 from twinkle.hub import HubOperation
 from twinkle.server.state import ServerState
 from twinkle.server.training.router import TrainingRouter
-from twinkle.server.training.store import TrainingStore
 from twinkle.server.training.catalog import TrainingCatalog
 from twinkle.server.config.training import TrainingConfig
 
@@ -29,7 +28,7 @@ def http_request(body):
 async def test_upload_after_recycle_is_cpu_only_and_preserves_future_ownership(monkeypatch, tmp_path):
     router = TrainingRouter.__new__(TrainingRouter)
     router.state = ServerState(backend=FakeBackend())
-    router.store = TrainingStore(router.state, 'upload-test')
+    router.store = router.state.create_training_store('upload-test')
     router.replica_id = 'router'
     await router.state.register_replica(router.replica_id, 0)
     await router.state.touch_replica_last_seen(router.replica_id)
@@ -85,3 +84,18 @@ async def test_native_lora_admission_does_not_import_peft(monkeypatch, rank):
         with pytest.raises(RequestRejectedError, match='rank'):
             await router.native_request(request, 'add_adapter_to_model')
         router.controller.create.remote.assert_not_awaited()
+
+
+def test_router_schemas_match_model_runtime_routes():
+    from fastapi import FastAPI
+    from twinkle.server.model.tinker_handlers import _register_model_tinker_routes
+    from twinkle.server.model.twinkle_handlers import _register_model_twinkle_routes
+    from twinkle.server.training.router import NATIVE_REQUESTS, TINKER_REQUESTS
+
+    app = FastAPI()
+    _register_model_tinker_routes(app, lambda: None)
+    _register_model_twinkle_routes(app, lambda: None)
+    for protocol, schemas in [('twinkle', NATIVE_REQUESTS), ('tinker', TINKER_REQUESTS)]:
+        endpoints = {route.path.rsplit('/', 1)[-1] for route in app.routes
+                     if route.path.startswith(f'/{protocol}/') and 'POST' in route.methods}
+        assert endpoints == set(schemas)

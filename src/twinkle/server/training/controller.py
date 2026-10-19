@@ -12,19 +12,25 @@ from datetime import datetime
 from typing import Any, Protocol
 
 from twinkle.server.config.training import TrainingConfig
-from twinkle.server.exceptions import RequestRejectedError, ResourceNotFoundError, ResourceQuotaExceededError
+from twinkle.server.exceptions import (RequestRejectedError, ResourceExhaustedError, ResourceNotFoundError,
+                                       ResourceQuotaExceededError)
+from twinkle.server.resources.allocation import CapacityUnavailableError
 from twinkle.server.state.models import FutureFailureRecord
+from twinkle.server.state.training_records import (LIVE_INSTANCES, TERMINAL_TRAINING, CreateTraining, InstanceRecord,
+                                                   TrainingRecord)
+from twinkle.server.state.training_store import TrainingStore
 from .catalog import TrainingCatalog, TrainingSpec
-from .errors import CapacityUnavailableError, TrainingExpiredError
-from .records import LIVE_INSTANCES, TERMINAL_TRAINING, CreateTraining, InstanceRecord, TrainingRecord
-from .store import TrainingStore
+from .errors import TrainingExpiredError
 
 logger = logging.getLogger(__name__)
 
 
 class InstanceDriver(Protocol):
 
-    async def start(self, instance: InstanceRecord, spec: TrainingSpec) -> dict[str, Any]:
+    async def allocate(self, instance: InstanceRecord, spec: TrainingSpec) -> dict[str, Any]:
+        ...
+
+    async def deploy(self, instance: InstanceRecord, spec: TrainingSpec) -> None:
         ...
 
     async def create_training(self, instance: InstanceRecord, training: TrainingRecord,
@@ -83,6 +89,7 @@ class TrainingController:
         self._cleaning: set[str] = set()
         self._closing: set[str] = set()
         self._reconciling: set[str] = set()
+        self._failed_instances: dict[str, FutureFailureRecord] = {}
         self._lock = asyncio.Lock()
         self._ready = False
 
@@ -92,8 +99,11 @@ class TrainingController:
 
         def done(completed):
             self._jobs.discard(completed)
-            if not completed.cancelled():
-                completed.exception()
+            if completed.cancelled():
+                return
+            exc = completed.exception()
+            if exc is not None:
+                logger.error('Training background job failed', exc_info=(type(exc), exc, exc.__traceback__))
 
         task.add_done_callback(done)
         return task
@@ -145,8 +155,8 @@ class TrainingController:
 
     def residents_ready_for(self, spec: TrainingSpec) -> bool:
         return sum(
-            instance.resident and (instance.base_model, instance.mode) == spec.key and instance.state in ('READY',
-                                                                                                          'RESETTING')
+            instance.resident and instance.instance_id not in self._failed_instances and (
+                instance.base_model, instance.mode) == spec.key and instance.state in ('READY', 'RESETTING')
             for instance in self.instances.values()) >= spec.config.min_replicas
 
     async def register_runtime(self, instance_id: str, epoch: str, incarnation: str) -> None:
@@ -190,19 +200,33 @@ class TrainingController:
     async def _start_instance(self, instance: InstanceRecord) -> None:
         spec = self.catalog.get(instance.base_model, instance.mode)
         try:
-            details = await asyncio.wait_for(self.driver.start(instance, spec), self.config.startup_timeout_s)
+
+            async def startup():
+                details = await self.driver.allocate(instance, spec)
+                async with self._lock:
+                    await self._assert_epoch()
+                    if instance.state != 'ALLOCATING':
+                        raise RuntimeError('Instance became unavailable during allocation')
+                    for name in details:
+                        if name not in ('application_name', 'placement_group_id', 'node_id', 'devices'):
+                            raise ValueError(f'Unknown runtime allocation field: {name}')
+                    allocated = instance.model_copy(deep=True, update=details)
+                    await self.store.save_instance(allocated)
+                    for name, value in details.items():
+                        setattr(instance, name, value)
+                # Ownership is persisted before any worker is constructed; the driver does not write records.
+                await self.driver.deploy(instance.model_copy(deep=True), spec)
+
+            await asyncio.wait_for(startup(), self.config.startup_timeout_s)
             async with self._lock:
                 await self._assert_epoch()
                 if self.clock() >= instance.startup_deadline:
                     raise TimeoutError('Training runtime became ready after its startup deadline')
                 if instance.state not in ('ALLOCATING', 'STARTING'):
                     raise RuntimeError('Instance became unavailable during startup')
-                for name, value in details.items():
-                    if name not in ('application_name', 'placement_group_id', 'node_id', 'devices'):
-                        raise ValueError(f'Unknown runtime allocation field: {name}')
-                    setattr(instance, name, value)
+                ready = instance.model_copy(update={'state': 'READY'})
+                await self.store.save_instance(ready)
                 instance.state = 'READY'
-                await self.store.save_instance(instance)
         except Exception as exc:
             await self.fail_instance(instance.instance_id, failure_for(exc))
             raise
@@ -210,8 +234,8 @@ class TrainingController:
     def _select(self, spec: TrainingSpec) -> InstanceRecord | None:
         candidates = [
             instance for instance in self.instances.values()
-            if (instance.base_model, instance.mode) == spec.key and instance.state in (
-                'READY', 'ALLOCATING', 'STARTING') and len(instance.training_ids) < spec.capacity
+            if instance.instance_id not in self._failed_instances and (instance.base_model, instance.mode) == spec.key
+            and instance.state in ('READY', 'ALLOCATING', 'STARTING') and len(instance.training_ids) < spec.capacity
         ]
         return min(
             candidates,
@@ -225,7 +249,7 @@ class TrainingController:
         async with self._lock:
             await self._assert_epoch()
             if not self._ready:
-                raise RequestRejectedError('Training service is not ready')
+                raise ResourceExhaustedError('Training service is not ready')
             previous = await self.store.get_create(identity)
             if previous is not None:
                 if previous['fingerprint'] != fingerprint:
@@ -338,9 +362,12 @@ class TrainingController:
                 await self._cleanup_user(training)
 
     async def _expired(self, training: TrainingRecord) -> bool:
+        heartbeat = await self.store.state.get_session_last_heartbeat(training.session_id)
+        return self._expired_with_heartbeat(training, heartbeat)
+
+    def _expired_with_heartbeat(self, training: TrainingRecord, heartbeat: float | None) -> bool:
         spec = self.catalog.get(training.base_model, training.mode)
         config, legacy = spec.config, spec.model.legacy_expiration
-        heartbeat = await self.store.state.get_session_last_heartbeat(training.session_id)
         if heartbeat is None:
             return True
         if legacy is not None:
@@ -361,7 +388,7 @@ class TrainingController:
             raise ResourceNotFoundError('Unknown training handle')
         if training.state == 'EXPIRED':
             raise TrainingExpiredError('Training handle expired; create a new handle and explicitly load a checkpoint.')
-        if training.state != 'ACTIVE':
+        if training.state != 'ACTIVE' or training.instance_id in self._failed_instances:
             raise ResourceNotFoundError('Training handle is no longer active')
         if await self.store.state.get_session_last_heartbeat(training.session_id) is None:
             raise TrainingExpiredError('Training session expired; create a new training handle')
@@ -463,60 +490,82 @@ class TrainingController:
 
     async def _cleanup_user(self, training: TrainingRecord) -> None:
         instance = self.instances[training.instance_id]
-        # Each training must have exactly one cleanup, including concurrent finish callbacks.
-        async with self._lock:
-            if (instance.state not in ('READY', 'RESETTING') or training.state != 'CLOSING'
-                    or training.pending_operation_ids or training.training_id in self._cleaning):
-                return
-            self._cleaning.add(training.training_id)
-            resetting = instance.resident and instance.mode == 'full' and not instance.dirty
-            if resetting:
-                instance.state = 'RESETTING'
-                await self.store.save_instance(instance)
-            closing_full = instance.mode == 'full' and (not instance.resident or instance.dirty)
-            if closing_full:
-                instance.state = 'DRAINING'
-                await self.store.save_instance(instance)
-        if closing_full:
-            await self._close_instance(instance)
-            self._cleaning.discard(training.training_id)
-            return
+        claimed = False
+        resetting = False
+        closing_full = False
         try:
-            spec = self.catalog.get(training.base_model, training.mode)
-            await asyncio.wait_for(
-                self.driver.release_training(instance, training),
-                spec.config.queue_config.absolute_future_ttl(spec.config.num_devices))
-        except Exception as exc:
-            # A timed-out create/cleanup RPC does not prove that shared workers failed.
-            # Keep this slot reserved until serial cleanup can be confirmed.
-            if instance.mode == 'lora' and any(
-                    self.trainings[identity].state in ('ACTIVE',
-                                                       'PENDING') or self.trainings[identity].pending_operation_ids
-                    for identity in instance.training_ids if identity != training.training_id):
-                logger.warning('Training cleanup remains pending for %s: %s', training.training_id, exc)
-            else:
-                await self.fail_instance(instance.instance_id, failure_for(exc))
-            self._cleaning.discard(training.training_id)
-            return
-        async with self._lock:
-            training.state = {
-                'expired': 'EXPIRED',
-                'released': 'RELEASED',
-                'cancelled': 'CANCELLED'
-            }.get(training.terminal_reason, 'FAILED')
-            training.terminal_at = time.time()
-            await self.store.retire(training)
-            self._cleaning.discard(training.training_id)
-            if training.training_id in instance.training_ids:
-                instance.training_ids.remove(training.training_id)
-            close = not instance.training_ids and (not instance.resident or instance.dirty)
+            # Each training must have exactly one cleanup, including concurrent finish callbacks.
+            async with self._lock:
+                if (instance.state not in ('READY', 'RESETTING') or training.state != 'CLOSING'
+                        or training.pending_operation_ids or training.training_id in self._cleaning):
+                    return
+                self._cleaning.add(training.training_id)
+                claimed = True
+                resetting = instance.resident and instance.mode == 'full' and not instance.dirty
+                closing_full = instance.mode == 'full' and (not instance.resident or instance.dirty)
+                if resetting:
+                    updated_instance = instance.model_copy(update={'state': 'RESETTING'})
+                    await self.store.save_instance(updated_instance)
+                    instance.state = 'RESETTING'
+                if closing_full:
+                    updated_instance = instance.model_copy(update={'state': 'DRAINING'})
+                    await self.store.save_instance(updated_instance)
+                    instance.state = 'DRAINING'
+            if closing_full:
+                await self._close_instance(instance)
+                return
+            try:
+                spec = self.catalog.get(training.base_model, training.mode)
+                await asyncio.wait_for(
+                    self.driver.release_training(instance, training),
+                    spec.config.queue_config.absolute_future_ttl(spec.config.num_devices))
+            except Exception as exc:
+                # A timed-out create/cleanup RPC does not prove that shared workers failed.
+                # Keep this slot reserved until serial cleanup can be confirmed.
+                if instance.mode == 'lora' and any(
+                        self.trainings[identity].state in ('ACTIVE',
+                                                           'PENDING') or self.trainings[identity].pending_operation_ids
+                        for identity in instance.training_ids if identity != training.training_id):
+                    logger.warning('Training cleanup remains pending for %s: %s', training.training_id, exc)
+                else:
+                    await self.fail_instance(
+                        instance.instance_id,
+                        FutureFailureRecord(
+                            reason_code='internal_error',
+                            attribution='server',
+                            message=f'Training cleanup failed: {exc}'[:1024],
+                            diagnostic=traceback.format_exc()))
+                return
+            async with self._lock:
+                terminal = training.model_copy(
+                    deep=True,
+                    update={
+                        'state': {
+                            'expired': 'EXPIRED',
+                            'released': 'RELEASED',
+                            'cancelled': 'CANCELLED'
+                        }.get(training.terminal_reason, 'FAILED'),
+                        'terminal_at': time.time()
+                    })
+                await self.store.retire(terminal)
+                remaining = [identity for identity in instance.training_ids if identity != training.training_id]
+                close = not remaining and (not instance.resident or instance.dirty)
+                updated_instance = instance.model_copy(
+                    deep=True,
+                    update={
+                        'training_ids': remaining,
+                        'state': 'DRAINING' if close else ('READY' if resetting else instance.state)
+                    })
+                await self.store.save_instance(updated_instance)
+                training.state = terminal.state
+                training.terminal_at = terminal.terminal_at
+                instance.training_ids = remaining
+                instance.state = updated_instance.state
             if close:
-                instance.state = 'DRAINING'
-            elif resetting:
-                instance.state = 'READY'
-            await self.store.save_instance(instance)
-        if close:
-            await self._close_instance(instance)
+                await self._close_instance(instance)
+        finally:
+            if claimed:
+                self._cleaning.discard(training.training_id)
 
     async def _close_instance(self, instance: InstanceRecord) -> None:
         if instance.instance_id in self._closing:
@@ -527,60 +576,105 @@ class TrainingController:
                 await asyncio.wait_for(self.driver.shutdown(instance), self.config.shutdown_timeout_s)
             except Exception as exc:
                 async with self._lock:
+                    quarantined = instance.model_copy(update={'state': 'QUARANTINED', 'failure': str(exc)})
+                    await self.store.save_instance(quarantined)
                     instance.state = 'QUARANTINED'
                     instance.failure = str(exc)
-                    await self.store.save_instance(instance)
                 return
             async with self._lock:
-                instance.state = 'STOPPED'
-                instance.stopped_at = time.time()
-                await self.store.save_instance(instance)
+                terminal_records = []
+                terminal_at = time.time()
+                failure = self._failed_instances.get(instance.instance_id)
                 for training_id in list(instance.training_ids):
                     training = self.trainings[training_id]
+                    if failure is not None:
+                        for request_id in (training.create_request_id, *training.pending_operation_ids):
+                            await self.store.future(request_id, 'failed', training_id, failure=failure)
+                    terminal = training.model_copy(
+                        deep=True,
+                        update={
+                            'pending_operation_ids': {},
+                            'state': {
+                                'expired': 'EXPIRED',
+                                'released': 'RELEASED',
+                                'cancelled': 'CANCELLED'
+                            }.get(training.terminal_reason, 'FAILED'),
+                            'terminal_at': terminal_at
+                        })
+                    await self.store.retire(terminal)
+                    terminal_records.append((training, terminal))
+                stopped = instance.model_copy(
+                    deep=True, update={
+                        'state': 'STOPPED',
+                        'stopped_at': terminal_at,
+                        'training_ids': []
+                    })
+                await self.store.save_instance(stopped)
+                for training, terminal in terminal_records:
                     training.pending_operation_ids.clear()
-                    training.state = {
-                        'expired': 'EXPIRED',
-                        'released': 'RELEASED',
-                        'cancelled': 'CANCELLED'
-                    }.get(training.terminal_reason, 'FAILED')
-                    training.terminal_at = time.time()
-                    await self.store.retire(training)
+                    training.state = terminal.state
+                    training.terminal_at = terminal.terminal_at
+                instance.state = 'STOPPED'
+                instance.stopped_at = terminal_at
                 instance.training_ids.clear()
-                await self.store.save_instance(instance)
+                self._failed_instances.pop(instance.instance_id, None)
         finally:
             self._closing.discard(instance.instance_id)
 
     async def fail_instance(self, instance_id: str, failure: FutureFailureRecord) -> None:
         async with self._lock:
             instance = self.instances[instance_id]
-            if instance.state in ('DRAINING', 'STOPPED', 'QUARANTINED'):
+            if instance.state == 'STOPPED':
+                self._failed_instances.pop(instance_id, None)
                 return
-            instance.state = 'DRAINING'
-            instance.failure = failure.message
-            await self.store.save_instance(instance)
-            for training_id in instance.training_ids:
-                training = self.trainings[training_id]
-                training.state = 'CLOSING'
-                training.terminal_reason = failure.reason_code
-                for request_id in (training.create_request_id, *training.pending_operation_ids):
-                    await self.store.future(request_id, 'failed', training_id, failure=failure)
-                await self.store.save_training(training)
-        startup = self._startup.get(instance_id)
-        if startup is not None and startup is not asyncio.current_task() and not startup.done():
-            startup.cancel()
-            await asyncio.gather(startup, return_exceptions=True)
-        await self._close_instance(instance)
+            # Record the retry intent without promoting unpersisted state; block new routing.
+            self._failed_instances[instance_id] = failure
+            if instance.state not in ('DRAINING', 'QUARANTINED'):
+                draining = instance.model_copy(update={'state': 'DRAINING', 'failure': failure.message})
+                await self.store.save_instance(draining)
+                instance.state = 'DRAINING'
+                instance.failure = failure.message
+        try:
+            async with self._lock:
+                for training_id in instance.training_ids:
+                    training = self.trainings[training_id]
+                    closing = training.model_copy(
+                        deep=True, update={
+                            'state': 'CLOSING',
+                            'terminal_reason': failure.reason_code
+                        })
+                    await self.store.save_training(closing)
+                    training.state = 'CLOSING'
+                    training.terminal_reason = failure.reason_code
+                    for request_id in (training.create_request_id, *training.pending_operation_ids):
+                        await self.store.future(request_id, 'failed', training_id, failure=failure)
+            startup = self._startup.get(instance_id)
+            if startup is not None and startup is not asyncio.current_task() and not startup.done():
+                startup.cancel()
+                await asyncio.gather(startup, return_exceptions=True)
+        finally:
+            # Once DRAINING is durable, shutdown must be attempted even if a
+            # later training/future write fails. Sweep will retry if this fails.
+            await self._close_instance(instance)
 
     async def sweep(self) -> None:
+        # Batch I/O outside the decision lock; re-verify state after re-acquiring, ignore handles added since snapshot.
+        session_ids = list({
+            training.session_id
+            for training in self.trainings.values() if training.state == 'ACTIVE' and not training.pending_operation_ids
+        })
+        heartbeats = await self.store.state.get_session_last_heartbeats(session_ids)
         async with self._lock:
             await self._assert_epoch()
             for training in self.trainings.values():
-                if training.state != 'ACTIVE' or training.pending_operation_ids:
+                if (training.state != 'ACTIVE' or training.pending_operation_ids
+                        or training.session_id not in heartbeats):
                     continue
-                if await self._expired(training):
+                if self._expired_with_heartbeat(training, heartbeats[training.session_id]):
+                    closing_record = training.model_copy(update={'state': 'CLOSING', 'terminal_reason': 'expired'})
+                    await self.store.save_training(closing_record)
                     training.state = 'CLOSING'
                     training.terminal_reason = 'expired'
-                    await self.store.save_training(training)
             uncertain = [(training, request_id) for training in self.trainings.values()
                          for request_id, ticket in training.pending_operation_ids.items()
                          if request_id not in self._reconciling and self.clock()
@@ -595,13 +689,16 @@ class TrainingController:
         for training, request_id in uncertain:
             self._spawn(self._reconcile_operation(training, request_id))
         for instance in list(self.instances.values()):
-            if instance.state == 'QUARANTINED':
+            failure = self._failed_instances.get(instance.instance_id)
+            if failure is not None:
+                self._spawn(self.fail_instance(instance.instance_id, failure))
+            elif instance.state in ('DRAINING', 'QUARANTINED'):
                 self._spawn(self._close_instance(instance))
         # Rebuilding one specification must not stop expiry or other models.
         for spec in self.catalog.specs():
             residents = sum(
-                instance.resident and (instance.base_model,
-                                       instance.mode) == spec.key and instance.state in LIVE_INSTANCES
+                instance.resident and instance.instance_id not in self._failed_instances and (
+                    instance.base_model, instance.mode) == spec.key and instance.state in LIVE_INSTANCES
                 for instance in self.instances.values())
             for _ in range(spec.config.min_replicas - residents):
                 async with self._lock:

@@ -9,19 +9,19 @@ from __future__ import annotations
 
 import asyncio
 from fastapi import FastAPI, Request
-from ray import serve
 from typing import Any
 
 from twinkle import DeviceGroup
 from twinkle.server.config.backend_dispatch import BackendSelector
+from twinkle.server.config.task_queue import TaskQueueConfig
 from twinkle.server.deployment import bind_deployment, build_deployment_app
 from twinkle.server.runtime import init_twinkle_runtime
 from twinkle.server.session_resource import AdapterManagerMixin
 from twinkle.server.state import ServerState, get_server_state
-from twinkle.server.task_queue import TaskQueueConfig, TaskQueueMixin
-from twinkle.server.training.runtime import ManagedTrainingRuntime
+from twinkle.server.task_queue import TaskQueueMixin
 from twinkle.server.utils import wrap_builder_with_device_group_env
 from twinkle.utils.logger import get_logger
+from .managed_runtime import ManagedTrainingRuntime
 from .tinker_handlers import _register_model_tinker_routes
 from .twinkle_handlers import _register_model_twinkle_routes
 
@@ -86,7 +86,7 @@ class ModelManagement(ManagedTrainingRuntime, TaskQueueMixin, AdapterManagerMixi
     - Base model and multiple LoRA adapters (multi-user)
     - Tinker training operations via /tinker/* endpoints (async/polling)
     - Twinkle training operations via /twinkle/* endpoints (synchronous)
-    - Adapter lifecycle via AdapterManagerMixin
+    - AdapterManagerMixin provides local registration only; expiry is handled by the training controller.
     - Per-user rate limiting via TaskQueueMixin
     """
 
@@ -96,7 +96,6 @@ class ModelManagement(ManagedTrainingRuntime, TaskQueueMixin, AdapterManagerMixi
                        device_group: dict[str, Any],
                        device_mesh: dict[str, Any],
                        backend: str,
-                       adapter_config: dict[str, Any] | None = None,
                        queue_config: TaskQueueConfig | None = None,
                        data_plane_url: str | None = None,
                        **kwargs):
@@ -148,7 +147,7 @@ class ModelManagement(ManagedTrainingRuntime, TaskQueueMixin, AdapterManagerMixi
             collect_width=len(actors) if actors else 1,
         )
         self.model._ray_get_timeout = self.task_queue_config.effective_execution_timeout
-        self._init_adapter_manager(**(adapter_config or {}))
+        self._init_adapter_manager()
         await self._register_replica_on_startup()
 
     @property
@@ -226,7 +225,6 @@ def build_model_app(model_id: str,
                     device_mesh: dict[str, Any],
                     deploy_options: dict[str, Any],
                     backend: str,
-                    adapter_config: dict[str, Any] | None = None,
                     queue_config: TaskQueueConfig | None = None,
                     data_plane_url: str | None = None,
                     **kwargs):
@@ -243,7 +241,6 @@ def build_model_app(model_id: str,
         backend: Model backend selector — ``mock`` | ``transformers`` | ``megatron``.
             Validated up front; bad values raise :class:`ConfigError` before
             any side effect.
-        adapter_config: Adapter lifecycle config (timeout, per-token limits)
         queue_config: Task queue configuration (rate limiting, etc.)
         **kwargs: Additional model initialization arguments
 
@@ -272,8 +269,7 @@ def build_model_app(model_id: str,
         ModelManagement,
         deploy_options,
         deployment_name='ModelManagement',
-        bind_args=(model_id, nproc_per_node, device_group, device_mesh, backend, adapter_config, queue_config,
-                   data_plane_url),
+        bind_args=(model_id, nproc_per_node, device_group, device_mesh, backend, queue_config, data_plane_url),
         bind_kwargs=kwargs,
     )
 

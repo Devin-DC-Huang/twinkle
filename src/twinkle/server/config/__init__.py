@@ -5,6 +5,7 @@ from .application_spec import (ApplicationSpec, DataPlaneArgs, HttpOptions, Mode
                                ServerArgs, SpectralHybridArgs)
 from .persistence import PersistenceConfig
 from .server_config import ServerConfig
+from .task_queue import TaskQueueConfig
 from .telemetry import TelemetryConfig
 
 __all__ = [
@@ -18,5 +19,6 @@ __all__ = [
     'ServerArgs',
     'SpectralHybridArgs',
     'ServerConfig',
+    'TaskQueueConfig',
     'TelemetryConfig',
 ]

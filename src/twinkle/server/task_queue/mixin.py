@@ -15,6 +15,7 @@ from collections.abc import Callable, Coroutine
 from typing import TYPE_CHECKING, Any
 
 from twinkle.protocol.types.lifecycle import TERMINAL_STATUSES, TaskEnvelope
+from twinkle.server.config.task_queue import TaskQueueConfig
 from twinkle.server.exceptions import BatchSizeError, ConfigError, InputTokensExceededError, RateLimitExceededError
 from twinkle.server.lifecycle.envelope import envelope_from_record
 from twinkle.server.lifecycle.poll_config import long_poll_window
@@ -22,7 +23,6 @@ from twinkle.server.state.models import FutureFailureRecord
 from twinkle.server.telemetry.metrics import get_task_metrics
 from twinkle.utils.logger import get_logger
 from .backend_gate import BackendGate
-from .config import TaskQueueConfig
 from .rate_limiter import RateLimiter
 from .types import QueuedTask, QueueState, TaskStatus
 from .worker import ComputeWorker
@@ -273,19 +273,22 @@ class TaskQueueMixin:
         q = self._compute_worker.get_queue(queue_key)
         self._compute_worker.track_task(request_id)
         await q.put(task)
-        if task.on_enqueued is not None:
-            await task.on_enqueued()
-        await self.state.store_future_status(
-            request_id,
-            TaskStatus.QUEUED.value,
-            model_id,
-            queue_state=QueueState.ACTIVE.value,
-        )
-        logger.info(f'[TaskQueue] Task {request_id} queued, type={task.task_type or "unknown"}, '
-                    f'model_id={model_id}, queue_key={queue_key}, '
-                    f'queue_depth={q.qsize()}, input_tokens={task.input_tokens}')
-
-        self._compute_worker.notify_new_task()
+        try:
+            if task.on_enqueued is not None:
+                await task.on_enqueued()
+            await self.state.store_future_status(
+                request_id,
+                TaskStatus.QUEUED.value,
+                model_id,
+                queue_state=QueueState.ACTIVE.value,
+            )
+            logger.info(f'[TaskQueue] Task {request_id} queued, type={task.task_type or "unknown"}, '
+                        f'model_id={model_id}, queue_key={queue_key}, '
+                        f'queue_depth={q.qsize()}, input_tokens={task.input_tokens}')
+        finally:
+            # Once q.put succeeds the sleeping worker must always be woken, even
+            # if an acknowledgement or status write fails afterwards.
+            self._compute_worker.notify_new_task()
 
     async def schedule_task(
         self,

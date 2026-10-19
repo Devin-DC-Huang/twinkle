@@ -9,11 +9,10 @@ import time
 from twinkle.server.config.training import TrainingConfig
 from twinkle.server.state import get_server_state
 from twinkle.server.state.models import FutureFailureRecord
+from twinkle.server.state.training_records import CreateTraining
 from twinkle.utils.logger import get_logger
 from .controller import TrainingController
 from .driver import RayInstanceDriver
-from .records import CreateTraining
-from .store import TrainingStore
 
 logger = get_logger()
 
@@ -28,7 +27,7 @@ class TrainingControllerActor:
     def __init__(self, config, namespace):
         self.config = TrainingConfig.model_validate(config)
         self.namespace = namespace
-        self.store = TrainingStore(get_server_state(), namespace)
+        self.store = get_server_state().create_training_store(namespace)
         self.driver = RayInstanceDriver(self.config, self.store, namespace, controller_name(namespace))
         self.core = TrainingController(self.config, self.store, self.driver)
         self._monitors = []
@@ -39,8 +38,18 @@ class TrainingControllerActor:
         await asyncio.shield(self._initialization)
 
     async def _initialize(self):
-        await self.core.initialize()
+        try:
+            await self.core.initialize()
+        except Exception:
+            logger.exception('Training controller initialization failed; restart is deferred')
+            # First-time startup is rolled back by the launcher; auto-restart waits before retrying.
+            self._restart_task = asyncio.create_task(self._restart_after_failure())
+            raise
         self._monitors = [asyncio.create_task(self._heartbeat()), asyncio.create_task(self._sweep())]
+
+    async def _restart_after_failure(self):
+        await asyncio.sleep(max(5.0, self.config.sweep_interval_s))
+        ray.kill(ray.get_actor(controller_name(self.namespace), namespace=self.namespace), no_restart=False)
 
     async def _heartbeat(self):
         while True:
@@ -150,6 +159,10 @@ class TrainingControllerActor:
         }
 
     async def shutdown(self):
+        restart = getattr(self, '_restart_task', None)
+        if restart is not None:
+            restart.cancel()
+            await asyncio.gather(restart, return_exceptions=True)
         for task in self._monitors:
             task.cancel()
         await asyncio.gather(*self._monitors, return_exceptions=True)

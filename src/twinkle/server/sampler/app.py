@@ -13,11 +13,11 @@ from typing import Any
 
 from twinkle import DeviceGroup
 from twinkle.server.config.backend_dispatch import BackendSelector
+from twinkle.server.config.task_queue import TaskQueueConfig
 from twinkle.server.deployment import LazyCleanupMixin, bind_deployment, build_deployment_app
 from twinkle.server.middleware.auth import get_token_from_request
 from twinkle.server.runtime import init_twinkle_runtime
 from twinkle.server.state import ServerState, get_server_state
-from twinkle.server.task_queue.config import TaskQueueConfig
 from twinkle.server.task_queue.mixin import TaskQueueMixin
 from twinkle.server.utils import get_template_for_model, wrap_builder_with_device_group_env
 from twinkle.utils.logger import get_logger

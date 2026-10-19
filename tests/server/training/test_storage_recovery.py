@@ -8,7 +8,6 @@ import pytest
 from twinkle.server.state.backend.memory_backend import RayActorBackend
 from twinkle.server.state.backend.redis_backend import RedisBackend
 from twinkle.server.training.controller import TrainingController
-from twinkle.server.training.store import TrainingStore
 from tests.server.training.test_controller import create, request, setup
 
 
@@ -25,7 +24,7 @@ async def test_pending_operation_recovery_preserves_creation_identity_and_quota(
         original = await controller.create(request('retry'))
         await controller.admit(identity, 'owner', 'session', 'queued')
         await controller.store.future('queued', 'queued', identity)
-        replacement = TrainingController(controller.config, TrainingStore(state, 'unit'), runtime, clock=clock)
+        replacement = TrainingController(controller.config, state.create_training_store('unit'), runtime, clock=clock)
         await replacement.initialize()
         assert (await state.get_future('queued'))['failure']['reason_code'] == 'orphaned_replica'
         assert await replacement.create(request('retry')) == original

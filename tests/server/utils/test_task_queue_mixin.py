@@ -2,7 +2,7 @@ import asyncio
 import pytest
 import pytest_asyncio
 
-from twinkle.server.task_queue.config import TaskQueueConfig
+from twinkle.server.config.task_queue import TaskQueueConfig
 from twinkle.server.task_queue.mixin import TaskQueueMixin
 from twinkle.server.task_queue.types import UserTaskError
 from twinkle.server.task_queue.worker import ComputeWorker

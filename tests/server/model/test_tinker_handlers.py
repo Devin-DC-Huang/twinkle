@@ -9,7 +9,7 @@ from twinkle.server.model.app import ModelManagement
 from twinkle.server.model.tinker_handlers import _register_model_tinker_routes
 from twinkle.server.deployment import twinkle_server_error_handler
 from twinkle.server.exceptions import BatchSizeError, TwinkleServerError
-from twinkle.server.task_queue.config import TaskQueueConfig
+from twinkle.server.config.task_queue import TaskQueueConfig
 from twinkle.server.task_queue.mixin import TaskQueueMixin
 
 

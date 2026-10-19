@@ -117,6 +117,22 @@ class ModelManager(BaseManager[ModelRecord]):
             await self.remove(model_id)
         await self._replicas.unregister(replica_id)
 
+    async def unregister_replica_capacity(self, replica_id: str) -> None:
+        """Remove capacity and heartbeat only; model records are retired by the owning lifecycle controller."""
+        await self._replicas.unregister(replica_id)
+
+    async def save_record(self, model_id: str, record: ModelRecord) -> None:
+        # Update without re-applying quota; cannot reuse add().
+        await self._backend.set(self._make_key(model_id), record.model_dump())
+
+    async def get_training_records(self, namespace: str):
+        from .training_records import TrainingRecord
+        keys = await self._backend.keys('model::*')
+        return [
+            TrainingRecord.model_validate(value) for value in await self._backend.mget(keys) if isinstance(value, dict)
+            and value.get('controller_epoch') and value.get('training_namespace') == namespace
+        ]
+
     async def touch_replica_last_seen(self, replica_id: str) -> None:
         """Refresh a replica's liveness timestamp."""
         await self._replicas.touch_last_seen(replica_id)

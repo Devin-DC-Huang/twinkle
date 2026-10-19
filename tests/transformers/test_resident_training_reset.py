@@ -37,3 +37,16 @@ def test_resident_reset_removes_previous_templates_forward_hook():
             assert model(torch.ones(1, 1)).item() == 1
             assert model.weight.grad is None
             assert len(model._forward_pre_hooks) == 1
+
+
+def test_blank_model_still_resets_training_state():
+    wrapper = object.__new__(TransformersModel)
+    wrapper.model_id = ''
+    wrapper._model_wrapped = False
+    previous = SimpleNamespace(template=None, _handler=None, optimizer=object())
+    fresh = SimpleNamespace(template=None, _handler=None, optimizer=None)
+    wrapper.optimizer_group = {'': previous}
+    object.__setattr__(wrapper, '_construct_default_optimizer_group', lambda: fresh)
+    wrapper.reload_initial_weights(reset_training_state=True)
+    assert wrapper.optimizer_group == {'': fresh}
+    assert wrapper.active_group == '' and fresh.adapter_name == ''

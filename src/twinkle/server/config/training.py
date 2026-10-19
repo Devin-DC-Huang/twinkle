@@ -5,8 +5,8 @@ from __future__ import annotations
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing import Literal
 
-from twinkle.server.task_queue.config import TaskQueueConfig
 from .hybrid import SpectralHybridArgs
+from .task_queue import TaskQueueConfig
 
 
 class _TrainingConfig(BaseModel):

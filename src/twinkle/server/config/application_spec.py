@@ -15,8 +15,8 @@ import os
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing import Any, Literal
 
-from twinkle.server.task_queue.config import TaskQueueConfig
 from .hybrid import SpectralHybridArgs
+from .task_queue import TaskQueueConfig
 from .training import TrainingModes
 
 # Env var keys the launcher sets from the gateway ``server_config`` so that any

@@ -8,9 +8,8 @@ import uuid
 from twinkle import DeviceGroup
 from twinkle.infra._ray.resource_manager import ResourceManager
 from twinkle.server.config.training import TrainingConfig
-from twinkle.server.training.allocation import DevicePool
+from twinkle.server.resources.allocation import CapacityUnavailableError, DevicePool
 from twinkle.server.training.catalog import TrainingCatalog
-from twinkle.server.training.errors import CapacityUnavailableError
 
 
 async def main():
@@ -36,14 +35,14 @@ async def main():
                 },
             }])
             spec = TrainingCatalog(config).get(str(index), 'full')
-            allocation = await pool.allocate(spec, 'epoch', str(index))
+            allocation = await pool.allocate(spec.config.num_devices, spec.model.device_type, 'epoch', str(index))
             allocations.append(allocation)
         devices = [device for allocation in allocations for device in allocation.devices]
         assert len(set(devices)) == 8, devices
         assert len({allocation.node_id for allocation in allocations}) == 1
         assert ray.available_resources().get('GPU', 0) == 0
         try:
-            await pool.allocate(spec, 'epoch', 'overflow')
+            await pool.allocate(spec.config.num_devices, spec.model.device_type, 'epoch', 'overflow')
             raise AssertionError('over-allocation was admitted')
         except CapacityUnavailableError:
             pass
@@ -72,7 +71,7 @@ async def main():
                     }
                 },
             }])).get('replacement', 'full')
-        replacement = await pool.allocate(two, 'epoch', 'replacement')
+        replacement = await pool.allocate(two.config.num_devices, two.model.device_type, 'epoch', 'replacement')
         allocations.append(replacement)
         assert set(replacement.devices) == set(freed.devices)
         print(json.dumps({'passed': True, 'devices': devices, 'reused': list(replacement.devices)}))
