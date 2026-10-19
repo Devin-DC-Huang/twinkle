@@ -56,6 +56,12 @@ class HttpOptions(BaseModel):
     ssl_keyfile: str | None = None
     ssl_certfile: str | None = None
 
+    @model_validator(mode='after')
+    def _ssl_pair_set_together(self) -> 'HttpOptions':
+        if (self.ssl_keyfile is None) != (self.ssl_certfile is None):
+            raise ValueError('ssl_keyfile and ssl_certfile must be set together to serve HTTPS')
+        return self
+
 
 # ---------- per-deployment args schemas ------------------------------------ #
 
@@ -209,10 +215,11 @@ class ServerArgs(_ArgsBase):
     """Args for the gateway ``server`` deployment.
 
     ``api_key``, when set, makes the gateway require ``Authorization: Bearer
-    <key>`` on the OpenAI-compatible generation endpoints (chat/completions,
-    completions, embeddings, infer); the health/models endpoints stay open so
-    load balancers can probe them. ``owned_by`` is the ``owned_by`` field the
-    ``/models`` listing reports for every served model.
+    <key>`` on every route (the OpenAI-compatible generation endpoints, the
+    tinker training endpoints and the /twinkle task surface alike); only the
+    liveness probes (/health, /ping, /twinkle/healthz*) and /models stay open
+    so load balancers can do their job. ``owned_by`` is the ``owned_by``
+    field the ``/models`` listing reports for every served model.
     """
 
     server_config: ServerStateArgs = Field(default_factory=ServerStateArgs)

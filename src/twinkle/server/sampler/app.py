@@ -61,9 +61,10 @@ def _make_sglang_async_sampler(kw: dict[str, Any]) -> Any:
 
 
 def _make_torch_sampler(kw: dict[str, Any]) -> Any:
-    from twinkle.sampler import TorchSampler  # type: ignore[attr-defined]
+    """Construct the HF transformers engine sampler (the ``torch`` sampler_type)."""
+    from twinkle.sampler import TransformersSampler
 
-    return TorchSampler(**kw)
+    return TransformersSampler(**kw)
 
 
 # Single validate-then-dispatch selector for the sampler backend.
@@ -149,9 +150,12 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
         if template and hasattr(self.sampler, 'set_template'):
             template_kwargs = dict(template)
             template_cls = template_kwargs.pop('template_cls', None)
-            if template_cls is not None:
-                await self.call_backend(self.sampler.set_template, template_cls, **template_kwargs)
-                self._template_pinned = True
+            if template_cls is None:
+                raise ValueError(
+                    "template must carry a 'template_cls' key naming the template class; got keys: "
+                    f'{sorted(template_kwargs) or "none"}')
+            await self.call_backend(self.sampler.set_template, template_cls, **template_kwargs)
+            self._template_pinned = True
 
         self.state: ServerState = get_server_state()
         from twinkle.server.data_plane import DataPlaneProxy
@@ -167,7 +171,7 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
         # backend result so a timed-out request cannot release live weights.
         self.sampler._ray_get_timeout = None
         self.sampling_guard = SamplerConcurrency()
-        if sampler_type != 'mock':
+        if sampler_type != 'mock' and not self._template_pinned:
             await self.call_backend(self.sampler.set_template, get_template_for_model(model_id), model_id=model_id)
 
     async def shutdown(self) -> None:

@@ -65,6 +65,20 @@ class SampleResponseModelList(ResponseModel):
     samples: list[SampleResponseModel] = Field(..., description='List of sample responses')
 
 
+class EncodeRequest(StrictRequest):
+    """Request body for the ``/encode`` pooling endpoint.
+
+    The pooling counterpart of :class:`SampleRequest`: the same wire-validated ``inputs``
+    surface (Trajectory or InputFeature entries), with a ``pooling_params`` block in place
+    of sampling parameters.
+    """
+
+    inputs: WireInputBatch = Field(..., description='Trajectory or InputFeature entries to run the pooling forward on')
+    pooling_params: dict[str, JsonValue] | None = Field(
+        None, description='Pooling parameters (task, dimensions, etc.)')
+    adapter_name: str = Field('', description='Adapter name for LoRA inference')
+
+
 class SamplerSetTemplateRequest(StrictRequest):
     """Request body for the sampler ``/set_template`` endpoint."""
     template_cls: str = Field(..., description="Template class name (e.g. 'Template')")

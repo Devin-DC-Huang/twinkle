@@ -15,7 +15,7 @@ import twinkle.protocol.types as types
 from twinkle.server.deployment import LazyCleanupMixin, bind_deployment, build_deployment_app
 from twinkle.server.state import get_server_state
 from twinkle.utils.logger import get_logger
-from .openai_handlers import _register_openai_routes
+from .openai_handlers import _register_api_key_gate, _register_openai_routes
 from .proxy import ServiceProxy
 from .tinker_handlers import _register_gateway_tinker_routes
 from .twinkle_handlers import _register_gateway_twinkle_routes
@@ -135,6 +135,8 @@ def build_gateway_app(deploy_options: dict[str, Any],
         _register_gateway_tinker_routes(app, get_self)
         _register_gateway_twinkle_routes(app, get_self)
         _register_openai_routes(app, get_self)
+        # Registered last so the api_key gate wraps everything installed before it.
+        _register_api_key_gate(app, get_self)
 
     async def _on_shutdown(servable: Any) -> None:
         await servable.proxy.close()
