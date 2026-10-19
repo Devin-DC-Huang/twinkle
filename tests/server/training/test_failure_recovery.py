@@ -193,6 +193,35 @@ async def test_failed_resident_is_excluded_when_rebuilding_minimum_replicas(monk
 
 
 @pytest.mark.asyncio
+async def test_shutdown_waits_for_an_in_flight_instance_close():
+    controller, _, runtime, _ = await setup(backend=FakeBackend(), min_replicas=1)
+    instance = next(iter(controller.instances.values()))
+    original_shutdown = runtime.shutdown
+    entered, resume = asyncio.Event(), asyncio.Event()
+
+    async def slow_shutdown(target):
+        entered.set()
+        await resume.wait()
+        await original_shutdown(target)
+
+    runtime.shutdown = slow_shutdown
+    closing = asyncio.create_task(controller._close_instance(instance))
+    await entered.wait()
+    shutdown = asyncio.create_task(controller.shutdown())
+    for _ in range(100):
+        if instance.state == 'DRAINING' or shutdown.done():
+            break
+        await asyncio.sleep(0)
+
+    assert instance.state == 'DRAINING'
+    assert not shutdown.done()
+    resume.set()
+    await asyncio.gather(closing, shutdown)
+    assert instance.state == 'STOPPED'
+    assert instance.instance_id not in controller._closing
+
+
+@pytest.mark.asyncio
 async def test_cleanup_error_is_not_classified_as_startup_failure():
     controller, state, runtime, _ = await setup(backend=FakeBackend())
     identity = await create(controller, state, 'release-failure')

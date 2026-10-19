@@ -87,7 +87,7 @@ class TrainingController:
         self._startup: dict[str, asyncio.Task] = {}
         self._jobs: set[asyncio.Task] = set()
         self._cleaning: set[str] = set()
-        self._closing: set[str] = set()
+        self._closing: dict[str, asyncio.Task] = {}
         self._reconciling: set[str] = set()
         self._failed_instances: dict[str, FutureFailureRecord] = {}
         self._lock = asyncio.Lock()
@@ -568,58 +568,65 @@ class TrainingController:
                 self._cleaning.discard(training.training_id)
 
     async def _close_instance(self, instance: InstanceRecord) -> None:
-        if instance.instance_id in self._closing:
-            return
-        self._closing.add(instance.instance_id)
+        close_task = self._closing.get(instance.instance_id)
+        if close_task is None:
+            close_task = self._spawn(self._close_instance_once(instance))
+            self._closing[instance.instance_id] = close_task
+
+            def clear(completed: asyncio.Task) -> None:
+                if self._closing.get(instance.instance_id) is completed:
+                    self._closing.pop(instance.instance_id, None)
+
+            close_task.add_done_callback(clear)
+        await asyncio.shield(close_task)
+
+    async def _close_instance_once(self, instance: InstanceRecord) -> None:
         try:
-            try:
-                await asyncio.wait_for(self.driver.shutdown(instance), self.config.shutdown_timeout_s)
-            except Exception as exc:
-                async with self._lock:
-                    quarantined = instance.model_copy(update={'state': 'QUARANTINED', 'failure': str(exc)})
-                    await self.store.save_instance(quarantined)
-                    instance.state = 'QUARANTINED'
-                    instance.failure = str(exc)
-                return
+            await asyncio.wait_for(self.driver.shutdown(instance), self.config.shutdown_timeout_s)
+        except Exception as exc:
             async with self._lock:
-                terminal_records = []
-                terminal_at = time.time()
-                failure = self._failed_instances.get(instance.instance_id)
-                for training_id in list(instance.training_ids):
-                    training = self.trainings[training_id]
-                    if failure is not None:
-                        for request_id in (training.create_request_id, *training.pending_operation_ids):
-                            await self.store.future(request_id, 'failed', training_id, failure=failure)
-                    terminal = training.model_copy(
-                        deep=True,
-                        update={
-                            'pending_operation_ids': {},
-                            'state': {
-                                'expired': 'EXPIRED',
-                                'released': 'RELEASED',
-                                'cancelled': 'CANCELLED'
-                            }.get(training.terminal_reason, 'FAILED'),
-                            'terminal_at': terminal_at
-                        })
-                    await self.store.retire(terminal)
-                    terminal_records.append((training, terminal))
-                stopped = instance.model_copy(
-                    deep=True, update={
-                        'state': 'STOPPED',
-                        'stopped_at': terminal_at,
-                        'training_ids': []
+                quarantined = instance.model_copy(update={'state': 'QUARANTINED', 'failure': str(exc)})
+                await self.store.save_instance(quarantined)
+                instance.state = 'QUARANTINED'
+                instance.failure = str(exc)
+            return
+        async with self._lock:
+            terminal_records = []
+            terminal_at = time.time()
+            failure = self._failed_instances.get(instance.instance_id)
+            for training_id in list(instance.training_ids):
+                training = self.trainings[training_id]
+                if failure is not None:
+                    for request_id in (training.create_request_id, *training.pending_operation_ids):
+                        await self.store.future(request_id, 'failed', training_id, failure=failure)
+                terminal = training.model_copy(
+                    deep=True,
+                    update={
+                        'pending_operation_ids': {},
+                        'state': {
+                            'expired': 'EXPIRED',
+                            'released': 'RELEASED',
+                            'cancelled': 'CANCELLED'
+                        }.get(training.terminal_reason, 'FAILED'),
+                        'terminal_at': terminal_at
                     })
-                await self.store.save_instance(stopped)
-                for training, terminal in terminal_records:
-                    training.pending_operation_ids.clear()
-                    training.state = terminal.state
-                    training.terminal_at = terminal.terminal_at
-                instance.state = 'STOPPED'
-                instance.stopped_at = terminal_at
-                instance.training_ids.clear()
-                self._failed_instances.pop(instance.instance_id, None)
-        finally:
-            self._closing.discard(instance.instance_id)
+                await self.store.retire(terminal)
+                terminal_records.append((training, terminal))
+            stopped = instance.model_copy(
+                deep=True, update={
+                    'state': 'STOPPED',
+                    'stopped_at': terminal_at,
+                    'training_ids': []
+                })
+            await self.store.save_instance(stopped)
+            for training, terminal in terminal_records:
+                training.pending_operation_ids.clear()
+                training.state = terminal.state
+                training.terminal_at = terminal.terminal_at
+            instance.state = 'STOPPED'
+            instance.stopped_at = terminal_at
+            instance.training_ids.clear()
+            self._failed_instances.pop(instance.instance_id, None)
 
     async def fail_instance(self, instance_id: str, failure: FutureFailureRecord) -> None:
         async with self._lock:
