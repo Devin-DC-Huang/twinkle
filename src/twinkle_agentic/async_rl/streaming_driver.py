@@ -88,12 +88,12 @@ exposing ``admit``/``poll``/``collect``/``cancel``, which default-binds them (an
   no baseline is written.
 * ``cancel(handle)``: drop an in-flight generation (budget hit, drain, or error).
 * ``score_worker`` (OPTIONAL collaborator, not a callable): when given, the kernel runs BOTH scoring
-  channels itself at the group barrier -- one ``score_group(samples)`` call whose sample-major rows are
-  written onto the samples (and timed into ``stats.score_time``), then one ``score_prm(samples)`` call
-  (per-token process rewards written onto ``sample.prm_process``) when the worker carries a PRM channel
-  and any algorithm hook needs it. The PRM pass runs only when a later consumer exists (``regenerate``
-  / ``baseline_fn`` / the deprecated ``group_complete``); a pure-ORM worker skips it. With none of those
-  hooks given, the barrier still scores the ORM channel alone.
+  channels itself at the group barrier -- ``score_group(samples)`` whose sample-major rows are written
+  onto the samples (and timed into ``stats.score_time``), or the single ``score_group_prm(samples)``
+  pass (rows plus the per-token process rewards written onto ``sample.prm_process``) when the worker
+  carries a wired PRM channel; that channel's consumer may be an algorithm hook (``regenerate`` /
+  ``baseline_fn`` / the deprecated ``group_complete``) or the training half reading
+  ``sample.prm_process`` downstream. A pure-ORM worker scores the ORM channel alone.
 * ``resource_adapter`` (OPTIONAL collaborator, not a callable): when given, its decision window is
   fed at every pull boundary (``observe``) and its scaling decision is produced and consumed
   inside the publish bracket (``decide`` + ``register_decision`` before the push, whose weight
@@ -1142,15 +1142,17 @@ class StreamingDriver:
         Intra-group barrier (never a batch barrier): fires when ``group_key`` has ``num_generations`` records
         in the ready buffer, at most once per group (``resolved_groups``), while every other group keeps
         streaming and overlapping. No-op when nothing is wired (the infer / PPO / blocking path). The
-        pipeline, in order: the ORM channel (``score_worker.score_group`` -> ``sample.orm_reward``), the
-        PRM channel (``score_worker.score_prm`` -> ``sample.prm_process``), the optional ``regenerate``
-        verdict, the optional ``baseline_fn`` write, or -- dev-compat only -- the deprecated
-        ``group_complete`` hook doing all three itself. Everything is timed into ``stats.score_time``
-        HERE, not inside any hook. On ``REGENERATE`` (or a ``True`` verdict) within the attempt cap the
-        group's records are dropped from the buffer and its prompt re-queued for admission under the
-        current policy version (the conservative staleness anchor); the group_key is reused so the
-        retried siblings are counted and barrier-checked as one group. A verdict past the cap is
-        accepted as-is, matching the fixed-batch dynamic-sampling fallback.
+        pipeline, in order: the scoring pass (``score_worker.score_group`` -> ``sample.orm_reward``, or
+        the merged ``score_group_prm`` -> both fields at once when a PRM channel is wired), the
+        optional ``regenerate`` verdict, then -- once the group is final (accepted, or a regeneration
+        verdict past the cap accepted as-is) -- the optional ``baseline_fn`` write, or -- dev-compat
+        only -- the deprecated ``group_complete`` hook doing all three itself. Everything is timed into
+        ``stats.score_time`` HERE, not inside any hook. On ``REGENERATE`` (or a ``True`` verdict)
+        within the attempt cap the group's records are dropped from the buffer and its prompt
+        re-queued for admission under the current policy version (the conservative staleness
+        anchor); the group_key is reused so the retried siblings are counted and barrier-checked
+        as one group. A verdict past the cap is accepted as-is, matching the fixed-batch
+        dynamic-sampling fallback.
         """
         if (self._group_complete is None and self._score_worker is None
                 and self._regenerate is None and self._baseline_fn is None):
@@ -1166,11 +1168,12 @@ class StreamingDriver:
         # pull, the assembled batch) reads them off the samples.
         if self._score_worker is not None:
             _t = time.perf_counter()
-            rows = self._score_worker.score_group(samples)
             if self._prm_ready:
-                prm_refs = self._score_worker.score_prm(samples)
+                rows, prm_refs = self._score_worker.score_group_prm(samples)
                 for sample, ref in zip(samples, prm_refs):
                     sample.prm_process = ref
+            else:
+                rows = self._score_worker.score_group(samples)
             self.stats.score_time += time.perf_counter() - _t
             for sample, row in zip(samples, rows):
                 sample.orm_reward = row
@@ -1179,12 +1182,6 @@ class StreamingDriver:
         else:
             if self._regenerate is not None and self._regenerate(group_key, samples):
                 decision = GroupDecision.REGENERATE
-            elif self._baseline_fn is not None:
-                baseline = self._baseline_fn(group_key, samples)
-                if baseline is not None:
-                    for sample in samples:
-                        sample.baseline = baseline
-                decision = GroupDecision.ACCEPT
             else:
                 decision = GroupDecision.ACCEPT
         if (decision == GroupDecision.REGENERATE
@@ -1196,6 +1193,14 @@ class StreamingDriver:
             resolved_groups.discard(group_key)
             regen_queue.append((group_prompt[group_key], group_key))
         else:
+            # The group is FINAL now (plainly accepted, or a REGENERATE verdict past the cap that
+            # is accepted as-is): a remax-style baseline must land on every kept sibling here, or
+            # this group would train with no baseline while its batch peers carry one.
+            if self._group_complete is None and self._baseline_fn is not None:
+                baseline = self._baseline_fn(group_key, samples)
+                if baseline is not None:
+                    for sample in samples:
+                        sample.baseline = baseline
             resolved_groups.add(group_key)
 
     def _consume_batch(self, records: List[BufferRecord]) -> Optional[int]:

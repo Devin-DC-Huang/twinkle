@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict, List, Optional, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from twinkle import remote_class, remote_function
 
@@ -49,6 +50,49 @@ def _score_rows(samples: Sequence[Any]) -> List[dict]:
     return rows
 
 
+def _run_grouped(tasks: Sequence[Tuple[Any, Callable[[], Any]]]) -> List[Any]:
+    """Run scoring tasks grouped by placement: groups overlap as threads, within a group serial.
+
+    A thread parked on its own actors' ray.get releases the GIL, so scorers on disjoint device
+    groups (each RM on its own cards, a judge on its own engine) overlap wall-clock; one group
+    stays strictly serial -- two forwards on the same cards would only race for memory. A single
+    group runs inline (the all-rules shape starts no pool) and the first exception propagates
+    unchanged.
+    """
+    groups: Dict[Any, List[int]] = {}
+    for index, (key, _task) in enumerate(tasks):
+        groups.setdefault(key, []).append(index)
+    results: List[Any] = [None] * len(tasks)
+    if len(groups) <= 1:
+        for index, (_key, task) in enumerate(tasks):
+            results[index] = task()
+        return results
+
+    def _run_group(indices: List[int]) -> None:
+        for index in indices:
+            results[index] = tasks[index][1]()
+
+    with ThreadPoolExecutor(max_workers=len(groups)) as pool:
+        futures = [pool.submit(_run_group, indices) for indices in groups.values()]
+        for future in futures:
+            future.result()
+    return results
+
+
+def _stash(value: Any) -> Any:
+    """Keep a heavy payload out of the caller when this worker runs remote: a ref, else the value.
+
+    The return-path mirror of ``_resolve``: inside a remote worker a per-token vector crosses the
+    boundary as an ObjectRef (Ray derefs it again when the consumer's next remote call carries it);
+    a local worker shares the caller's process, so the value itself is the cheaper hand-off.
+    """
+    if not os.environ.get('WORKER_NAME'):
+        return value
+    import ray
+
+    return ray.put(value)
+
+
 @remote_class(execute='first')
 class ScoreWorker:
     """Score rollout samples where the data lives: one remote boundary for the ORM channel.
@@ -56,7 +100,8 @@ class ScoreWorker:
     The driver (or the caller's group-completion hook) hands samples -- the payloads may be
     LazyCollect / ObjectRef refs under a remote rollout -- and this actor resolves them, rebuilds
     the scoring rows, runs every scorer (duck-typed: ``scorer(rows)`` for rules and twinkle
-    ``Reward`` classes, ``scorer.score`` for model handles), and returns the ``[N][n_scorers]``
+    ``Reward`` classes, ``scorer.score`` for model handles; scorers on disjoint device groups
+    overlap as threads, one group strictly serial), and returns the ``[N][n_scorers]``
     sample-major matrix with ``None`` for
     an unparseable verdict or a NaN, so the caller's nan-aware sums skip them. Subclasses add
     the algorithm-specific halves (advantage fusion, teacher reweighting) on the same actor.
@@ -95,9 +140,41 @@ class ScoreWorker:
         """
         resolved = [_resolve(sample) for sample in samples]
         rows = _score_rows(resolved)
-        matrix = [self._one_reward(scorer, rows) for scorer in self.orm_scorers]
+        matrix = _run_grouped([
+            (getattr(scorer, 'placement_key', None),
+             lambda scorer=scorer: self._one_reward(scorer, rows))
+            for scorer in self.orm_scorers])
         return [[None if value is None or value != value else float(value) for value in column]
                 for column in zip(*matrix)] if matrix else [[] for _ in samples]
+
+    @remote_function(dispatch='all', collect='first', lazy_collect=False)
+    def score_group_prm(self, samples: List[Any]) -> Tuple[List[List[Optional[float]]], List[Any]]:
+        """Both channels for one group in ONE pass: ``(the ORM matrix, per-sample process rewards)``.
+
+        Samples resolve and rows rebuild once, then each ORM scorer and each PRM sample's step
+        batch is a task keyed by its scorer's placement: the ORM channel's device groups overlap
+        the PRM channel's forwards, each group strictly serial. Each sample's per-token process
+        vector is stashed (:func:`_stash`) so the heavy payloads stay out of the caller; the
+        matrix is the same sample-major, ``None``-normalized form ``score_group`` returns.
+        """
+        if self.prm_step_scorer is None or not self.prm_scorers:
+            raise RuntimeError('score_group_prm was called without a wired PRM channel.')
+        resolved = [_resolve(sample) for sample in samples]
+        rows = _score_rows(resolved)
+        tasks = [(getattr(scorer, 'placement_key', None),
+                  lambda scorer=scorer: self._one_reward(scorer, rows))
+                 for scorer in self.orm_scorers]
+        prm_key = next((key for key in (getattr(scorer, 'placement_key', None)
+                                        for scorer in self.prm_scorers) if key is not None), None)
+        for sample, row in zip(resolved, rows):
+            columns = {key: value for key, value in row.items() if key != 'messages'}
+            tasks.append((prm_key, lambda sample=sample, columns=columns: self.prm_step_scorer(
+                sample, self.template.decode, self._weighted_step_score, columns=columns)))
+        results = _run_grouped(tasks)
+        matrix = results[:len(self.orm_scorers)]
+        rewards = ([[None if value is None or value != value else float(value) for value in column]
+                    for column in zip(*matrix)] if matrix else [[] for _ in samples])
+        return rewards, [_stash(value) for value in results[len(self.orm_scorers):]]
 
     def _weighted_step_score(self, step_rows: List[Dict[str, Any]]) -> List[float]:
         """One weighted process score per PRM step row (nan-aware: a judge miss never poisons it)."""
@@ -116,27 +193,6 @@ class ScoreWorker:
                 total += 0.0 if value is None else float(value) * weight
             rows.append(total)
         return rows
-
-    @remote_function(dispatch='all', collect='first', lazy_collect=True)
-    def score_prm(self, samples: List[Any]) -> List[Any]:
-        """Per-sample per-token process rewards for one group (heavy: stays a ref until consumed).
-
-        Each resolved sample is segmented by the ``prm_step_scorer`` plugin (its own step spans,
-        multi-turn context included -- it owns both); every step is scored in one batch through
-        the ``prm_scorers`` channel (same duck-typed view as ``score_group``) and broadcast onto
-        the response tokens by the plugin. The plugin signature is
-        ``prm_step_scorer(sample, decode, score_steps, columns) -> List[float]``.
-        """
-        if self.prm_step_scorer is None or not self.prm_scorers:
-            raise RuntimeError('score_prm was called without a wired PRM channel.')
-        process: List[Any] = []
-        for sample in samples:
-            resolved = _resolve(sample)
-            row = _score_rows([resolved])[0]
-            process.append(self.prm_step_scorer(
-                resolved, self.template.decode, self._weighted_step_score,
-                columns={key: value for key, value in row.items() if key != 'messages'}))
-        return process
 
     @remote_function(dispatch='all', collect='first', lazy_collect=False)
     def prm_ready(self) -> bool:
