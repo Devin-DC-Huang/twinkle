@@ -487,12 +487,13 @@ class StreamingDriver:
         if assembly_ready is None and pull_rule == 'prefix':
             assembly_ready = self._make_prefix_pull_rule(need_rows)
         # Two more defaulted collaborators, same duck-typed style as ``rollout``: ``score_worker``
-        # (protocol: ``score_group(samples) -> [N][n_scorers]`` rows) default-binds the group-barrier
-        # ORM scoring -- the kernel calls it the instant a group completes and writes the rows back
-        # onto the samples, so the algorithm's ``group_complete`` hook only decides (variance,
-        # baselines); ``resource_adapter`` (protocol: ``observe/decide/register_decision``) is fed at
-        # every pull boundary and inside the publish bracket BEFORE the push, so its scaling
-        # decision is produced and consumed in the same publication.
+        # (protocol: ``score_group(samples) -> [N][n_scorers]`` rows) default-binds the ORM scoring
+        # -- 'group' runs it at the group barrier, 'prefix' at the pull boundary on the whole batch,
+        # so a per-sample consumer batches instead of one round-trip per sample; ``resource_adapter``
+        # (protocol: ``observe/decide/register_decision``) is fed at every pull boundary and inside
+        # the publish bracket BEFORE the push, so its scaling decision is produced and consumed in
+        # the same publication.
+        self._pull_rule = pull_rule
         self._score_worker = score_worker
         if score_worker is not None and not callable(getattr(score_worker, 'score_group', None)):
             raise TypeError(f'StreamingDriver score_worker needs a score_group(samples) method, '
@@ -962,6 +963,21 @@ class StreamingDriver:
                 #     pulls only; the remainder stays buffered for the next batch).
                 records = self._assembly_ready(ready) if ready else None
                 if records:
+                    if self._score_worker is not None and self._pull_rule == 'prefix':
+                        # A per-sample consumer scores at the PULL boundary: one batched pass over
+                        # the whole pulled batch (no group ever fires under 'prefix'), timed into
+                        # score_time exactly like the group barrier's pass.
+                        pulled = [record.sample for record in records]
+                        _t = time.perf_counter()
+                        if self._prm_ready:
+                            rows, prm_refs = self._score_worker.score_group_prm(pulled)
+                            for sample, ref in zip(pulled, prm_refs):
+                                sample.prm_process = ref
+                        else:
+                            rows = self._score_worker.score_group(pulled)
+                        self.stats.score_time += time.perf_counter() - _t
+                        for sample, row in zip(pulled, rows):
+                            sample.orm_reward = row
                     _t = time.perf_counter()
                     self._train_pull(records, ready, group_counts)
                     train_now = time.perf_counter()
@@ -1163,10 +1179,13 @@ class StreamingDriver:
             return
         group_records = [record for record in ready if record.group_key == group_key]
         samples = [record.sample for record in group_records]
-        # The kernel-defaulted scoring: one group-barrier pass per channel that writes its results
-        # onto the samples themselves, so whatever runs next (the algorithm's verdict hooks, the
-        # pull, the assembled batch) reads them off the samples.
-        if self._score_worker is not None:
+        # The kernel-defaulted scoring: one scoring pass per channel that writes its results onto
+        # the samples themselves, so whatever runs next (the algorithm's verdict hooks, the pull,
+        # the assembled batch) reads them off the samples. A 'prefix' consumer never reaches here
+        # (no group ever completes at num_generations > 1); under num_generations == 1 this barrier
+        # would degenerate to one score_group call PER SAMPLE -- the pull-boundary batch pass below
+        # is the one that serves it.
+        if self._score_worker is not None and self._pull_rule != 'prefix':
             _t = time.perf_counter()
             if self._prm_ready:
                 rows, prm_refs = self._score_worker.score_group_prm(samples)

@@ -3,6 +3,8 @@ from __future__ import annotations
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Callable, Optional
 
+from twinkle.infra import remote_function
+
 
 class AsyncSaveMixin:
     """Staging/write separation for checkpoint persistence.
@@ -28,6 +30,7 @@ class AsyncSaveMixin:
         self._join_async_save()
         self._async_write_future = executor.submit(fn)
 
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
     def wait_async_saves(self) -> None:
         """Join and re-raise any failure from the in-flight background write."""
         self._join_async_save()

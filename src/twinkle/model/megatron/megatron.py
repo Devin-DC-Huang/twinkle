@@ -28,7 +28,7 @@ from twinkle import DeviceMesh, Platform, remote_class, remote_function, require
 from twinkle.checkpoint_engine.mixin import CheckpointEngineMixin
 from twinkle.data_format import InputFeature, ModelOutput, Trajectory
 from twinkle.hub import HubOperation
-from twinkle.infra import collect_tensor_dict
+from twinkle.infra import collect_tensor_dict, remote_function
 from twinkle.infra._torch_setup import seed_from_env
 from twinkle.loss import CrossEntropyLoss, Loss
 from twinkle.metric import LossMetric, Metric, TrainMetric
@@ -1885,6 +1885,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
             self._mcore_async_queue.maybe_finalize_async_calls(
                 blocking, no_dist=not dist.is_initialized())
 
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
     def wait_async_saves(self) -> None:
         """Join every in-flight save on both async channels (thread-pool tail + mcore queue)."""
         super().wait_async_saves()

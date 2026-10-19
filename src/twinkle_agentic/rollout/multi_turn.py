@@ -50,10 +50,12 @@ class RolloutSample:
     ``response_loss_mask`` mirrors ``response_token_ids``.
     """
 
-    encoded: dict
-    response_token_ids: List[int]
-    rollout_logprobs: List[float]
-    prompt_id: str
+    # Defaults let a consumer synthesise a sample-shaped row (a scored ground truth, a
+    # cache-loaded candidate) without faking engine state; the engine factory always fills them.
+    encoded: dict = field(default_factory=dict)
+    response_token_ids: List[int] = field(default_factory=list)
+    rollout_logprobs: List[float] = field(default_factory=list)
+    prompt_id: str = ''
     extra: Dict[str, Any] = field(default_factory=dict)
     decoded: str = ''
     truncated: bool = False
