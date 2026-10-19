@@ -69,8 +69,7 @@ class DevicePool:
             elif resource != 'CPU':
                 options['resources'] = {resource: count}
             node, devices = await asyncio.wait_for(
-                ray.remote(_probe_allocation).options(**options).remote(resource, device_type),
-                self.shutdown_timeout)
+                ray.remote(_probe_allocation).options(**options).remote(resource, device_type), self.shutdown_timeout)
             if resource == 'CPU':
                 devices = [str(index) for index in range(count)]
             if len(devices) != count or len(set(devices)) != count:

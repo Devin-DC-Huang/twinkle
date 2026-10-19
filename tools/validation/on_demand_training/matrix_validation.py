@@ -3,17 +3,16 @@
 import argparse
 import json
 import os
+import ray
 import socket
 import subprocess
 import sys
 import time
 import uuid
-from pathlib import Path
-from xml.etree import ElementTree
-
-import ray
 import yaml
+from pathlib import Path
 from ray import serve
+from xml.etree import ElementTree
 
 from twinkle.server.config import ServerConfig
 from twinkle.server.launcher.server_launcher import ServerLauncher
@@ -32,8 +31,8 @@ def main():
     with socket.socket() as listener:
         listener.bind(('127.0.0.1', 0))
         port = listener.getsockname()[1]
-    source = root / 'tests/server/config' / (
-        'server_config_4b_e2e.yaml' if args.backend == 'transformers' else 'server_config_4b_e2e_megatron.yaml')
+    source = root / 'tests/server/config' / ('server_config_4b_e2e.yaml' if args.backend == 'transformers' else
+                                             'server_config_4b_e2e_megatron.yaml')
     raw = yaml.safe_load(source.read_text())
     raw['ray_namespace'] = namespace
     raw['http_options'] = {'host': '127.0.0.1', 'port': port}
@@ -69,8 +68,13 @@ def main():
         'PYTHONPATH': str(root / 'src'),
     })
     evidence = {'backend': args.backend, 'namespace': namespace, 'cases': [], 'lazy_start': False}
-    ray.init(address='local', namespace=namespace, num_cpus=24, num_gpus=3,
-             _temp_dir='/tmp/twm-' + namespace[-8:], include_dashboard=False)
+    ray.init(
+        address='local',
+        namespace=namespace,
+        num_cpus=24,
+        num_gpus=3,
+        _temp_dir='/tmp/twm-' + namespace[-8:],
+        include_dashboard=False)
     launcher = ServerLauncher(config)
     try:
         launcher._start_serve()
@@ -83,15 +87,28 @@ def main():
             start = time.monotonic()
             with (run_dir / (filename + '.log')).open('w') as output:
                 result = subprocess.run([
-                    sys.executable, '-m', 'pytest', str(root / 'tests/server/integration' / filename),
-                    '-vv', '-s', '--junitxml=' + str(run_dir / (filename + '.xml')),
-                ], stdout=output, stderr=subprocess.STDOUT, env=os.environ.copy(), timeout=7200)
+                    sys.executable,
+                    '-m',
+                    'pytest',
+                    str(root / 'tests/server/integration' / filename),
+                    '-vv',
+                    '-s',
+                    '--junitxml=' + str(run_dir / (filename + '.xml')),
+                ],
+                                        stdout=output,
+                                        stderr=subprocess.STDOUT,
+                                        env=os.environ.copy(),
+                                        timeout=7200)
             junit = run_dir / (filename + '.xml')
             cases = ElementTree.parse(junit).getroot().findall('.//testcase') if junit.exists() else []
             skipped = sum(case.find('skipped') is not None for case in cases)
-            evidence['cases'].append({'file': filename, 'returncode': result.returncode,
-                                      'tests': len(cases), 'skipped': skipped,
-                                      'seconds': time.monotonic() - start})
+            evidence['cases'].append({
+                'file': filename,
+                'returncode': result.returncode,
+                'tests': len(cases),
+                'skipped': skipped,
+                'seconds': time.monotonic() - start
+            })
             (run_dir / 'results.json').write_text(json.dumps(evidence, indent=2))
             assert result.returncode == 0, f'{filename} failed; see {run_dir / (filename + ".log")}'
             assert len(cases) == (1 if filename == 'test_full_cycle_e2e.py' else 2) and skipped == 0

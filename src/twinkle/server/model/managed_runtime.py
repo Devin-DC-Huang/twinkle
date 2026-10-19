@@ -155,13 +155,13 @@ class ManagedTrainingRuntime:
                 from tinker import types
                 run_config = types.CreateModelRequest.model_validate(request.payload)
                 if not self.is_full_mode:
+
                     def build_lora_config():
                         from peft import LoraConfig
                         return LoraConfig(r=run_config.lora_config.rank, target_modules='all-linear')
 
                     config = await asyncio.to_thread(build_lora_config)
-                    await self.call_backend(
-                        self.model.add_adapter_to_model, adapter_name=adapter, config_or_dir=config)
+                    await self.call_backend(self.model.add_adapter_to_model, adapter_name=adapter, config_or_dir=config)
                 await self.call_backend(
                     self.model.set_template,
                     get_template_for_model(self.base_model),
@@ -169,6 +169,7 @@ class ManagedTrainingRuntime:
                     model_id=self.base_model)
                 await self.call_backend(self.model.set_processor, 'InputProcessor', adapter_name=backend_adapter)
                 await self.call_backend(self.model.set_optimizer, 'Adam', adapter_name=backend_adapter)
+
             def save_training_metadata():
                 create_training_run_manager(training.token, client_type=request.client_type).save(adapter, run_config)
 
