@@ -38,10 +38,6 @@ class LazyDataset(Dataset):
         self._lazy_map_ops: Dict[str, List[Tuple[Callable, Dict]]] = {}
         # Global lazy map ops (applied after mix): [(func, kwargs), ...]
         self._global_map_ops: List[Tuple[Callable, Dict]] = []
-
-        # Mix state. `_mixed` is the base class's flag and is reused verbatim -- a second field for
-        # the same concept would have to be kept in sync with it by hand, and inherited methods that
-        # read `_mixed` would silently see the wrong value.
         self._mixed = False
         self._mix_interleave = True
         self._length_cache: Optional[int] = None
