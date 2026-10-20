@@ -8,7 +8,10 @@ Translates OpenAI request/response shapes and proxies to the existing sampler
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import os
+import time
 import uuid
 from collections.abc import Callable
 from fastapi import Depends, FastAPI, Request
@@ -32,20 +35,50 @@ from .use_cases import poll_future
 
 logger = get_logger()
 
-_TERMINAL_STATUSES = frozenset({'completed', 'failed', 'cancelled'})
+_OPENAI_SAMPLE_TIMEOUT_ENV = 'TWINKLE_OPENAI_SAMPLE_TIMEOUT'
+_DEFAULT_OPENAI_SAMPLE_TIMEOUT = 1800.0
 
 
-async def _resolve_sampler_envelope(gateway: GatewayServer, sampler_data: dict[str, Any]) -> types.TaskEnvelope | None:
+class SamplerWaitTimeoutError(TimeoutError):
+    """The sampler task did not reach a terminal state inside the gateway's budget."""
+
+
+def _sample_wait_timeout() -> float:
+    return float(os.environ.get(_OPENAI_SAMPLE_TIMEOUT_ENV, str(_DEFAULT_OPENAI_SAMPLE_TIMEOUT)))
+
+
+async def _resolve_sampler_envelope(gateway: GatewayServer, sampler_data: dict[str, Any],
+                                    request: Request) -> types.TaskEnvelope | None:
     """Resolve the sampler's TaskEnvelope to a terminal state.
 
     ``/twinkle/sample`` always answers with a TaskEnvelope; a slow sample is
     still ``queued``/``running`` when the proxy returns. Polling the shared
     state backend is the only way to obtain its result without changing the
     upstream wire contract. Returns ``None`` when the future record was lost.
+
+    The wait is bounded by ``TWINKLE_OPENAI_SAMPLE_TIMEOUT`` and stops as soon
+    as the client disconnects: a stuck task must not keep this coroutine (and
+    its reads of the shared state) alive for the future's whole retention
+    window, long after the caller gave up.
     """
     envelope = types.TaskEnvelope.model_validate(sampler_data)
-    while envelope.status not in _TERMINAL_STATUSES:
-        outcome = await poll_future(gateway.state, envelope.request_id)
+    deadline = time.monotonic() + _sample_wait_timeout()
+    while envelope.status not in types.TERMINAL_STATUSES:
+        if await request.is_disconnected():
+            raise SamplerWaitTimeoutError('Client disconnected while waiting for the sampling task.')
+        # ``poll_future`` waits out its whole window before reporting a missing
+        # record, so check once here: a lost record is a terminal answer, not a
+        # reason to keep the coroutine alive.
+        if await gateway.state.get_future(envelope.request_id) is None:
+            return None
+        try:
+            # Bound each long poll by the remaining budget, otherwise one 30s
+            # window could overshoot a shorter configured deadline.
+            outcome = await asyncio.wait_for(
+                poll_future(gateway.state, envelope.request_id), timeout=deadline - time.monotonic())
+        except TimeoutError:
+            raise SamplerWaitTimeoutError(
+                f'Sampling task {envelope.request_id} did not finish within {_sample_wait_timeout():.0f}s.') from None
         if outcome.record is None:
             return None
         envelope = envelope_from_record(envelope.request_id, outcome.record)
@@ -127,12 +160,18 @@ def _register_openai_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
                 )
 
             sampler_data = json.loads(response.body)
-            envelope = await _resolve_sampler_envelope(self, sampler_data)
+            try:
+                envelope = await _resolve_sampler_envelope(self, sampler_data, request)
+            except SamplerWaitTimeoutError as e:
+                return JSONResponse(
+                    status_code=504,
+                    content=make_error(message=str(e), error_type='timeout'),
+                )
             if envelope is None:
                 return JSONResponse(
-                    status_code=404,
+                    status_code=500,
                     content=make_error(
-                        message=f'Sampling task {sampler_data.get("request_id")} was not found',
+                        message=f'Sampling task {sampler_data.get("request_id")} was lost by the server',
                         error_type='server_error',
                     ),
                 )

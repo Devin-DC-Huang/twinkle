@@ -291,6 +291,53 @@ class TestChatCompletions:
         assert 'mismatch' in resp.json()['error']['message']
         assert resp.json()['error']['type'] == 'server_error'
 
+    def test_non_stream_wait_is_bounded(self, mock_gateway, monkeypatch):
+        """A task that never terminates returns 504 instead of polling forever."""
+        monkeypatch.setenv('TWINKLE_OPENAI_SAMPLE_TIMEOUT', '0.01')
+        mock_self, app = mock_gateway
+        mock_self.proxy.proxy_request.return_value = self._make_sample_response(status='running')
+        mock_self.state.get_future = AsyncMock(return_value={'status': 'running'})
+
+        client = TestClient(app)
+        resp = client.post(
+            '/chat/completions',
+            json={
+                'model': 'Qwen/Qwen3.5-4B',
+                'messages': [{
+                    'role': 'user',
+                    'content': 'Hello'
+                }],
+            },
+            headers={'Authorization': 'Bearer key'},
+        )
+
+        assert resp.status_code == 504
+        assert resp.json()['error']['type'] == 'timeout'
+        assert 'did not finish' in resp.json()['error']['message']
+
+    def test_non_stream_lost_record_is_a_server_error(self, mock_gateway):
+        """A vanished future record is the server's loss, not a client 404."""
+        mock_self, app = mock_gateway
+        mock_self.proxy.proxy_request.return_value = self._make_sample_response(status='queued')
+        mock_self.state.get_future = AsyncMock(return_value=None)
+
+        client = TestClient(app)
+        resp = client.post(
+            '/chat/completions',
+            json={
+                'model': 'Qwen/Qwen3.5-4B',
+                'messages': [{
+                    'role': 'user',
+                    'content': 'Hello'
+                }],
+            },
+            headers={'Authorization': 'Bearer key'},
+        )
+
+        assert resp.status_code == 500
+        assert 'lost' in resp.json()['error']['message']
+        assert resp.json()['error']['type'] == 'server_error'
+
     def test_template_request_uses_only_declared_sampler_fields(self, mock_gateway):
         """The sampler's strict schema rejects top-level model_id; do not send it."""
         from fastapi import Response
