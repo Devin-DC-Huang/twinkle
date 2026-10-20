@@ -72,10 +72,13 @@ class TransformersGenerativeRerankerPatch(Patch):
             logits = F.linear(hidden_states, weight)
             return logits[..., 0:1] - logits[..., 1:2]
 
-        wrapper = MethodType(_reranker_head_forward, head)
-        setattr(wrapper, _MARKER, True)
-        wrapper._origin_forward = self._origin_forward
-        head.forward = wrapper
+        # The marker/origin ride on the FUNCTION, not on the bound method: a MethodType has no
+        # __dict__, so `setattr(wrapper, ...)` raises AttributeError('method' object has no attribute
+        # ...). Bound-method attribute READS forward to __func__, so the idempotency probe above
+        # (getattr(head.forward, _MARKER)) and unpatch's _origin_forward lookup still resolve.
+        setattr(_reranker_head_forward, _MARKER, True)
+        _reranker_head_forward._origin_forward = self._origin_forward
+        head.forward = MethodType(_reranker_head_forward, head)
         return module
 
     def unpatch(self, module, *args, **kwargs):

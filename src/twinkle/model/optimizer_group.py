@@ -54,17 +54,6 @@ class BaseOptimizerGroup:
     pending_failed: bool = False
     pending_loss: float = 0.0
 
-    def __setattr__(self, name, value):
-        if name == 'loss_instance' and value is not None:
-            from twinkle.utils.nccl_safe import safe_loss
-            value = safe_loss(value)
-        super().__setattr__(name, value)
-
-    @staticmethod
-    def _prepare_loss(loss: Loss) -> Loss:
-        from twinkle.utils.nccl_safe import safe_loss
-        return safe_loss(loss)
-
     def set_loss(self, loss: Loss, loss_key: Optional[str] = None) -> None:
         if loss_key is None:
             self.loss_registry.clear()
@@ -72,7 +61,7 @@ class BaseOptimizerGroup:
             return
         if not isinstance(loss_key, str) or not loss_key:
             raise ValueError('loss_key must be a non-empty string')
-        self.loss_registry[loss_key] = self._prepare_loss(loss)
+        self.loss_registry[loss_key] = loss
 
     def get_loss(self, loss_key: Optional[str] = None) -> Loss:
         if loss_key is not None:

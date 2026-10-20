@@ -2030,10 +2030,6 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         checkpoint_dir = os.path.join(output_dir, name)
         if optimizer_config.cur_step % interval != 0:
             return
-        # The synchronous path writes optimizer/trainer state BEFORE the weights (whose
-        # save_pretrained used to be the only thing creating the directory), so create it here;
-        # exist_ok makes concurrent ranks and the async path harmless.
-        os.makedirs(checkpoint_dir, exist_ok=True)
         model = self.strategy.unwrap_model(self.model)
         save_kwargs = {
             'safe_serialization': safe_serialization,
@@ -2152,7 +2148,8 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         defer_trainer_state = kwargs.pop('defer_trainer_state', False)
         # The optimizer/scheduler files are written before _write_weights() gets a chance to
         # create the checkpoint dir via save_pretrained; torch.save then raises
-        # "Parent directory ... does not exist".
+        # "Parent directory ... does not exist". This lives HERE (not at the top of save()) so it
+        # also covers the hybrid model's save path, which calls _save_training_state directly.
         os.makedirs(output_dir, exist_ok=True)
         self._save_optimizer(output_dir, adapter_name=adapter_name)
 

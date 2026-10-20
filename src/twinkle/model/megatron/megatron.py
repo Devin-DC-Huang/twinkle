@@ -38,7 +38,6 @@ from twinkle.patch import Patch, apply_context, apply_patch
 from twinkle.perf import timed
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
-from twinkle.utils.nccl_safe import _is_fail_fast
 from twinkle.utils import construct_class, get_logger, selective_log_softmax
 from ._mindspeed_runtime import ensure_mindspeed_adaptor_patched
 from .strategy import MegatronStrategy
@@ -1007,18 +1006,14 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
                     entropies = _outputs.get('entropies', None)
                     unpacked_logits = _outputs.get('logits', None)
             except Exception as e:
-                # Data processing error (e.g. unpack_packed_sequences dimension mismatch).
-                # Must catch here inside the scheduler to prevent exception escaping
-                # and breaking PP P2P communication → NCCL hang.
-                if _is_fail_fast():
-                    raise
-                logger.warning('[nccl_safe] forward_step_func data processing error: '
+                # Data processing error (e.g. unpack_packed_sequences dimension mismatch). Log the
+                # rank-attributed failure, then re-raise unchanged: swallowing it here would let this
+                # DP rank skip the PP collectives while the others wait, and a degraded value would
+                # mask the failure -- the time bound comes from the task lifecycle, not this handler.
+                logger.warning('[nccl_safe] forward_step_func data processing error on rank: '
                                '%s: %s',
                                type(e).__name__, e)
-                logps = None
-                unpacked_logits = None
-                entropies = None
-                embeddings = None
+                raise
             return output_tensor, partial(
                 post_loss_function,
                 inputs=batch,
