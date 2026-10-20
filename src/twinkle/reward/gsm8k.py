@@ -1,8 +1,8 @@
 import re
 from typing import Any, Dict, List
 
-from twinkle.data_format import user_data_get
-from twinkle.reward.base import Reward, ground_truth, last_assistant_text
+from twinkle.data_format import ground_truth, last_assistant_text, user_data_get
+from twinkle.reward.base import Reward
 
 
 def _extract_last_boxed(text: str) -> str:
@@ -51,13 +51,8 @@ class GSM8KAccuracyReward(Reward):
     def __call__(self, trajectories: List[Dict[str, Any]], **kwargs) -> List[float]:
         rewards = []
         for trajectory in trajectories:
-            messages = trajectory.get('messages', [])
             # Get model completion (last assistant message)
-            completion = ''
-            for msg in reversed(messages):
-                if msg.get('role') == 'assistant':
-                    completion = msg.get('content', '')
-                    break
+            completion = last_assistant_text(trajectory)
 
             # Get ground truth from user_data
             user_data = trajectory.get('user_data') or []
@@ -101,11 +96,7 @@ class MathVerifyAccuracyReward(Reward):
 
         rewards = []
         for trajectory in trajectories:
-            completion = ''
-            for message in reversed(trajectory.get('messages', [])):
-                if message.get('role') == 'assistant':
-                    completion = str(message.get('content', ''))
-                    break
+            completion = last_assistant_text(trajectory)
             gold = ground_truth(trajectory, self.ground_truth_key)
             gold = '' if gold is None else str(gold)
             try:
@@ -155,11 +146,7 @@ class GSM8KBrevityReward(Reward):
     def __call__(self, trajectories: List[Dict[str, Any]], **kwargs) -> List[float]:
         rewards = []
         for trajectory in trajectories:
-            completion = ''
-            for message in reversed(trajectory.get('messages', [])):
-                if message.get('role') == 'assistant':
-                    completion = message.get('content', '')
-                    break
+            completion = last_assistant_text(trajectory)
             has_answer = _has_boxed(completion) or bool(re.search(r'####\s*[\-\d,\.]+', completion))
             if not has_answer:
                 rewards.append(0.0)
@@ -213,12 +200,7 @@ class GSM8KFormatReward(Reward):
     def __call__(self, trajectories: List[Dict[str, Any]], **kwargs) -> List[float]:
         rewards = []
         for trajectory in trajectories:
-            messages = trajectory.get('messages', [])
-            completion = ''
-            for msg in reversed(messages):
-                if msg.get('role') == 'assistant':
-                    completion = msg.get('content', '')
-                    break
+            completion = last_assistant_text(trajectory)
             has_answer = bool(_has_boxed(completion) or re.search(r'####\s*[\-\d,\.]+', completion))
             rewards.append(1.0 if has_answer else 0.0)
         return rewards

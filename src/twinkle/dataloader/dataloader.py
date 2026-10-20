@@ -348,6 +348,15 @@ class DataLoader:
         consumed = int(state.get('consumed_train_samples', offset))
         if epoch < 0 or offset < 0 or consumed < offset:
             raise ValueError('DataLoader state requires non-negative epoch/offset and consumed >= offset.')
+        # A map-style pass interrupted exactly at its end records (epoch, len(dataset)) -- the same
+        # position a finished pass reports as (epoch + 1, 0). Normalize it here (the producer cannot:
+        # get_state runs mid-pass) so the resume starts the next pass instead of skipping a whole
+        # epoch and yielding nothing; already-written checkpoints restore correctly too.
+        from torch.utils.data import IterableDataset
+        if offset and not isinstance(self.dataset, IterableDataset):
+            length = max(len(self.dataset), 1)
+            if offset >= length:
+                epoch, offset = epoch + offset // length, offset % length
 
         self._epoch = epoch
         if self._epoch_sampler is not None:

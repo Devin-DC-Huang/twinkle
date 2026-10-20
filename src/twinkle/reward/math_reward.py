@@ -2,8 +2,8 @@
 import re
 from typing import Any, List, Union
 
-from twinkle.data_format import Trajectory
-from twinkle.reward.base import Reward, ground_truth, last_assistant_text
+from twinkle.data_format import Trajectory, ground_truth, last_assistant_text
+from twinkle.reward.base import Reward
 
 
 class MathReward(Reward):
@@ -77,7 +77,10 @@ class MathReward(Reward):
             prediction = last_assistant_text(trajectory)
             # The gold lives in the trajectory's user_data (or flat column); an absent key falls
             # back to scoring the completion against itself (compare degenerates, never raises).
-            gold = ground_truth(trajectory, self.ground_truth_key) or prediction
+            # The test is `is None`: a gold of 0 is a real label, not a missing one.
+            gold = ground_truth(trajectory, self.ground_truth_key)
+            if gold is None:
+                gold = prediction
             if '# Answer' in prediction:
                 prediction = prediction.split('# Answer')[1]
             if isinstance(gold, str) and '# Answer' in gold:

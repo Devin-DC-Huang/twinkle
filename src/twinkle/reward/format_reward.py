@@ -2,8 +2,8 @@
 import re
 from typing import Any, List
 
-from twinkle.data_format import Trajectory
-from twinkle.reward.base import Reward, last_assistant_text
+from twinkle.data_format import Trajectory, last_assistant_text
+from twinkle.reward.base import Reward
 
 
 class FormatReward(Reward):

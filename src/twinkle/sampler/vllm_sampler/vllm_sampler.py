@@ -320,9 +320,12 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, Par
         # labels when they are missing or length-mismatched. Present, aligned labels are
         # left untouched (preserving provenance), and the logprobs-only path -- which
         # never concatenates -- is not touched.
-        if not token_only and not logprobs_only and 'input_ids' in feat and len(feat.get('labels') or []) != len(
-                feat['input_ids']):
-            feat['labels'] = [-100] * len(feat['input_ids'])
+        if not token_only and not logprobs_only and 'input_ids' in feat:
+            # ``labels`` may be an ndarray (np.roll output), whose truth value is ambiguous;
+            # compare lengths directly instead of ``feat.get('labels') or []``.
+            labels = feat.get('labels')
+            if labels is None or len(labels) != len(feat['input_ids']):
+                feat['labels'] = [-100] * len(feat['input_ids'])
         sequences = []
         for seq in response.sequences:
             if token_only:

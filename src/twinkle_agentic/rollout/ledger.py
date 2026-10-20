@@ -29,6 +29,7 @@ import threading
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from twinkle.data_format import Trajectory
+from twinkle.data_format import last_assistant_text as _traj_last_assistant_text
 from twinkle.data_format.sampling import SampledSequence
 from twinkle.template.base import Template
 from twinkle_agentic.utils.token_utils import _to_plain, append_ids, extend_with_bridge
@@ -116,12 +117,12 @@ def sampled_token_logprobs(tokens: List[int], logprobs) -> List[float]:
 
 
 def last_assistant_text(messages: Optional[List[dict]]) -> str:
-    """The newest assistant turn's text, for logging / rule-based reward."""
-    for message in reversed(messages or []):
-        if message.get('role') == 'assistant':
-            content = message.get('content')
-            return content if isinstance(content, str) else ''
-    return ''
+    """The newest assistant turn's text, for logging / rule-based reward.
+
+    Delegates to the shared trajectory helper; multimodal content (a list of parts) is
+    flattened to its text parts rather than read as a plain string.
+    """
+    return _traj_last_assistant_text({'messages': messages})
 
 
 class TurnLedger:
