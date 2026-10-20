@@ -56,10 +56,11 @@ class Perf:
                 handle is a ``@remote_class`` actor, so its injected ``perf_on`` reaches all of its worker ranks.
             enabled: turn timing on/off. ``None`` (the default) reads twinkle's ``TWINKLE_PERF`` env flag, so
                 ``Perf.initialize(actors)`` is the zero-config path.
-            profiler: the serializable module-profiler spec (``select`` / ``profiler`` must be strings, since it
-                crosses the Ray boundary). This is an INDEPENDENT switch from ``enabled``: the forward hooks force
-                device syncs and cost more than the timing decorators, so they stay OFF unless a spec is given
-                here or via ``TWINKLE_PERF_SPEC`` / ``TWINKLE_PERF_EVERY_N``.
+            profiler: the serializable module-profiler spec (``select`` / ``collectors`` must be
+                strings, since it crosses the Ray boundary). This is an INDEPENDENT switch from
+                ``enabled``: the forward hooks force device syncs and cost more than the timing
+                decorators, so they stay OFF unless a spec is given here or via
+                ``TWINKLE_PERF_SPEC`` / ``TWINKLE_PERF_EVERY_N``.
 
         Idempotent per actor: an already-registered handle is skipped, so a loop may call this at the top of every
         fit (e.g. across a resume) and profile the FIRST step rather than losing it to a lazy attach, and may
@@ -163,7 +164,7 @@ class Perf:
         injected ``perf_dump``, so the two never drift.
 
         Both accumulators are RESET after the read, so each call returns exactly the window since the last
-        one: the recorder (stage timings) and the profiler (module stats + ``_overhead_ns``) advance in lockstep.
+        one: the recorder (stage timings) and the profiler (module stats + overhead accounts) advance in lockstep.
         Without the profiler reset ``overhead_s`` would grow cumulatively while ``wall_s`` stays per-window,
         driving ``_net_wall_s`` to zero after a few windows and reporting lifetime means instead of the window's.
         """
@@ -235,9 +236,10 @@ class Perf:
 
         ``None`` is the default (timing only): the hook profiler forces device syncs, so it is opt-in and
         independent of ``TWINKLE_PERF``. ``TWINKLE_PERF_SPEC`` (a JSON object) wins and is forwarded verbatim to
-        ``build_module_profiler`` -- ``select`` / ``profiler`` must be strings there, since the spec crosses the
-        Ray boundary. Otherwise ``TWINKLE_PERF_EVERY_N`` alone turns the profiler on at that cadence (hooking
-        every module with the built-in activation stats).
+        ``build_module_profiler`` -- ``select`` / ``collectors`` must be strings there, since the spec crosses the
+        Ray boundary, e.g. ``'{"every_n_steps": 20, "collectors": ["activation", "param"]}'``. Otherwise
+        ``TWINKLE_PERF_EVERY_N`` alone turns the profiler on at that cadence (hooking every module with the
+        built-in activation stats).
         """
         raw = os.environ.get('TWINKLE_PERF_SPEC', '').strip()
         if raw:
