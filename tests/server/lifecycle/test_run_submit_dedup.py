@@ -20,11 +20,13 @@ class _FakeState:
     def __init__(self, record_after_claim):
         self._record_after_claim = record_after_claim
         self.claimed = {}
+        self.claim_ttls = []
         self.released = []
 
     async def claim_seq(self, dedup_key, request_id, ttl):
         # Unseen -> claim it and let the caller proceed (returns None).
         self.claimed[dedup_key] = request_id
+        self.claim_ttls.append(ttl)
         return None
 
     async def get_future(self, request_id):
@@ -38,7 +40,7 @@ class _FakeState:
 class _FakeManagement:
     def __init__(self, record_after_claim):
         self.state = _FakeState(record_after_claim)
-        self.task_queue_config = SimpleNamespace(effective_execution_timeout=60.0)
+        self.task_queue_config = SimpleNamespace(queue_timeout=300.0, effective_execution_timeout=1800.0)
         # A real deployment declares its backend; preflight reads it from here.
         self.backend = 'transformers'
         self.data_world_size = 1
@@ -85,6 +87,15 @@ async def test_release_when_never_enqueued():
     with pytest.raises(RuntimeError):
         await run_submit(mgmt, _request(), _body(), task_type='forward_backward', backend_call=_call)
     assert mgmt.state.released == ['seq::sess-1::sess-1-ad::7'], 'claim should be released when nothing enqueued'
+
+
+@pytest.mark.asyncio
+async def test_dedup_ttl_covers_queue_and_execution():
+    """The claim must outlive queue wait plus execution, not just execution."""
+    mgmt = _FakeManagement(record_after_claim={'status': 'queued'})
+    with pytest.raises(RuntimeError):
+        await run_submit(mgmt, _request(), _body(), task_type='forward_backward', backend_call=_call)
+    assert mgmt.state.claim_ttls == [2160]
 
 
 @pytest.mark.asyncio
