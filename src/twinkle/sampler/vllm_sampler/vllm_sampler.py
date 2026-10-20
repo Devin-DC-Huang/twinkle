@@ -454,6 +454,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, Par
         use_base_model: bool = False,
         adapter_paths: Optional[List[Optional[str]]] = None,
         allow_partial_rollout: bool = False,
+        token_only: bool = False,
     ) -> List[SampleResponse]:
         """The async generation core shared by the blocking :meth:`sample` and :meth:`submit_generation`.
 
@@ -521,6 +522,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, Par
                     multi_modal_data=multi_modal_data,
                     logprobs_only=logprobs_only,
                     disable_lora=use_base_model,
+                    token_only=token_only,
                 )
 
             # Partial rollout: one generation attempt is a plain _sample_single; the resume/merge loop
