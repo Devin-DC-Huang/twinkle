@@ -103,26 +103,6 @@ class _TransformersTinkerCompatMixin(TwinkleCompatModelBase):
         output = super().forward_only(inputs=inputs, **kwargs)
         return to_cpu_safe_output(output)
 
-    @remote_function(dispatch='all', collect='none')
-    def preflight_loss_inputs(self,
-                              *,
-                              inputs: InputFeature | list[InputFeature] | Trajectory | list[Trajectory],
-                              adapter_name: str = None,
-                              **kwargs):
-        """Validate the full, unsliced batch on every rank before any forward.
-
-        The loss's own alignment check runs after a rank has already forwarded
-        its slice. If one rank raises there while another proceeds to backward,
-        the DDP collective deadlocks the replica (BUG-05). Running the same
-        check on the full batch first makes every rank fail together while no
-        rank holds an in-flight forward or collective.
-        """
-        adapter_name = adapter_name or self._get_default_group()
-        group = self.optimizer_group.get(adapter_name)
-        loss_instance = getattr(group, 'loss_instance', None)
-        if loss_instance is not None:
-            loss_instance.validate_inputs(inputs, **kwargs)
-
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
     def forward_backward(self, *, inputs: InputFeature | list[InputFeature] | Trajectory | list[Trajectory], **kwargs):
         """Forward+backward for twinkle-native clients (InputFeature/Trajectory I/O)."""

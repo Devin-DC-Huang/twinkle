@@ -144,6 +144,10 @@ def _register_model_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelMana
                 # Full, unsliced batch on every rank: a loss alignment error must
                 # fail all ranks before any of them enters its backward collective.
                 await self.call_backend(preflight, inputs=all_inputs, adapter_name=resolved_adapter_name, **kwargs)
+            elif preflight is None:
+                logger.warning(
+                    'Backend %s has no preflight_loss_inputs; a loss alignment error can still deadlock the DP peers.',
+                    type(self.model).__name__)
             ret = await self.call_backend(
                 self.model.forward_backward, inputs=all_inputs, adapter_name=resolved_adapter_name, **kwargs)
             return {'result': ret}
@@ -250,6 +254,10 @@ def _register_model_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelMana
             preflight = getattr(self.model, 'preflight_loss_inputs', None)
             if preflight is not None and any(key in kwargs for key in ('old_logps', 'ref_logps', 'advantages')):
                 await self.call_backend(preflight, inputs=inputs, adapter_name=resolved_adapter_name, **kwargs)
+            elif preflight is None:
+                logger.warning(
+                    'Backend %s has no preflight_loss_inputs; a loss alignment error can still deadlock the DP peers.',
+                    type(self.model).__name__)
             ret = await self.call_backend(
                 self.model.forward_backward, inputs=inputs, adapter_name=resolved_adapter_name, **kwargs)
             return {'result': ret}

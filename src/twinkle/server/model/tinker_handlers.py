@@ -184,6 +184,14 @@ def _register_model_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManag
                 datum_list = body.forward_backward_input.data
                 loss_fn = body.forward_backward_input.loss_fn
                 loss_fn_config = body.forward_backward_input.loss_fn_config or {}
+                preflight = getattr(self.model, 'preflight_loss_inputs', None)
+                if preflight is not None and loss_fn == 'importance_sampling' and not validate_tinker_loss(
+                        loss_fn, datum_list, data_world_size=self.data_world_size):
+                    # GRPO datums carry ragged per-sample targets; the loss check inside
+                    # the sliced backend would deadlock the peer ranks (BUG-05), so the
+                    # full batch is validated on every rank first.
+                    await self.call_backend(
+                        preflight, inputs=datum_list, adapter_name=model_adapter, loss_fn=loss_fn, **loss_fn_config)
                 output, loss = await self.call_backend(
                     self.model.tinker_forward_backward,
                     inputs=datum_list,
