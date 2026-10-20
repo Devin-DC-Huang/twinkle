@@ -286,3 +286,33 @@ class TestGKDLoss:
 
         result = loss_fn({'labels': labels}, {'logits': student_logits}, teacher_logits=teacher_logits)
         assert torch.isfinite(result['loss'])
+
+
+class TestGRPOValidateInputs:
+    """Pre-forward validation must match the in-loss alignment rules."""
+
+    @staticmethod
+    def _batch():
+        # Two trainable positions per row, at indices 2 and 3, so a length-3
+        # row cannot be read as the full-sequence form (index 3 is missing).
+        labels = torch.tensor([[-100, -100, 0, 0], [-100, -100, 0, 0]])
+        return [{'labels': labels}, {'labels': labels}]
+
+    def test_accepts_response_only_scalar_and_full_length(self):
+        loss_fn = GRPOLoss()
+        inputs = self._batch()
+        loss_fn.validate_inputs(inputs, old_logps=[[0.1, 0.2], [0.3, 0.4]])
+        loss_fn.validate_inputs(inputs, old_logps=[[0.1], [0.2]])
+        loss_fn.validate_inputs(inputs, old_logps=torch.zeros(2, 4))
+
+    def test_rejects_ragged_length_before_forward(self):
+        loss_fn = GRPOLoss()
+        inputs = self._batch()
+        with pytest.raises(AssertionError, match='data/mask length mismatch at sample 1'):
+            loss_fn.validate_inputs(inputs, old_logps=[[0.1, 0.2], [0.3, 0.4, 0.5]])
+
+    def test_rejects_ragged_advantages(self):
+        loss_fn = GRPOLoss()
+        inputs = self._batch()
+        with pytest.raises(AssertionError, match='data/mask length mismatch'):
+            loss_fn.validate_inputs(inputs, advantages=[1.0, [1.0, 2.0, 3.0]])

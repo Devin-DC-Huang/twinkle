@@ -272,3 +272,43 @@ async def test_checkpoint_consumers_keep_backend_path_and_options(monkeypatch, t
     else:
         service.model.upload_to_hub.assert_called_once_with(
             checkpoint_dir=directory, hub_model_id='org/output', hub_token='hub-token', async_upload=False)
+
+
+class _PreflightManagement(_SchedulingManagement):
+
+    def __init__(self):
+        super().__init__()
+        self.preflight_calls = []
+
+    def preflight_loss_inputs(self, *, inputs, adapter_name, **kwargs):
+        self.preflight_calls.append((inputs, adapter_name, kwargs))
+        self.model_calls.append(('preflight', adapter_name))
+
+
+@pytest.mark.asyncio
+async def test_forward_backward_preflights_loss_inputs_before_backend() -> None:
+    """The full batch is validated before the backend call can slice it."""
+    management = _PreflightManagement()
+    app = FastAPI()
+    _register_model_twinkle_routes(app, lambda: management)
+    route = next(route for route in app.routes if getattr(route, 'path', None) == '/twinkle/forward_backward')
+    request = Request({'type': 'http', 'headers': []})
+    request.state.session_id = 'session'
+    body = types.ForwardBackwardTaskRequest(
+        inputs=[{
+            'input_ids': [1, 2],
+            'labels': [-100, 5],
+        }],
+        adapter_name='adapter',
+        loss_kwargs={'old_logps': [[-0.1]]},
+    )
+
+    await route.endpoint(request, body, management)
+
+    assert len(management.preflight_calls) == 1
+    _, preflight_adapter, preflight_kwargs = management.preflight_calls[0]
+    assert preflight_adapter == 'session-adapter'
+    assert preflight_kwargs['old_logps'] == [[-0.1]]
+    assert management.model_calls[0][0] == 'preflight'
+    assert management.model_calls[-1][0] != 'preflight'
+    assert management.model_calls[-1][1] == 'session-adapter'
