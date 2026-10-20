@@ -1,18 +1,51 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Optional training features applied to a constructed transformers model.
 
-NEFTune (embedding noise) and Liger kernels are orthogonal features with no
-interaction with the rest of the model surface. TransformersModel keeps thin
-same-named methods that delegate here (subclass overrides keep working); the
-logic lives in this module, next to nothing else.
+NEFTune (embedding noise), Liger kernels and the FSDP-aware pretrained-load
+context manager are orthogonal features with no interaction with the rest of
+the model surface. TransformersModel and the strategies keep thin same-named
+delegation points (subclass overrides keep working); the logic lives in this
+module, next to nothing else.
 """
 from __future__ import annotations
 
+import contextlib
+import os
 from typing import Any, Dict, Optional
 
 import torch
 
 from twinkle.utils import get_logger
+
+# Env flags transformers/accelerate read to pick their FSDP-aware loading path (rank0 load,
+# meta-device placement, no full CPU materialization per rank).
+_FSDP_EFFICIENT_LOADING_ENV = {
+    'ACCELERATE_USE_FSDP': 'true',
+    'FSDP_CPU_RAM_EFFICIENT_LOADING': 'true',
+}
+
+
+@contextlib.contextmanager
+def fsdp_pretrained_load_context(enabled: bool):
+    """Enable the env flags required for transformers FSDP-aware loading when needed.
+
+    A load-scoped transaction: the flags are restored (or popped) even when loading raises,
+    so later imports in the same process never mistake themselves for FSDP-aware loaders.
+    """
+    if not enabled:
+        yield
+        return
+
+    saved_env = {key: os.environ.get(key) for key in _FSDP_EFFICIENT_LOADING_ENV}
+    os.environ.update(_FSDP_EFFICIENT_LOADING_ENV)
+    try:
+        yield
+    finally:
+        for key, old_val in saved_env.items():
+            if old_val is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old_val
 
 
 def activate_neftune(model, neftune_noise_alpha: float) -> None:

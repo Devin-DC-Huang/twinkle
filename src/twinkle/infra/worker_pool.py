@@ -48,14 +48,22 @@ class WorkerSlotView:
 class WorkerPoolView:
     """A consistent read-only snapshot of the pool plus its continuous-work loads."""
 
-    def __init__(self, slots: Tuple[WorkerSlotView, ...]):
+    def __init__(self, slots: Tuple[WorkerSlotView, ...], suspended: Tuple[str, ...] = ()):
         self._slots = slots
+        self._suspended = frozenset(suspended)
         self._by_id = {slot.worker_id: slot for slot in slots}
 
     @property
     def active_ids(self) -> Tuple[str, ...]:
-        """Worker ids currently ACTIVE -- the only ones a router may pick."""
+        """Worker ids currently ACTIVE."""
         return tuple(slot.worker_id for slot in self._slots if slot.state == 'ACTIVE')
+
+    @property
+    def admissible_ids(self) -> Tuple[str, ...]:
+        """Worker ids a router may pick: ACTIVE and not suspended."""
+        return tuple(
+            slot.worker_id for slot in self._slots
+            if slot.state == 'ACTIVE' and slot.worker_id not in self._suspended)
 
     def slot(self, worker_id: str) -> Optional[WorkerSlotView]:
         return self._by_id.get(worker_id)
@@ -81,6 +89,26 @@ class Router:
         return None
 
 
+class LeastInflightRouter(Router):
+    """The pool's built-in default: rotate the starting point, then pick the admissible
+    worker with the fewest in-flight requests. Carried over verbatim from the sampler
+    admission policy; the rotation counter is router state, so replacing the router
+    resets the rotation deliberately."""
+
+    def __init__(self):
+        self._rotation = 0
+
+    def select(self, method: str, args: tuple, kwargs: dict, view: WorkerPoolView) -> Optional[Sequence[str]]:
+        ids = view.admissible_ids
+        if not ids:
+            return None
+        offset = self._rotation % len(ids)
+        rotated = ids[offset:] + ids[:offset]
+        winner = min(rotated, key=lambda worker_id: view.slot(worker_id).inflight)
+        self._rotation = ids.index(winner) + 1
+        return (winner,)
+
+
 class WorkerPool:
     """Admission ledger, call reservation protocol and drain lifecycle of a worker pool.
 
@@ -97,6 +125,8 @@ class WorkerPool:
     def __init__(self, owner: Any, *, router: Optional[Router] = None):
         self._owner = owner
         self._lock = threading.RLock()
+        self._default_router = LeastInflightRouter()
+        self.router = router
         self.workers: Dict[str, WorkerSlot] = {}
         self.suspended_workers = set()
         self.paused_generation_workers = set()
@@ -144,7 +174,34 @@ class WorkerPool:
                 WorkerSlotView(slot.worker_id, slot.state, slot.shared, slot.inflight, slot.dispatching,
                                load.get(slot.worker_id, 0))
                 for slot in self.workers.values())
-        return WorkerPoolView(slots)
+            suspended = tuple(self.suspended_workers)
+        return WorkerPoolView(slots, suspended)
+
+    def select_worker(self, method: str, args: tuple, kwargs: dict) -> Optional[str]:
+        """Single-worker routing decision, taken under the pool lock (reentrant: callers
+        that already hold the worker lock simply nest).
+
+        The pluggable ``self.router`` answers first; abstaining (``None`` or empty) falls
+        back to the built-in least-inflight default. A router that names a worker which is
+        not admissible fails loudly. Returns ``None`` only when no worker is admissible.
+        """
+        with self._lock:
+            view = self.view()
+            if not view.admissible_ids:
+                return None
+            selection = None
+            if self.router is not None:
+                selection = self.router.select(method, args, kwargs, view)
+            if not selection:
+                selection = self._default_router.select(method, args, kwargs, view)
+            if not selection:
+                return None
+            admissible = set(view.admissible_ids)
+            for worker_id in selection:
+                if worker_id not in admissible:
+                    raise RuntimeError(
+                        f'router selected non-admissible worker {worker_id!r} for {method!r}')
+            return selection[0]
 
     # ---- call reservation protocol (driven by the infra dispatch wrapper) ----
 
@@ -434,7 +491,6 @@ def with_worker_pool(cls) -> type:
         # Family-local submission state, initialized here to keep the historical protocol
         # (generation-submission bookkeeping keys) unchanged.
         self._generation_owners = {}
-        self._round_robin = 0
         pool.install_slots(self._actors, tuple(ranks[index * width:(index + 1) * width] for index in
                                                range(len(self._actors))),
                            group or self.remote_group, shared=shared, state=state)

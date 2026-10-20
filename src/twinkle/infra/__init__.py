@@ -31,6 +31,7 @@ from .continuous_work import _cw_drop_locked, _cw_unregister, _select_workers, g
 from .dispatch import (_dispatch_args, _get_device_mesh_param_name, get_device_placement, remote_class,
                        remote_function)
 from .ray_tasks import remote_map
+from twinkle.utils.lazy_collect import set_lazy_collect
 from .worker_pool import with_worker_pool
 
 __all__ = [
@@ -50,8 +51,6 @@ _mode: Optional[Literal['local', 'ray']] = 'local'
 
 if os.environ.get('TWINKLE_MODE', 'local') == 'ray':
     _mode = 'ray'
-
-_lazy_collect = True
 
 # Torch process-global init knobs (seed / determinism / tf32), bundled into one dict so a new knob never
 # means a new initialize()/create_workers() argument or a new env var. Each only takes effect in the
@@ -117,11 +116,11 @@ def initialize(mode: Literal['local', 'ray'] = 'local',
             method raises. The original exception is always re-raised; the
             notifier is best-effort and its own failures are swallowed.
     """
-    global _mode, _device_group, _extra_torch_kwargs, _lazy_collect, _device_mesh, _name, _notifier
+    global _mode, _device_group, _extra_torch_kwargs, _device_mesh, _name, _notifier
     assert mode in ('local', 'ray')
     _mode = mode
     _name = name
-    _lazy_collect = lazy_collect
+    set_lazy_collect(lazy_collect)
     _notifier = notifier
     if name is not None:
         os.environ['TWINKLE_NAME'] = name

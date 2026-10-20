@@ -11,7 +11,7 @@ from twinkle.model.state_dict_utils import collect_local_state, is_lora_state_ke
 from twinkle.utils import DeviceMesh, Platform, get_logger, torch_util
 from twinkle.utils.torch_utils import clone_state_dict_to_cpu
 from .base import TransformerStrategyBase
-from .load_context import fsdp_pretrained_load_context
+from ..feature_hooks import fsdp_pretrained_load_context
 
 if TYPE_CHECKING:
     from torch.distributed.fsdp import MixedPrecisionPolicy

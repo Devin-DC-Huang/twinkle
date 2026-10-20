@@ -40,6 +40,7 @@ from twinkle.template import Template
 from twinkle.utils import construct_class, get_logger, selective_log_softmax
 from .utils import mtp
 from .utils._mindspeed_runtime import ensure_mindspeed_adaptor_patched
+from .utils.utils import _find_embedding, _find_layers
 from .strategy import MegatronStrategy
 
 logger = get_logger()
@@ -66,22 +67,6 @@ def _resolve_task_context(model, task):
         return apply_context(model, MegatronEmbeddingPatch())
     raise ValueError(f'Unknown task={task!r}; expected one of: causal_lm, embedding, seq_cls, reranker, '
                      'generative_reranker, value.')
-
-
-def _find_layers(model, cond_fn):
-    """Every full mcore module path under ``model`` satisfying ``cond_fn(name, module)``.
-
-    Shared by the ``all-*`` keyword expansion for both ``target_modules`` and ``modules_to_save``, so the
-    two keep one definition of "walk the real modules" (the expansion runs worker-side, where the real
-    modules live -- the driver only holds a sharded PROXY).
-    """
-    return [name for name, module in model.named_modules() if cond_fn(name, module)]
-
-
-def _find_embedding(model):
-    """mcore's embedding modules, used to expand the ``'all-embedding'`` keyword."""
-    from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
-    return _find_layers(model, lambda name, module: isinstance(module, LanguageModelEmbedding) and 'lora' not in name)
 
 
 @dataclass
@@ -138,22 +123,9 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
         recompute_method: Optional[str] = 'uniform',
         recompute_num_layers: Optional[int] = 1,
         recompute_modules: Optional[list] = None,  # Modules to recompute
-        # Per-tower vision checkpointing: the multimodal counterpart of the global recompute_* knobs
-        # above, which cover the mcore LLM decoder but NOT the external HF vision tower. Consumed
-        # worker-side in __init__ below; declared explicitly so it never leaks through **kwargs into
-        # mcore's TransformerConfig. Mirrors TransformersModel's kwarg of the same name.
         vit_gradient_checkpointing: Optional[bool] = None,
         vit_gradient_checkpointing_kwargs: Optional[Dict[str, Any]] = None,
-        # Vocab growth for added special tokens, the megatron counterpart of TransformersModel's kwarg of the
-        # same name. An already-resolved token list (any .txt expansion happened driver-side, so only
-        # serializable strings cross the Ray boundary). Consumed worker-side in __init__: the tokenizer is
-        # extended and hf_config.vocab_size raised BEFORE MegatronStrategy builds the mcore config (which
-        # sizes VocabParallelEmbedding from it), then the new zero-filled rows are re-initialized once the
-        # model exists. Declared explicitly so it never leaks through **kwargs into mcore's TransformerConfig.
         new_special_tokens: Optional[List[str]] = None,
-        # Forwarded verbatim to MegatronStrategy, which owns them. Declared explicitly (rather than
-        # left in **kwargs) because they are the supported construction surface, and bridge_backend
-        # in particular must stay a NAME string so it survives the Ray worker boundary.
         bridge_backend='mcore-bridge',
         align_grad_reduce: bool = True,
         nccl_comm_warmup: bool = False,
@@ -161,10 +133,6 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
         **kwargs,
     ):
         requires('megatron_core')
-        # Before torch_util.set_device() below, which creates the CUDA context: the connection-count
-        # variable MegatronStrategy sets here is only read by the driver at context creation, so this
-        # call cannot be deferred into the strategy's own __init__ (built further down).
-        MegatronStrategy.apply_process_env(ddp_config)
         nn.Module.__init__(self)
         from twinkle.patch.megatron_peft import MegatronPeft
 
@@ -176,15 +144,12 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
         self._default_tokenizer = None
         self.use_distributed_optimizer = kwargs.pop('use_distributed_optimizer', True)
         self.variable_seq_lengths = kwargs.get('variable_seq_lengths', True)
-        # MoE routing replay (R2/R3). mcore builds one RouterReplay per MoE router only when
-        # ``moe_enable_routing_replay`` is set on the TransformerConfig, so translate the caller-facing
-        # ``enable_router_replay`` flag into it here (it flows through MegatronStrategy.get_model_config
-        # -> MCoreBridgeBackend.build_model_config's ``config_kwargs.update(kwargs)``). Symmetric with
-        # TransformersModel's ``enable_router_replay`` (basic principle 1: the two backends are equivalent).
         self._router_replay_enabled = bool(kwargs.pop('enable_router_replay', False))
         self._router_replay_applied = False
         if self._router_replay_enabled:
             kwargs['moe_enable_routing_replay'] = True
+        if MegatronStrategy.uses_fsdp(ddp_config):
+            os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '32'
         torch_util.set_device()
         self._try_init_process_group()
         # MindSpeed must patch before mcore_bridge imports its patcher, otherwise
@@ -213,18 +178,10 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
         if config is not None:
             self.hf_config = config
         elif model_loader is not None:
-            # Same caller-supplied builder contract as TransformersModel (see ModelLoaderProtocol): a
-            # loader (build_config + process_config -- dev's ModelLoader) owns the HF config, so a family
-            # that rewrites it keeps doing so on this backend too. Only the config hooks apply here;
-            # mcore builds the module itself, and weights come from bridge.load_weights below.
             self.hf_config = model_loader.process_config(model_loader.build_config(self._model_path))
         else:
             from transformers import AutoConfig
             self.hf_config = AutoConfig.from_pretrained(self._model_path, trust_remote_code=True)
-        # Extend the tokenizer and raise hf_config.vocab_size BEFORE the strategy reads it: mcore sizes the
-        # VocabParallelEmbedding from this config (get_model_config -> hf_to_mcore_config), so the new rows
-        # already exist (zero-filled) at build time and are re-initialized just below. Worker-side, because
-        # the driver holds only a proxy stub.
         if new_special_tokens:
             self._extend_vocab_for_new_special_tokens(new_special_tokens)
         self.strategy = MegatronStrategy(
@@ -357,6 +314,9 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
                 num_to_initialize = int(initialize_mask.sum().item())
                 if num_to_initialize == 0:
                     continue
+                from megatron.core import mpu
+                if mpu.get_data_parallel_rank() == 0:
+                    logger.info(f'Initializing {num_to_initialize} zero rows of {key!r} for new special tokens.')
                 tensor = module.weight.new_empty(num_to_initialize, module.weight.shape[1])
                 module.weight.data[initialize_mask] = init_method(tensor)
                 if getattr(module.weight, 'main_param', None) is not None:

@@ -6,7 +6,7 @@ from typing import Any, Dict, Literal, Mapping, Optional
 from twinkle import DeviceMesh
 from twinkle.model.state_dict_utils import collect_local_state, is_saveable_adapter_key
 from .base import TransformerStrategyBase
-from .load_context import fsdp_pretrained_load_context
+from ..feature_hooks import fsdp_pretrained_load_context
 
 
 class AccelerateStrategy(TransformerStrategyBase):

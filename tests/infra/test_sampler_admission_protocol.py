@@ -52,6 +52,18 @@ class _ProbeActor:
         time.sleep(PROBE_SLEEP)
         return [(self.name, item) for item in items]
 
+    def _submit_generation(self, submission_id, inputs, sampling_params=None, adapter_name='',
+                            adapter_path=None, **kwargs):
+        self.events.append(('submit_generation', time.time(), submission_id))
+        return {'submission_id': submission_id, 'status': 'running'}
+
+    def _cancel_all_generations(self):
+        self.events.append(('cancel_all_generations', time.time(), None))
+        return {'submissions': 0, 'cancelled': 0}
+
+    def _cancel_generation(self, submission_id):
+        return {'submission_id': submission_id, 'status': 'missing'}
+
     def _twinkle_async_probe(self, items):
         return self.probe(items)
 
@@ -146,7 +158,7 @@ class _ProbeSampler(Sampler):
         return [self._second_worker_id]
 
     def _reap_generation_owners(self):
-        """No-op stand-in for the GenerationSubmissionMixin hook real samplers carry."""
+        """No-op stand-in for the async-submission capability hook real samplers carry."""
 
     @remote_function(dispatch='slice', collect='flatten', lazy_collect=False, worker_selector='_pick_second')
     def sel_probe(self, items):
@@ -186,7 +198,7 @@ def _install(driver, actor_names, *, state='ACTIVE'):
     actors = [_ProbeActor.remote(name) for name in actor_names]
     driver._actors = tuple(actors)
     driver._generation_owners = {}
-    driver._round_robin = 0
+    driver._worker_pool._default_router._rotation = 0
     driver._worker_pool.install_slots(actors, tuple((index, ) for index in range(len(actors))), 'probe-group',
                                       state=state)
     driver._second_worker_id = get_worker_id(actors[1])
@@ -401,6 +413,50 @@ def test_continuous_work_least_load_balance(driver):
     assert sorted(names) == ['w0', 'w0', 'w1', 'w1'], '4 requests must split 2/2 over 2 idle workers'
 
 
+def test_router_extension_point(driver):
+    """A pluggable Router wins over the built-in default, abstention falls back to it,
+    and naming a non-admissible worker fails loudly."""
+    import zlib
+
+    from twinkle.infra.worker_pool import Router
+
+    pool = driver._worker_pool
+    workers = list(pool.sampling_worker_ids())
+
+    class StickyRouter(Router):
+
+        def select(self, method, args, kwargs, view):
+            submission_id = args[0]
+            return (workers[zlib.crc32(str(submission_id).encode('utf-8')) % len(workers)],)
+
+    try:
+        pool.router = StickyRouter()
+        first = pool.select_worker('submit_generation', ('sid-router-a', [1]), {})
+        second = pool.select_worker('submit_generation', ('sid-router-a', [2]), {})
+        assert first == second, 'same submission id must stay sticky'
+        assert first in workers
+
+        class AbstainingRouter(Router):
+
+            def select(self, method, args, kwargs, view):
+                return None
+
+        pool.router = AbstainingRouter()
+        fallback = pool.select_worker('submit_generation', ('sid-router-c', [3]), {})
+        assert fallback in workers, 'abstention falls back to the built-in default'
+
+        class RogueRouter(Router):
+
+            def select(self, method, args, kwargs, view):
+                return ('nonexistent-worker',)
+
+        pool.router = RogueRouter()
+        with pytest.raises(RuntimeError, match='non-admissible worker'):
+            pool.select_worker('submit_generation', ('sid-router-x', [4]), {})
+    finally:
+        pool.router = None
+
+
 def test_dispatch_generation_sticky_for_small_batch():
     """Same submission id routes to one worker; the batch smaller than the DP size lands whole."""
     sticky_a = _dispatch_generation(2, 0, ('sid-a', ['x']), {})
@@ -427,6 +483,37 @@ def test_dispatch_generation_sticky_for_small_batch():
 
 
 # --- G: serialization boundary -----------------------------------------------------
+
+
+def test_remote_class_attaches_capabilities(driver):
+    """A plain ``_CAPABILITIES`` dict is attached by remote_class; undeclared classes stay clean,
+    and a class-body name colliding with the bundle fails loudly at decoration time."""
+    from twinkle.infra import remote_class
+
+    def _cap_method(self):
+        return 'cap'
+
+    bundle = {'cap_probe': _cap_method}
+
+    class _Capable:
+        _CAPABILITIES = bundle
+
+    class _Bare:
+        pass
+
+    capable = remote_class()(_Capable)
+    remote_class()(_Bare)
+    assert capable().cap_probe() == 'cap'
+    assert not hasattr(_Bare, 'cap_probe'), 'capability must not leak onto undeclared classes'
+
+    class _Conflict:
+        _CAPABILITIES = bundle
+
+        def cap_probe(self):
+            return 'own'
+
+    with pytest.raises(ValueError, match='already defines'):
+        remote_class()(_Conflict)
 
 
 def test_remote_class_auto_attaches_pool_facade(driver):

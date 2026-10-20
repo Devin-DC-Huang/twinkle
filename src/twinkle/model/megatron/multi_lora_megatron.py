@@ -56,8 +56,6 @@ class MultiLoraMegatronModel(MegatronModel):
         **kwargs,
     ):
         requires('megatron_core')
-        # Same ordering constraint as MegatronModel: must precede the CUDA context creation below.
-        MegatronStrategy.apply_process_env(ddp_config)
         nn.Module.__init__(self)
         from twinkle.patch.megatron_peft import MegatronPeft
 
@@ -71,6 +69,9 @@ class MultiLoraMegatronModel(MegatronModel):
         self.use_distributed_optimizer = False
         self.variable_seq_lengths = kwargs.get('variable_seq_lengths', True)
         self.optimizer_group = {}
+        # Same ordering constraint as MegatronModel: must precede the CUDA context creation below.
+        if MegatronStrategy.uses_fsdp(ddp_config):
+            os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '32'
         torch_util.set_device()
         self._try_init_process_group()
         ensure_mindspeed_adaptor_patched()

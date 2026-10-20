@@ -22,6 +22,7 @@ from twinkle.utils import DeviceMesh, Platform, check_unsafe, get_logger
 from . import _torch_setup
 from .continuous_work import (_WORKER_ASYNC_PREFIX, _cw_barrier, _cw_batch_len, _cw_register, _cw_unregister,
                               _run_continous_work, _select_workers, get_worker_id, _make_worker_async_companion)
+from twinkle.utils.lazy_collect import get_lazy_collect
 from .worker_pool import with_worker_pool
 
 logger = get_logger()
@@ -855,7 +856,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                         # This is a result future, call it to get the actual result
                         result_func = RayHelper.do_get_and_collect_func(
                             _collect_func, collect, result, device_mesh, timeout=_rgt)
-                        _local_lazy_collect = infra._lazy_collect
+                        _local_lazy_collect = get_lazy_collect()
                         recorder = _pool.record_configuration if _pool is not None else None
                         if func.__name__ == '__iter__':
                             # return self
@@ -941,7 +942,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
         wrapper._execute = execute
         wrapper._collect = collect
         wrapper._dispatch = dispatch
-        wrapper._lazy_collect = infra._lazy_collect
+        wrapper._lazy_collect = get_lazy_collect()
         wrapper._sync = sync
         wrapper._enable_continous_work = enable_continous_work
         if enable_continous_work:

@@ -270,10 +270,10 @@ def submit_generation(self, submission_id: str, inputs: Any, sampling_params=Non
                 raise ValueError(f'target_worker must be in [0, {len(candidates)}), got {target_worker!r}.')
             worker_id = candidates[target_worker]
         else:
-            offset = self._round_robin % len(candidates)
-            rotated = candidates[offset:] + candidates[:offset]
-            worker_id = min(rotated, key=lambda candidate: self._sampler_workers[candidate].inflight)
-            self._round_robin = candidates.index(worker_id) + 1
+            worker_id = self._worker_pool.select_worker('submit_generation', (submission_id, inputs),
+                                                        dict(adapter_name=adapter_name))
+            if worker_id is None:
+                raise RuntimeError('No ACTIVE sampler worker is available for generation admission.')
         owner = GenerationOwner(worker_id, time.monotonic())
         self._generation_owners[submission_id] = owner
         self._sampler_workers[worker_id].inflight += 1
@@ -311,9 +311,9 @@ def get_generation_status(self, submission_id: str):
 def collect_generation(self, submission_id: str):
     self._check_generation_control()
     if not hasattr(self, '_sampler_workers'):
-        from twinkle.infra import _lazy_collect
+        from twinkle.utils.lazy_collect import get_lazy_collect
         result = self._collect_generation(submission_id)
-        if not getattr(self, '_lazy_collect', _lazy_collect) and callable(result):
+        if not getattr(self, '_lazy_collect', get_lazy_collect()) and callable(result):
             return result()
         return result
     with self._worker_lock:

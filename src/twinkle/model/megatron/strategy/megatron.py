@@ -1,7 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import contextlib
 import gc
-import os
 
 import torch
 import torch.nn as nn
@@ -101,56 +100,16 @@ class MegatronStrategy:
     #: it from ``use_megatron_fsdp`` -- so a config carrying either key means the same thing here.
     _FSDP_KEYS = ('use_megatron_fsdp', 'use_custom_fsdp')
 
-    #: What to raise CUDA_DEVICE_MAX_CONNECTIONS to for FSDP. megatron only requires "> 1"; 32 is
-    #: the value its own error message suggests, and matches legacy Megatron-SWIFT.
-    _FSDP_DEVICE_MAX_CONNECTIONS = '32'
-
     @classmethod
     def uses_fsdp(cls, ddp_config: Optional[Dict[str, Any]]) -> bool:
         """Whether this ddp_config asks for Megatron-FSDP rather than DDP.
 
-        Public because the decision is needed before a strategy instance exists (see
-        ``apply_process_env``) and it must not be spelled out twice: the wrapper class, the
-        checkpoint sharding type and the device-connection count all have to agree, and they are
-        chosen at three different points in the run.
+        Public because the verdict is needed at several points where no strategy instance exists
+        yet: the wrapper class choice, the checkpoint sharding type and the optimizer wiring all
+        have to agree, and they are decided at different points in the run.
         """
         ddp_config = ddp_config or {}
         return any(ddp_config.get(key) for key in cls._FSDP_KEYS)
-
-    @classmethod
-    def apply_process_env(cls, ddp_config: Optional[Dict[str, Any]] = None) -> None:
-        """Set the environment megatron needs latched BEFORE the CUDA context is created.
-
-        Must run before ``torch_util.set_device()``, which creates the context: the CUDA driver reads
-        CUDA_DEVICE_MAX_CONNECTIONS when it builds the context, so writing it afterwards is silently
-        a no-op. That is why this is a classmethod called by the model rather than something the
-        strategy's ``__init__`` does -- the strategy is only constructed after the device is set.
-
-        CUDA_DEVICE_MAX_CONNECTIONS caps the hardware work queues per context, and the two
-        data-parallel modes want opposite things from it:
-
-        - DDP with tensor parallelism wants ``1``, which forces kernels to be issued in call order so
-          that a collective launched just before a GEMM really does overlap with it. megatron is
-          explicit that this ordering is "necessary for a speedup but not for correctness"
-          (tensor_parallel/layers.py) and only *warns* when the value is something else.
-        - FSDP wants more than 1, because it issues several parameter all-gathers concurrently to
-          overlap them with compute, and a single queue serializes those instead.
-
-        So this is a performance knob in both directions: choosing the wrong one is slow, not wrong.
-        """
-        os.environ['TOKENIZERS_PARALLELISM'] = 'true'
-        if not cls.uses_fsdp(ddp_config):
-            os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
-            return
-        # Only override the value the framework itself would have chosen. Someone who picked their
-        # own connection count knows their topology better than we do -- except for '1', which is
-        # the single value FSDP cannot work with, and is also exactly what twinkle's own Ray worker
-        # bootstrap leaves behind.
-        current = os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS')
-        if current in (None, '1'):
-            os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = cls._FSDP_DEVICE_MAX_CONNECTIONS
-            logger.info(f'Megatron-FSDP requires CUDA_DEVICE_MAX_CONNECTIONS > 1; set to '
-                        f'{cls._FSDP_DEVICE_MAX_CONNECTIONS} (was {current!r}). Export your own value to override.')
 
     def __init__(
         self,
