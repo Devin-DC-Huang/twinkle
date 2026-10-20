@@ -26,6 +26,8 @@ from typing import TYPE_CHECKING, Optional
 from twinkle.patch import Patch
 from twinkle.patch.transformers_emb import _LM_HEADS, get_lm_head_model
 
+_MARKER = '_twinkle_reranker_head'
+
 if TYPE_CHECKING:
     import torch
 
@@ -51,6 +53,11 @@ class TransformersGenerativeRerankerPatch(Patch):
                 head = getattr(lm_head_model, name)
                 break
         assert head is not None, 'Cannot find the proper lm_head name'
+        # Idempotent: a second apply must not wrap the first wrapper (unpatch only restores one layer).
+        if getattr(head.forward, _MARKER, False):
+            self._head = head
+            self._origin_forward = getattr(head.forward, '_origin_forward', head.forward)
+            return module
 
         # Save originals BEFORE mutation so unpatch can restore them verbatim.
         self._head = head
@@ -65,7 +72,10 @@ class TransformersGenerativeRerankerPatch(Patch):
             logits = F.linear(hidden_states, weight)
             return logits[..., 0:1] - logits[..., 1:2]
 
-        head.forward = MethodType(_reranker_head_forward, head)
+        wrapper = MethodType(_reranker_head_forward, head)
+        setattr(wrapper, _MARKER, True)
+        wrapper._origin_forward = self._origin_forward
+        head.forward = wrapper
         return module
 
     def unpatch(self, module, *args, **kwargs):

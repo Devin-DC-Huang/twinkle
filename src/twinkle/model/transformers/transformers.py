@@ -936,8 +936,13 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             resolve_router_replay_mode(router_replay_mode), routed_experts, batch_size,
             router_replay_manual_cleanup, replay_mask)
 
-        with _resolve_task_context(self.model, task, template=optimizer_config.template), \
-                _resolve_mm_graph_context(self.model, optimizer_config.template):
+        # Per-forward task patches probe module attributes (score/classifier heads,
+        # get_image_features) that DDP-wrapped models do not forward -- resolve them on the
+        # unwrapped module. Hooks registered there still fire: the wrapper's forward calls
+        # the inner module's __call__.
+        unwrapped_model = self.strategy.unwrap_model(self.model)
+        with _resolve_task_context(unwrapped_model, task, template=optimizer_config.template), \
+                _resolve_mm_graph_context(unwrapped_model, optimizer_config.template):
             outputs = self.model(**inputs)
 
         recorded_routing = rr_cleanup()
@@ -1087,7 +1092,8 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             lora_ctx = (
                 unwrapped_model.disable_adapter()
                 if disable_lora and isinstance(unwrapped_model, PeftModel) else contextlib.nullcontext())
-            with _resolve_task_context(self.model, task, template=optimizer_config.template), lora_ctx:
+            # unwrapped on purpose: task patches probe head/module attributes DDP does not forward.
+            with _resolve_task_context(unwrapped_model, task, template=optimizer_config.template), lora_ctx:
                 outputs = self.model(**inputs)
 
             recorded_routing = rr_cleanup()
@@ -1857,6 +1863,9 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
                 param_groups_spec,
                 model=self.strategy.unwrap_model(self.model),
                 tower_prefixes=resolve_tower_prefixes(self.model_arch))
+        if galore_config is not None and muon_config is not None:
+            raise ValueError('galore_config and muon_config are mutually exclusive: the Muon grouping '
+                             'would stamp GaLore keys (rank, proj_type, ...) onto every sub-group.')
         if galore_config is not None:
             if isinstance(galore_config, dict):
                 galore_config = GaLoreConfig(**galore_config)
@@ -1864,7 +1873,14 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         if muon_config is not None:
             if isinstance(muon_config, dict):
                 muon_config = MuonConfig(**muon_config)
-            params = create_muon_param_groups(params, muon_config)
+            # Families whose output head is not called 'lm_head' (internlm2 'output', chatglm
+            # 'transformer.output_layer', ...) would otherwise take the Muon update; the embedding
+            # side needs no key because create_muon_param_groups excludes it by type.
+            lm_head = self.model_arch.get('lm_head')
+            if lm_head and lm_head not in muon_config.exclude_keys:
+                muon_config.exclude_keys = list(muon_config.exclude_keys) + [lm_head]
+            params = create_muon_param_groups(
+                params, muon_config, model=self.strategy.unwrap_model(self.model))
         if hasattr(self.strategy, 'adjust_optimizer_kwargs'):
             kwargs = self.strategy.adjust_optimizer_kwargs(optimizer_cls, kwargs)
         optimizer_config.optimizer = construct_class(
