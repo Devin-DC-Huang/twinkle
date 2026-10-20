@@ -1,12 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import asyncio
 import contextlib
 import json
 import numpy as np
 import os
 import random
 import re
-import threading
 import torch
 import torch.distributed as dist
 import transformers
@@ -28,14 +26,18 @@ import twinkle.module.scheduler
 from twinkle import DeviceMesh, Platform, remote_class, remote_function
 from twinkle.checkpoint_engine import CheckpointEngine
 from twinkle.checkpoint_engine.mixin import CheckpointEngineMixin
+from twinkle.checkpoint_engine.weight_keys import (add_base_layer_suffix, is_lora_key, normalize_param_name,
+                                                   print_weight_example)
 from twinkle.data_format import InputFeature, ModelOutput, SampleResponse, SamplingParams, Trajectory
 from twinkle.hub import HubOperation
 from twinkle.infra import collect_dp_and_flatten, collect_tensor_dict
 from twinkle.loss import CrossEntropyLoss, Loss
 from twinkle.metric import Accuracy, LossMetric, Metric, TrainMetric
 from twinkle.model.base import ModelLoaderProtocol, TrainableModel, copy_checkpoint_args, rotate_checkpoints
+from twinkle.model.state_dict_utils import normalize_adapter_keys
 from twinkle.model.micro_batch import MicroBatchConfig, plan_micro_batches, select_batch
 from twinkle.model.optimizer_group import BaseOptimizerGroup, TrainStatus
+from twinkle.model.transformers import feature_hooks
 from twinkle.model.transformers.moe import apply_expert_parallel
 from twinkle.model.transformers.strategy import AccelerateStrategy, DeepSpeedStrategy, NativeFSDPStrategy
 from twinkle.module.optimizer import (GaLoreConfig, MuonConfig, apply_param_groups_spec, create_galore_param_groups,
@@ -465,58 +467,21 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         self.optimizer_group[_default_adapter_name].adapter_name = _default_adapter_name
         self.active_group = _default_adapter_name
 
+    # Optional-feature thin shells over twinkle.model.transformers.feature_hooks; the
+    # same-named methods stay so subclasses can override them.
+
     def _activate_neftune(self, neftune_noise_alpha: float) -> None:
-        """Add NEFTune uniform noise to the embedding output during training only.
-
-        Mirrors ``transformers.integrations.neftune.neftune_post_forward_hook``: scale is
-        ``alpha / sqrt(seq_len * hidden)`` and the hook is a no-op when the module is in eval mode, so
-        validation and generation see clean embeddings. Registered on the input-embedding module object,
-        which a later LoRA/DDP wrap preserves (they wrap Linear layers / the top model, not this module).
-        """
-        embeddings = self.model.get_input_embeddings()
-        if embeddings is None:
-            logger.warning('neftune_noise_alpha is set but the model exposes no input embeddings; skipping NEFTune.')
-            return
-
-        def neftune_post_forward_hook(module, input, output):
-            if not module.training:
-                return output
-            dims = torch.tensor(output.size(1) * output.size(2))
-            mag_norm = neftune_noise_alpha / torch.sqrt(dims)
-            return output + torch.zeros_like(output).uniform_(-mag_norm, mag_norm)
-
-        embeddings.register_forward_hook(neftune_post_forward_hook)
+        """See :func:`feature_hooks.activate_neftune`."""
+        feature_hooks.activate_neftune(self.model, neftune_noise_alpha)
 
     def _apply_liger_kernel(self, liger_kernel_config: Optional[Dict[str, Any]] = None) -> None:
-        """Patch the HF module's per-layer ops with Liger kernels via the mapping-driven ``kernelize``.
-
-        ``liger_kernel_config`` (an ``{op: bool}`` dict) switches individual ops off on top of Liger's
-        default set; None keeps the default. ``kernelize`` mutates the module in place (class / forward
-        replacement), which is why it belongs at the end of construction, before the optimizer is built.
-        The fused-linear-CE op is deliberately not a target here -- it skips the lm_head GEMM rather than
-        swapping a layer, so it is a loss-path selection, not a kernelize op.
-        """
-        from twinkle.kernel import kernelize
-        kernelize(self.model, self._liger_kernel_mapping(liger_kernel_config))
+        """See :func:`feature_hooks.apply_liger_kernel`."""
+        feature_hooks.apply_liger_kernel(self.model, liger_kernel_config)
 
     @staticmethod
     def _liger_kernel_mapping(liger_kernel_config: Optional[Dict[str, Any]]) -> Optional[dict]:
-        """DEFAULT_KERNEL_CONFIG minus any op the config switches off; None keeps the built-in default.
-
-        Returning None rather than a copy of the default matters: ``kernelize`` logs family-skips at DEBUG
-        on the default path but raises them to WARNING for any explicit mapping. 'fused_linear_cross_entropy'
-        is not a kernelize op, so it matches no DEFAULT_KERNEL_CONFIG entry and is ignored here (the loss
-        side consumes it instead).
-        """
-        if not liger_kernel_config:
-            return None
-        from twinkle.kernel.config import DEFAULT_KERNEL_CONFIG
-        disabled = {op for op, enabled in liger_kernel_config.items() if not enabled}
-        return {
-            target: choice
-            for target, choice in DEFAULT_KERNEL_CONFIG.items()
-            if getattr(choice, 'op', None) not in disabled
-        }
+        """See :func:`feature_hooks.liger_kernel_mapping`."""
+        return feature_hooks.liger_kernel_mapping(liger_kernel_config)
 
     def _apply_new_special_tokens(self, new_special_tokens: List[str]) -> None:
         """Grow the tokenizer's vocabulary with ``new_special_tokens`` and resize the embeddings to match.
@@ -686,26 +651,6 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         return f'{type(self).__name__}(model_id={getattr(self, "model_id", None)!r})'
 
     @staticmethod
-    def _not_encoded(inputs):
-        # A packed batch arrives as list[list[InputFeature]]: PackingDataset yields a list of encoded rows
-        # per item and the processor flattens it only later (prepare_inputs), after this probe has run.
-        # Descend to the first leaf dict so the probe reads a packed batch's encoding state instead of
-        # asserting on the intermediate list; for a flat dict / list[dict] the loop is a no-op.
-        while isinstance(inputs, (list, tuple)):
-            if not inputs:
-                return False
-            inputs = inputs[0]
-        assert isinstance(inputs, dict)
-        # A row is encoded once it carries ANY tokenized field, not only a bare `input_ids`. Embedding /
-        # reranker rows are GROUP-shaped: one row holds an anchor plus its candidates under prefixed keys
-        # (`anchor_input_ids`, `positive_input_ids`, `negative0_input_ids`, ...) and the processor splits
-        # it into flat per-sequence rows later (prepare_inputs). A raw Trajectory never carries a
-        # `*input_ids` key (it has `messages` + media), so keying on the suffix distinguishes the two
-        # without a bare-`input_ids`-only probe misreading a group row as raw and re-encoding it.
-        return not any(
-            k in ('input_ids', 'input_embedding') or k.endswith('_input_ids') or k.endswith('_input_embedding')
-            for k in inputs)
-
     def _lazy_wrap_model(self):
         if not self._model_wrapped:
             optimizer_groups = [og for og in self.optimizer_group.values() if og.optimizer is not None]
@@ -1938,6 +1883,10 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
 
     def __del__(self):
         HubOperation.wait_for()
+        # Chain to AsyncSaveMixin.__del__: an unjoined in-flight async write at teardown
+        # would silently lose the checkpoint. TrainableModel defines no __del__, so this
+        # call lands on the mixin.
+        super().__del__()
 
     # lazy_collect=False: save is a persistence side-effect the caller acts on immediately (it rotates
     # old checkpoints, writes args.json INTO the dir, and returns a path `swift infer` reloads), so the
@@ -2096,29 +2045,11 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
 
     def _get_adapter_state_dict_for_save(self, adapter_name: str) -> dict:
         """Return PEFT-normalized adapter state dict for saving."""
-        # Avoid collecting the full base model for large FSDP/EP jobs.
+        # The strategy collector already gathers modules_to_save copies together with
+        # their persistent buffers (state_dict_utils.collect_local_state), so only the
+        # PEFT wrapper key segments remain to be stripped here.
         adapter_state = self.strategy.get_adapter_state_dict(self.model, adapter_name)
-        adapter_suffix = f'.{adapter_name}.'
-        modules_to_save_infix = f'.modules_to_save.{adapter_name}.'
-        # Strategies collect parameters without materializing the full backbone state.
-        # PEFT modules_to_save also require persistent buffers (e.g. calibration state).
-        model = self.strategy.unwrap_model(self.model)
-        for module_name, module in model.named_modules():
-            if modules_to_save_infix not in f'{module_name}.':
-                continue
-            for buffer_name, buffer in module.named_buffers(recurse=False):
-                if buffer_name in module._non_persistent_buffers_set:
-                    continue
-                key = f'{module_name}.{buffer_name}'
-                adapter_state[key] = Torch.to_local_tensor(buffer).detach().cpu()
-        processed_state_dict = {}
-        for key, value in adapter_state.items():
-            if modules_to_save_infix in key:
-                normalized = key.replace(modules_to_save_infix, '.')
-            else:
-                normalized = key.replace(adapter_suffix, '.')
-            processed_state_dict[normalized] = value
-        return processed_state_dict
+        return normalize_adapter_keys(adapter_state, adapter_name)
 
     def _optimizer_param_name_mapping(self, adapter_name: str, optimizer: Optimizer) -> Dict[str, str]:
         """Map runtime optimizer parameter names to checkpoint names."""
@@ -2728,40 +2659,9 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
     ):
         if adapter_name is None:
             adapter_name = self._get_default_group()
-        # Get state dict from unwrapped model
+        # Get state dict from unwrapped model. Key shaping (PEFT segment stripping,
+        # vLLM base_layer renaming) lives in twinkle.checkpoint_engine.weight_keys.
         model = self.strategy.unwrap_model(self.model)
-
-        def _normalize(name: str, keep_base_layer: bool) -> str:
-            name = name.replace('base_model.model.', '')
-            if not keep_base_layer:
-                name = name.replace('.base_layer', '')
-            return name
-
-        def _add_base_layer_suffix(name):
-            # vLLM (enable_lora) wraps some modules as ``*WithLoRA`` and exposes
-            # only their ``.base_layer.*`` param, even when PEFT does not target
-            # them on the training side (e.g. linear-attn ``conv1d`` /
-            # ``in_proj_qkvz``).  Rename to match whenever the sampler exposes
-            # the ``.base_layer.`` variant.
-            base_layer_name = None
-            if name.endswith('.weight'):
-                base_layer_name = f'{name[:-7]}.base_layer.weight'
-                if not model_keys or base_layer_name in model_keys:
-                    name = base_layer_name
-            elif name.endswith('.bias'):
-                base_layer_name = f'{name[:-5]}.base_layer.bias'
-                if not model_keys or base_layer_name in model_keys:
-                    name = base_layer_name
-            if 'experts' in name and base_layer_name is not None:
-                return base_layer_name
-            return name
-
-        def _print_weight_example(names):
-            for name in names[:3]:
-                logger.info(f'Sync weight: {name}')
-
-        def _is_lora_key(name: str) -> bool:
-            return 'lora_A' in name or 'lora_B' in name or 'lora_embedding' in name
 
         if base_sync_done and adapter_name:
             if merge_and_sync:
@@ -2773,13 +2673,13 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
                         model.merge_adapter()
                     names = []
                     for name, tensor in model.state_dict().items():
-                        if _is_lora_key(name):
+                        if is_lora_key(name):
                             continue
                         tensor = Torch.to_local_tensor(tensor)
-                        name = _normalize(name, keep_base_layer=False)
+                        name = normalize_param_name(name, keep_base_layer=False)
                         names.append(name)
                         yield name, tensor
-                    _print_weight_example(names)
+                    print_weight_example(names)
                     if isinstance(model, PeftModel):
                         model.unmerge_adapter()
             else:
@@ -2792,10 +2692,10 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
                     names = []
                     for name, tensor in lora_state_dict.items():
                         tensor = Torch.to_local_tensor(tensor)
-                        name = _normalize(name, keep_base_layer=True)
+                        name = normalize_param_name(name, keep_base_layer=True)
                         names.append(name)
                         yield name, tensor
-                    _print_weight_example(names)
+                    print_weight_example(names)
 
         else:
             # First full base-model sync.  When the sampler runs with
@@ -2808,79 +2708,21 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             def weight_generator():
                 names = []
                 for name, tensor in state_dict.items():
-                    if _is_lora_key(name):
+                    if is_lora_key(name):
                         continue
                     tensor = Torch.to_local_tensor(tensor)
-                    name = _normalize(name, keep_base_layer=False)
+                    name = normalize_param_name(name, keep_base_layer=False)
                     if add_base_layer:
-                        name = _add_base_layer_suffix(name)
+                        name = add_base_layer_suffix(name, model_keys)
                     names.append(name)
                     yield name, tensor
-                _print_weight_example(names)
+                print_weight_example(names)
 
         return weight_generator()
 
-    @remote_function(dispatch='all', lazy_collect=True)
-    @timed
-    def send_weights(
-        self,
-        adapter_name: str = None,
-        base_sync_done: bool = False,
-        merge_and_sync: bool = False,
-        model_keys: List[str] = None,
-        local: bool = False,
-        **kwargs,
-    ):
-        engine = self._get_or_create_checkpoint_engine()
-        if local:
-            weight_generator = self._get_local_weight_generator()
-        else:
-            weight_generator = self._get_weight_generator(
-                adapter_name=adapter_name,
-                base_sync_done=base_sync_done,
-                merge_and_sync=merge_and_sync,
-                model_keys=model_keys,
-                **kwargs,
-            )
-
-        # Run async send_weights in a dedicated event loop thread.
-        # We cannot use the Ray worker's event loop because it may already
-        # be occupied, and send_weights uses run_in_executor internally.
-        async def _send():
-            await engine.send_weights(weight_generator)
-
-        result_container = {'error': None}
-
-        def _run():
-            try:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    loop.run_until_complete(_send())
-                finally:
-                    loop.close()
-            except Exception as e:
-                result_container['error'] = e
-
-        thread = threading.Thread(target=_run)
-        thread.start()
-        thread.join()
-
-        if result_container['error'] is not None:
-            raise result_container['error']
-
     # ── Paired EMA support (policy→reference via checkpoint-engine) ─────────
-
-    @remote_function(dispatch='all', collect='none', lazy_collect=False)
-    def prepare_ema_sender(self):
-        """Prepare this rank's engine as master for a paired 2-rank EMA group.
-
-        Returns this rank's MasterMetadata (unique TCPStore port) so the manager
-        can relay it to the paired reference rank.
-        """
-        engine = self._get_or_create_checkpoint_engine()
-        engine.is_master = True
-        return engine.prepare()
+    # send_weights / prepare_ema_sender / receive_weights_ema are inherited from
+    # CheckpointEngineMixin (transport protocol); the weight-source hooks below feed them.
 
     def _get_local_weight_generator(self):
         """Yield (name, local_tensor) for this rank's shard — no cross-rank gathering.
@@ -2898,40 +2740,3 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         from twinkle.utils.torch_util import Torch
         model = self.strategy.unwrap_model(self.model)
         return {name: Torch.to_local_tensor(tensor) for name, tensor in model.state_dict().items()}
-
-    @remote_function(dispatch='all', lazy_collect=True)
-    @timed
-    def receive_weights_ema(self, alpha: float, **kwargs):
-        """Receive policy weights via checkpoint-engine and apply EMA to local params.
-
-        Streaming: processes one bucket at a time, so peak memory is one bucket
-        (not the full model).  Each received (name, tensor) is matched to the
-        local state dict by name; a mismatch raises KeyError immediately.
-        """
-        engine = self._get_or_create_checkpoint_engine()
-        local_state = self._get_local_state_dict()
-
-        async def _receive_and_ema():
-            async for name, tensor in engine.receive_weights():
-                param = local_state[name]
-                param.data.mul_(alpha).add_(tensor, alpha=1.0 - alpha)
-
-        result_container = {'error': None}
-
-        def _run():
-            try:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    loop.run_until_complete(_receive_and_ema())
-                finally:
-                    loop.close()
-            except Exception as e:
-                result_container['error'] = e
-
-        thread = threading.Thread(target=_run)
-        thread.start()
-        thread.join()
-
-        if result_container['error'] is not None:
-            raise result_container['error']

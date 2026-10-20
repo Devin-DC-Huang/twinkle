@@ -18,8 +18,8 @@ from twinkle.hub import HubOperation
 from twinkle.patch import Patch, apply_patch
 from twinkle.perf import timed
 from twinkle.sampler.base import Sampler
-from twinkle.sampler.generation_submission import GenerationSubmissionMixin
-from twinkle.sampler.partial_rollout import PartialRolloutMixin
+from twinkle.sampler.generation_submission import ASYNC_SUBMISSION_METHODS
+from twinkle.sampler.partial_rollout import PARTIAL_ROLLOUT_METHODS
 from twinkle.utils import Platform
 
 logger = get_logger()
@@ -43,7 +43,7 @@ def _convert_ndarray_to_list(obj: Any) -> Any:
 
 
 @remote_class()
-class SGLangSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, PartialRolloutMixin):
+class SGLangSampler(Sampler, CheckpointEngineMixin):
     """An sglang-based sampler using :class:`SGLangEngine`.
 
     Mirrors :class:`vLLMSampler`: tensor parallelism is taken from the visible devices unless given
@@ -63,6 +63,10 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, P
         ``sync_weights(merge_and_sync=False)`` cannot push adapter deltas incrementally -- use the
         default ``sync_weights(merge_and_sync=True)``, which sends merged base weights.
     """
+
+    # Capability declaration: remote_class attaches these method bundles before its
+    # method scan, so the engine's MRO stays free of any mixin base.
+    _CAPABILITIES = {**ASYNC_SUBMISSION_METHODS, **PARTIAL_ROLLOUT_METHODS}
 
     def __init__(self, model_id: str, engine_args: Dict[str, Any] = None, device_mesh: DeviceMesh = None, **kwargs):
         """Initialize SGLangSampler.
@@ -92,11 +96,11 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, P
         self._async_thread = threading.Thread(target=self._run_event_loop, daemon=True, name='SGLangSampler-EventLoop')
         self._async_thread.start()
 
-        # In-flight non-blocking generations keyed by submission id (GenerationSubmissionMixin). Each
+        # In-flight non-blocking generations keyed by submission id (the async-submission capability). Each
         # entry is a concurrent.futures.Future scheduled on ``self._async_loop`` above.
         self._generation_submissions: Dict[str, Any] = {}
 
-        # Engine request ids currently mid-generation (PartialRolloutMixin), so an in-place weight republish
+        # Engine request ids currently mid-generation (the partial-rollout capability), so an in-place weight republish
         # can abort them and let each resume on the fresh weights. Only touched from ``self._async_loop``.
         self._inflight_request_ids: set = set()
 
@@ -199,7 +203,7 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, P
 
         ``request_id`` is this generation's engine handle (sglang's ``rid``): auto-generated when not given,
         and registered as in-flight for the duration of the call so :meth:`abort_all_inflight`
-        (PartialRolloutMixin) can interrupt it and let a partial rollout resume from the tokens it produced
+        (the partial-rollout capability) can interrupt it and let a partial rollout resume from the tokens it produced
         before the abort. Mirrors ``vLLMSampler._sample_single`` so the resume loop is backend-agnostic.
         """
         if request_id is None:
@@ -283,7 +287,7 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, P
             ``adapter_paths`` is a list too and is sliced in lockstep, staying aligned with ``inputs``.
         """
         # One sampling path: the blocking sample is the async core driven to completion on the loop. The
-        # non-blocking submit_generation (GenerationSubmissionMixin) schedules the SAME coroutine and
+        # non-blocking submit_generation (the async-submission capability) schedules the SAME coroutine and
         # collects it later, so an overlapped RL rollout and a plain blocking call cannot drift.
         return self._run_in_loop(
             self._generate_inputs(
@@ -313,7 +317,7 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, P
         ``use_base_model`` drops the adapter so the base weights are sampled.
 
         With ``allow_partial_rollout`` each input is driven through
-        :meth:`~twinkle.sampler.partial_rollout.PartialRolloutMixin._run_partial_rollout`, so an abort from
+        :meth:`~twinkle.sampler.partial_rollout.the partial-rollout capability._run_partial_rollout`, so an abort from
         a concurrent in-place weight republish resumes it from its own tokens on the fresh weights instead
         of ending it truncated; otherwise each input is a single ``_sample_single`` attempt.
         """
@@ -373,7 +377,7 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, P
                 )
 
             # Partial rollout: one generation attempt is a plain _sample_single; the resume/merge loop
-            # (PartialRolloutMixin) re-runs it from new_input_feature when a republish aborts it. The core
+            # (the partial-rollout capability) re-runs it from new_input_feature when a republish aborts it. The core
             # path carries no per-attempt control-plane state, so run_attempt returns None for it.
             async def run_attempt(current_input, attempt_params, attempt):
                 response = await self._sample_single(

@@ -263,7 +263,13 @@ class CheckpointEngineManager:
                 # A failed sync can leave the transport half-torn -- a NCCL group in error state, a
                 # dead socket -- and the next sync only rebuilds on membership change. Close here so
                 # the next attempt rebuilds the channel instead of reusing the broken one.
-                self.close()
+                try:
+                    self.close()
+                except Exception:
+                    # Mirror __init__: a failing close (e.g. the remote actor already died) must
+                    # not replace the original sync failure -- warn and re-raise the root cause.
+                    logger.warning('Failed to fully close checkpoint channel %s after sync failure.',
+                                   self.channel, exc_info=True)
                 raise
 
     def _sync_weights(self, merge_and_sync=True):

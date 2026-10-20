@@ -832,8 +832,8 @@ class MultiTurnRollout(Rollout):
         """
         abort = getattr(getattr(self, 'sampler', None), 'abort_all_inflight', None)
         if not callable(abort):
-            raise RuntimeError('abort-on-publish needs a sampler with abort_all_inflight (twinkle '
-                               'PartialRolloutMixin): the core vLLM/SGLang samplers provide it.')
+            raise RuntimeError('abort-on-publish needs a sampler with abort_all_inflight (the twinkle '
+                               'partial-rollout capability): the core vLLM/SGLang samplers provide it.')
         return abort()
 
     @remote_function(dispatch='all', collect='none', lazy_collect=False)

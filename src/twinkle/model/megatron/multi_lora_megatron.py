@@ -27,7 +27,7 @@ from twinkle.utils import get_logger
 from twinkle.utils.safetensors import load_state_dict, save_state_dict
 from ..base import ModelLoaderProtocol
 from ..multi_lora import MultiLora
-from ._mindspeed_runtime import ensure_mindspeed_adaptor_patched
+from .utils._mindspeed_runtime import ensure_mindspeed_adaptor_patched
 from .megatron import MegatronModel
 from .strategy import MegatronStrategy
 
@@ -424,7 +424,9 @@ class MultiLoraMegatronModel(MegatronModel):
     @remote_function(execute='first')
     def get_state_dict(self, **kwargs):
         self._check_adapter_valid(kwargs.get('adapter_name'))
-        return self.multi_adapter.get_state_dict(**kwargs)
+        # MultiLora.get_state_dict takes the tenant name positionally; kwargs here
+        # only ever carries adapter_name.
+        return self.multi_adapter.get_state_dict(kwargs.get('adapter_name'))
 
     @remote_function(dispatch='all', sync=True, timeout=3600)
     def add_adapter_to_model(
@@ -435,15 +437,15 @@ class MultiLoraMegatronModel(MegatronModel):
     ):
         # prevent opening requires_grad of the base model
         # prevent loading malicious code
-        assert not isinstance(
-            config_or_dir, str
-        ), 'config_or_dir does not support str, because loading config from modelhub may causing unexpected behavior'
-        assert isinstance(config_or_dir, LoraConfig), 'config_or_dir must be a LoraConfig instance'
+        if isinstance(config_or_dir, str):
+            raise ValueError('config_or_dir does not support str, '
+                             'because loading config from modelhub may causing unexpected behavior')
+        if not isinstance(config_or_dir, LoraConfig):
+            raise ValueError('config_or_dir must be a LoraConfig instance')
         # Limit the max peft version in pyproject.toml, in case any newer version opens some untested module grad.
         config_or_dir.modules_to_save = None
         config_or_dir.bias = 'none'
         config_or_dir.init_lora_weights = False
-        config_or_dir.modules_to_save = None
         config_or_dir.trainable_token_indices = None
         self.optimizer_group[adapter_name] = self._construct_default_optimizer_group()
         self.optimizer_group[adapter_name].adapter_name = adapter_name

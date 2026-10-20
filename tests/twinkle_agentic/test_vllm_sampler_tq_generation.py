@@ -13,7 +13,7 @@ from twinkle.infra import _dispatch_args
 from twinkle.server.sampler.twinkle_handlers import _await_generation
 from twinkle_agentic.async_rl import LoraContext
 from twinkle_agentic.async_rl.types import PartitionAdmission, PromptGroup, RolloutPolicy
-from twinkle_agentic.async_rl.generation_submissions import _dispatch_generation
+from twinkle.sampler.generation_submission import _dispatch_generation
 from twinkle_agentic.async_rl.vllm_sampler_tq import (
     VLLMSamplerTQ,
     _GeneratedSample,

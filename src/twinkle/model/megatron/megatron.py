@@ -1,5 +1,4 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import asyncio
 import contextlib
 import inspect
 import json
@@ -8,7 +7,6 @@ import numpy as np
 import os
 import random
 import re
-import threading
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -26,6 +24,7 @@ import twinkle.metric
 import twinkle.patch
 from twinkle import DeviceMesh, Platform, remote_class, remote_function, requires, torch_util
 from twinkle.checkpoint_engine.mixin import CheckpointEngineMixin
+from twinkle.checkpoint_engine.weight_keys import add_base_layer_suffix, is_lora_key, normalize_param_name, print_weight_example
 from twinkle.data_format import InputFeature, ModelOutput, Trajectory, is_encoded
 from twinkle.hub import HubOperation
 from twinkle.infra import collect_tensor_dict, remote_function
@@ -39,7 +38,8 @@ from twinkle.perf import timed
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
 from twinkle.utils import construct_class, get_logger, selective_log_softmax
-from ._mindspeed_runtime import ensure_mindspeed_adaptor_patched
+from .utils import mtp
+from .utils._mindspeed_runtime import ensure_mindspeed_adaptor_patched
 from .strategy import MegatronStrategy
 
 logger = get_logger()
@@ -407,27 +407,6 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
         return self.active_group
 
     @staticmethod
-    def _not_encoded(inputs):
-        # A packed batch arrives as list[list[InputFeature]]: PackingDataset yields a list of encoded rows
-        # per item and the processor flattens it only later (prepare_inputs), after this probe has run.
-        # Descend to the first leaf dict so the probe reads a packed batch's encoding state instead of
-        # asserting on the intermediate list; for a flat dict / list[dict] the loop is a no-op.
-        while isinstance(inputs, (list, tuple)):
-            if not inputs:
-                return False
-            inputs = inputs[0]
-        assert isinstance(inputs, dict)
-        # A row is encoded once it carries ANY tokenized field, not only a bare `input_ids`. Embedding /
-        # reranker rows are GROUP-shaped: one row holds an anchor plus its candidates under prefixed keys
-        # (`anchor_input_ids`, `positive_input_ids`, `negative0_input_ids`, ...) and the processor splits
-        # it into flat per-sequence rows later (prepare_inputs). A raw Trajectory never carries a
-        # `*input_ids` key (it has `messages` + media), so keying on the suffix distinguishes the two
-        # without a bare-`input_ids`-only probe misreading a group row as raw and re-encoding it.
-        return not any(
-            k in ('input_ids', 'input_embedding') or k.endswith('_input_ids') or k.endswith('_input_embedding')
-            for k in inputs)
-
-    @staticmethod
     def _slice_value_for_microbatch(value, mb_start: int, mb_end: int, micro_batch_size: int):
         """Recursively slice a value for microbatch processing.
 
@@ -467,26 +446,13 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
     # Multi-Token Prediction (MTP) joint training
     # =========================================================================
 
-    def _mtp_training_enabled(self, *, forward_only: bool, task: str, disable_lora: bool) -> bool:
-        """Whether this pass should hand next-token targets to the MTP heads.
+    # MTP training: thin shells over twinkle.model.megatron.mtp module functions. The
+    # same-named methods stay so subclasses can override them and duck-typed callers
+    # (``getattr(model, 'pop_mtp_metrics')`` in swift) keep resolving.
 
-        The config declares the *intent* (``enable_mtp_training``); only the call site knows whether
-        a pass will be backward'ed. That split is necessary, not redundant: megatron's ``forward_only``
-        schedule skips the backward but neither switches the module to eval nor disables autograd, so
-        ``self.training`` and ``torch.is_grad_enabled()`` are both True on a log-prob pass. Running
-        the MTP block there would cost an extra transformer layer plus a full-vocabulary projection
-        per unroll step, and throw every bit of it away.
-        """
-        if not getattr(self.strategy.config, 'enable_mtp_training', False):
-            return False
-        if forward_only:
-            # old/reference log-probs. No backward, so the MTP forward would be pure waste.
-            return False
-        if task != 'causal_lm':
-            # A pooling head has no next-token target to give them.
-            return False
-        if disable_lora:
-            # The base-policy pass of a LoRA run; its gradients are discarded by construction.
+    def _mtp_training_enabled(self, *, forward_only: bool, task: str, disable_lora: bool) -> bool:
+        if not mtp.mtp_pass_enabled(getattr(self.strategy.config, 'enable_mtp_training', False),
+                                    forward_only=forward_only, task=task, disable_lora=disable_lora):
             return False
         if not self._mtp_trainable_checked:
             self._mtp_trainable_checked = True
@@ -494,103 +460,16 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
         return True
 
     def _iter_mtp_modules(self):
-        """The MTP blocks across model chunks, skipping ranks and chunks that hold none.
-
-        ``mtp`` sits on the language model, which for a multimodal model is one level down. PP ranks
-        other than the last have no MTP block at all, and a PeftModel forwards the lookup to its base.
-        """
-        for _model in self.strategy.unwrap_model(self.model):
-            mtp = getattr(_model, 'mtp', None)
-            if mtp is None:
-                language_model = getattr(_model, 'language_model', None)
-                mtp = getattr(language_model, 'mtp', None) if language_model is not None else None
-            if mtp is not None:
-                yield mtp
+        return mtp.iter_mtp_modules(self.strategy.unwrap_model(self.model))
 
     def _warn_if_mtp_not_trainable(self):
-        """Warn when MTP training is asked for but nothing can receive the gradient.
-
-        LoRA is the way to get here that config validation cannot catch: it freezes every base
-        parameter, and the MTP layers are base parameters unless named in ``target_modules``. The
-        result is a run that pays for the MTP forward and reports an mtp_loss that never moves, which
-        is far harder to notice than an error.
-        """
-        mtp_modules = list(self._iter_mtp_modules())
-        if not mtp_modules:
-            # Expected on every PP rank but the last; those ranks have no MTP block to check.
-            return
-        if any(p.requires_grad for mtp in mtp_modules for p in mtp.parameters()):
-            return
-        logger.warning('enable_mtp_training is set, but no MTP parameter has requires_grad=True, so the '
-                       'MTP loss will be computed and then discarded. With LoRA this means the MTP '
-                       'layers are not covered by target_modules.')
+        mtp.warn_if_mtp_not_trainable(list(self._iter_mtp_modules()))
 
     @remote_function(collect='last_pp_first', lazy_collect=False)
     def pop_mtp_metrics(self, loss_scale: Optional[float] = None) -> dict[str, float]:
-        """Drain megatron's MTP loss tracker and return one entry per MTP depth, plus a total.
+        """Drain megatron's MTP loss tracker; see :func:`mtp.pop_mtp_metrics`."""
+        return mtp.pop_mtp_metrics(self._last_num_microbatches, loss_scale)
 
-        Draining rather than reading: the tracker accumulates across microbatches and megatron never
-        clears it, so a caller that only read it would report a monotonically growing loss. ``collect``
-        matches :meth:`calculate_metric` because the tracker is only populated where the MTP heads
-        live, which is the last pipeline stage.
-
-        Args:
-            loss_scale: Multiplier for the accumulated values. Defaults to ``1 / num_microbatches``
-                from the last :meth:`forward_backward` -- the tracker holds a per-microbatch sum while
-                the reported loss is a mean over them. The default is computed here rather than passed
-                in because the microbatch count is decided on this side: ``forward_backward`` picks
-                its own ``micro_batch_size`` and re-splits the inputs, so a caller counting the
-                batches it handed over would divide by the wrong number.
-
-        Returns:
-            ``{'mtp_1_loss': ..., ..., 'mtp_loss': <sum>}``, plus ``mtp_{i}_accept`` per depth when
-            the megatron version reports acceptance counts. Empty when MTP is off or nothing ran.
-        """
-        from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
-
-        tracker = MTPLossLoggingHelper.tracker
-        # mcore >= 0.19 renamed 'values' to 'loss_values' and added acceptance counts.
-        loss_key = 'loss_values' if 'loss_values' in tracker else 'values'
-        if loss_key not in tracker:
-            return {}
-        if loss_scale is None:
-            loss_scale = 1.0 / max(self._last_num_microbatches, 1)
-
-        if hasattr(MTPLossLoggingHelper, 'reduce_metrics_in_tracker'):
-            MTPLossLoggingHelper.reduce_metrics_in_tracker()
-        else:
-            self._reduce_mtp_tracker_legacy(tracker, loss_key)
-
-        losses = (tracker[loss_key] * loss_scale).tolist()
-        metrics = {f'mtp_{i + 1}_loss': float(v) for i, v in enumerate(losses)}
-        metrics['mtp_loss'] = float(sum(losses))
-
-        correct, total = tracker.get('correct_values'), tracker.get('total_values')
-        if correct is not None and total is not None:
-            for i, (c, t) in enumerate(zip(correct.tolist(), total.tolist(), strict=True)):
-                # The acceptance rate is what decides whether speculative decoding pays off at
-                # rollout time, so it is worth surfacing next to the loss rather than only the loss.
-                metrics[f'mtp_{i + 1}_accept'] = float(c / t) if t else 0.0
-
-        if hasattr(MTPLossLoggingHelper, 'clean_metrics_in_tracker'):
-            MTPLossLoggingHelper.clean_metrics_in_tracker()
-        else:
-            MTPLossLoggingHelper.clean_loss_in_tracker()
-        return metrics
-
-    @staticmethod
-    def _reduce_mtp_tracker_legacy(tracker, loss_key: str) -> None:
-        """The pre-0.19 reduction, which had no ``reduce_metrics_in_tracker`` to call.
-
-        Order matters: the sum across the reduce group first, then the average across the group the
-        loss is replicated over. Swapping them averages partial sums.
-        """
-        import torch.distributed as dist
-        values = tracker[loss_key]
-        if tracker.get('reduce_group') is not None:
-            dist.all_reduce(values, group=tracker['reduce_group'])
-        if tracker.get('avg_group') is not None:
-            dist.all_reduce(values, group=tracker['avg_group'], op=dist.ReduceOp.AVG)
 
     # lazy_collect=False: forward_only exists to hand its outputs back to the caller, so the driver must
     # receive the materialized dict rather than an un-collected callable. sync=True orders the workers but
@@ -1038,79 +917,33 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
 
         self._accumulate_metric(optimizer_config, is_training=not forward_only)
 
-        # Run forward-backward with Megatron's scheduler. Transaction hooks are restored even when
-        # the schedule raises, because the config object is shared by all later steps on this worker.
+        # Run forward-backward with Megatron's scheduler. The gradient-hook surgery for a
+        # transactional / deferred-finalize pass is owned by the strategy
+        # (transactional_grad_schedule restores the shared config even when the schedule raises).
         if rr_action is not None:
             # Set the action on every local router before the schedule; forward_step_func's dance then
             # flips REPLAY_FORWARD<->REPLAY_BACKWARD per microbatch (mirrors legacy base.py train_step).
             from twinkle.model.megatron.moe.router_replay import set_global_router_replay_action
             set_global_router_replay_action(rr_action)
-        config = self.strategy.config
-        original_grad_scale_func = config.grad_scale_func
-        original_no_sync_func = config.no_sync_func
-        original_grad_sync_func = config.grad_sync_func
-        original_finalize_model_grads_func = config.finalize_model_grads_func
-
-        scale = float(loss_weight)
-        if transactional:
-            gradient_accumulation_steps = int(kwargs.get('gradient_accumulation_steps') or 1)
-            if gradient_accumulation_steps < 1:
-                raise ValueError('gradient_accumulation_steps must be positive')
-            scale = scale / global_normalizer.clamp(min=1) / gradient_accumulation_steps
-
-        def transaction_grad_scale(value):
-            if original_grad_scale_func is not None:
-                value = original_grad_scale_func(value)
-            return value * scale
-
-        def disabled_no_sync():
-            return contextlib.nullcontext()
-
-        def disabled_grad_sync(*args, **kwargs):
-            return None
-
-        def disabled_finalize(*args, **kwargs):
-            return None
-
-        def finalize_accumulated_gradients(model, num_tokens=None, **finalize_kwargs):
-            return original_finalize_model_grads_func(model, None, **finalize_kwargs)
-
-        outer_no_sync = contextlib.ExitStack()
-        try:
-            with outer_no_sync:
-                if not forward_only and (transactional or loss_weight != 1.0):
-                    config.grad_scale_func = transaction_grad_scale
-                if not forward_only and not finalize_gradients:
-                    for model_chunk in self.model:
-                        if hasattr(model_chunk, 'no_sync'):
-                            outer_no_sync.enter_context(model_chunk.no_sync())
-                    if isinstance(original_no_sync_func, list):
-                        config.no_sync_func = [disabled_no_sync for _ in original_no_sync_func]
-                    else:
-                        config.no_sync_func = disabled_no_sync
-                    if isinstance(original_grad_sync_func, list):
-                        config.grad_sync_func = [disabled_grad_sync for _ in original_grad_sync_func]
-                    else:
-                        config.grad_sync_func = disabled_grad_sync
-                    config.finalize_model_grads_func = disabled_finalize
-                elif completing_pending and original_finalize_model_grads_func is not None:
-                    config.finalize_model_grads_func = finalize_accumulated_gradients
-
-                with _resolve_task_context(self.model, task):
-                    losses = forward_backward_func(
-                        forward_step_func=forward_step_func,
-                        data_iterator=data_iter,
-                        model=self.model,
-                        num_microbatches=len(inputs),
-                        seq_length=seq_length,
-                        micro_batch_size=micro_batch_size,
-                        forward_only=forward_only,
-                    )
-        finally:
-            config.grad_scale_func = original_grad_scale_func
-            config.no_sync_func = original_no_sync_func
-            config.grad_sync_func = original_grad_sync_func
-            config.finalize_model_grads_func = original_finalize_model_grads_func
+        with self.strategy.transactional_grad_schedule(
+                self.model,
+                forward_only=forward_only,
+                transactional=transactional,
+                loss_weight=loss_weight,
+                finalize_gradients=finalize_gradients,
+                completing_pending=completing_pending,
+                global_normalizer=global_normalizer,
+                **kwargs):
+            with _resolve_task_context(self.model, task):
+                losses = forward_backward_func(
+                    forward_step_func=forward_step_func,
+                    data_iterator=data_iter,
+                    model=self.model,
+                    num_microbatches=len(inputs),
+                    seq_length=seq_length,
+                    micro_batch_size=micro_batch_size,
+                    forward_only=forward_only,
+                )
 
         # Extract loss from results (only last PP stage returns non-empty)
         loss = torch.tensor(0.0).to(Platform.get_local_device())
@@ -1551,7 +1384,11 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
             Dict mapping parameter names to parameters.
         """
         is_default = adapter_name == _default_adapter_name
-        pattern = re.compile(rf'\.lora_\w+\.{re.escape(adapter_name)}\.')
+        # Same pattern family as the transformers backend: LoRA deltas plus the fully
+        # trained modules_to_save copies (megatron supports modules_to_save per chunk,
+        # see get_modules_to_save); missing it here would freeze those copies out of
+        # the optimizer group.
+        pattern = re.compile(rf'\.(?:lora_\w+|modules_to_save)\.{re.escape(adapter_name)}')
 
         params = {}
         model = self.strategy.unwrap_model(self.model)
@@ -2471,6 +2308,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
         base_sync_done: bool = False,
         merge_and_sync: bool = False,
         model_keys: List[str] = None,
+        **kwargs,
     ):
         if adapter_name is None:
             adapter_name = self._get_default_group()
@@ -2485,30 +2323,6 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
                 if isinstance(_model, PeftModel):
                     _model.unmerge_adapter()
 
-        def _normalize(name: str, keep_base_layer: bool) -> str:
-            name = name.replace('base_model.model.', '')
-            if not keep_base_layer:
-                name = name.replace('.base_layer', '')
-            return name
-
-        def _print_weight_example(names):
-            for name in names[:3]:
-                logger.info(f'Sync weight: {name}')
-
-        def _add_base_layer_suffix(name):
-            base_layer_name = None
-            if name.endswith('.weight'):
-                base_layer_name = f'{name[:-7]}.base_layer.weight'
-                if not model_keys or base_layer_name in model_keys:
-                    name = base_layer_name
-            elif name.endswith('.bias'):
-                base_layer_name = f'{name[:-5]}.base_layer.bias'
-                if not model_keys or base_layer_name in model_keys:
-                    name = base_layer_name
-            if 'experts' in name and base_layer_name is not None:
-                return base_layer_name
-            return name
-
         if base_sync_done and adapter_name:
             # The first base model synchronization finished, and is lora training
             if merge_and_sync:
@@ -2520,12 +2334,12 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
                             if name is None or tensor is None:
                                 continue
                             # Skip LoRA-specific weights for base model sync
-                            if 'lora_A' in name or 'lora_B' in name or 'lora_embedding' in name:
+                            if is_lora_key(name):
                                 continue
-                            name = _normalize(name, keep_base_layer=False)
+                            name = normalize_param_name(name, keep_base_layer=False)
                             names.append(name)
                             yield name, tensor
-                        _print_weight_example(names)
+                        print_weight_example(names)
 
             else:
 
@@ -2536,31 +2350,31 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
                             continue
                         if 'lora' not in name:
                             continue
-                        name = _normalize(name, keep_base_layer=True)
+                        name = normalize_param_name(name, keep_base_layer=True)
                         names.append(name)
                         yield name, tensor
-                    _print_weight_example(names)
+                    print_weight_example(names)
         else:
             # Need to synchronize the base model
             # First full base-model sync.
-            def _raw_weights(add_base_layer_suffix=False):
+            def _raw_weights(with_base_layer=False):
                 names = []
                 for name, tensor in self.get_hf_state_dict(adapter_name=''):
                     if name is None or tensor is None:
                         continue
                     # Skip LoRA-specific weights for base model sync
-                    if 'lora_A' in name or 'lora_B' in name or 'lora_embedding' in name:
+                    if is_lora_key(name):
                         continue
-                    name = _normalize(name, keep_base_layer=False)
-                    if add_base_layer_suffix:
-                        name = _add_base_layer_suffix(name)
+                    name = normalize_param_name(name, keep_base_layer=False)
+                    if with_base_layer:
+                        name = add_base_layer_suffix(name, model_keys)
                     names.append(name)
                     yield name, tensor
-                _print_weight_example(names)
+                print_weight_example(names)
 
             def weight_generator():
                 # Add the ``.base_layer.`` suffix whenever the sampler runs with
-                # ``enable_lora`` (``merge_and_sync=False``).  ``_add_base_layer_suffix``
+                # ``enable_lora`` (``merge_and_sync=False``).  The rename
                 # self-guards via ``model_keys``, so it only renames params vLLM
                 # actually exposes as ``*WithLoRA`` and is a no-op for full-param.
                 if not merge_and_sync:
@@ -2570,71 +2384,9 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
 
         return weight_generator()
 
-    @remote_function(dispatch='all', lazy_collect=True)
-    @timed
-    def send_weights(
-        self,
-        adapter_name: str = None,
-        base_sync_done: bool = False,
-        merge_and_sync: bool = False,
-        model_keys: List[str] = None,
-        local: bool = False,
-    ):
-        engine = self._get_or_create_checkpoint_engine()
-        if local:
-            weight_generator = self._get_local_weight_generator()
-        else:
-            weight_generator = self._get_weight_generator(
-                adapter_name=adapter_name,
-                base_sync_done=base_sync_done,
-                merge_and_sync=merge_and_sync,
-                model_keys=model_keys,
-            )
-
-        # In local (paired EMA) mode every rank is a sender in its own 2-rank group.
-        # In broadcast mode only engine rank 0 actually sends; others consume silently
-        # (they still must iterate the generator for TP allgather collectives to complete).
-        is_sender = local or (engine.rank is not None and engine.rank == 0)
-
-        if not is_sender:
-            for _name, _tensor in weight_generator:
-                pass
-            return
-
-        async def _send():
-            await engine.send_weights(weight_generator)
-
-        result_container = {'error': None}
-
-        def _run():
-            try:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    loop.run_until_complete(_send())
-                finally:
-                    loop.close()
-            except Exception as e:
-                result_container['error'] = e
-
-        thread = threading.Thread(target=_run)
-        thread.start()
-        thread.join()
-        if result_container['error'] is not None:
-            raise result_container['error']
-
     # ── Paired EMA support (policy→reference via checkpoint-engine) ─────────
-
-    @remote_function(dispatch='all', collect='none', lazy_collect=False)
-    def prepare_ema_sender(self):
-        """Prepare this rank's engine as master for a paired 2-rank EMA group.
-
-        Returns this rank's MasterMetadata (unique TCPStore port) so the manager
-        can relay it to the paired reference rank.
-        """
-        engine = self._get_or_create_checkpoint_engine()
-        engine.is_master = True
-        return engine.prepare()
+    # send_weights / prepare_ema_sender / receive_weights_ema are inherited from
+    # CheckpointEngineMixin (transport protocol); the weight-source hooks below feed them.
 
     def _get_local_weight_generator(self):
         """Yield (name, local_param_data) for this rank's Megatron shard.
@@ -2656,42 +2408,6 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
             for name, param in chunk.named_parameters():
                 state[f'chunk{chunk_idx}.{name}'] = param.data
         return state
-
-    @remote_function(dispatch='all', lazy_collect=True)
-    @timed
-    def receive_weights_ema(self, alpha: float, **kwargs):
-        """Receive policy weights via checkpoint-engine and apply EMA to local params.
-
-        Streaming: processes one bucket at a time, so peak memory is one bucket
-        (not the full model).  Each received (name, tensor) is matched to the
-        local state dict by name; a mismatch raises KeyError immediately.
-        """
-        engine = self._get_or_create_checkpoint_engine()
-        local_state = self._get_local_state_dict()
-
-        async def _receive_and_ema():
-            async for name, tensor in engine.receive_weights():
-                param = local_state[name]
-                param.mul_(alpha).add_(tensor, alpha=1.0 - alpha)
-
-        result_container = {'error': None}
-
-        def _run():
-            try:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    loop.run_until_complete(_receive_and_ema())
-                finally:
-                    loop.close()
-            except Exception as e:
-                result_container['error'] = e
-
-        thread = threading.Thread(target=_run)
-        thread.start()
-        thread.join()
-        if result_container['error'] is not None:
-            raise result_container['error']
 
     @remote_function(collect='first', lazy_collect=False)
     def get_peft_config_dict(self, adapter_name: str = None) -> Optional[Dict[str, Any]]:
