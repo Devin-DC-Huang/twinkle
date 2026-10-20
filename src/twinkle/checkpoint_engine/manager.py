@@ -8,6 +8,7 @@ from twinkle.infra import get_worker_id
 from twinkle import Platform, get_logger
 from .base import CheckpointEngine
 from .mixin import CheckpointEngineMixin
+from .zmq_auth import generate_auth_key
 
 logger = get_logger()
 
@@ -95,11 +96,17 @@ class CheckpointEngineManager:
             if self.mode != 'colocate':
                 raise ValueError('colocate_trainer_ranks is valid only for mode="colocate".')
             colocate_trainer_ranks = self._validate_colocate_ranks(colocate_trainer_ranks, self.receiver_worker_ids)
+        elif self.mode == 'colocate' and self.receiver_worker_ids is not None:
+            raise ValueError(
+                'mode="colocate" with an explicit receiver_worker_ids subset also requires '
+                'colocate_trainer_ranks: an arbitrary subset cannot be paired with trainer ranks by '
+                'the uniform default topology, and a mismatched pair would hang on the first bucket.')
         self.colocate_trainer_ranks = (None if colocate_trainer_ranks is None
                                        else tuple(colocate_trainer_ranks))
-        self.backend = None if self.mode == 'naive' else ('ipc' if self.mode == 'colocate' else
-                                                           'nccl' if Platform.get_platform(platform).__name__ == 'GPU'
-                                                           else 'hccl')
+        self.backend = None if self.mode == 'naive' else self.backend_cls.backend_name
+        # Signs the engine's control frames. Generated here and delivered to both sides through the
+        # Ray control path, so a peer that guessed the endpoint path still cannot inject frames.
+        self._auth_key = generate_auth_key()
 
         if self.mode != 'naive':
             try:
@@ -108,7 +115,8 @@ class CheckpointEngineManager:
                 try:
                     self.close()
                 except Exception:
-                    logger.warning('初始化失败后未能完整关闭 checkpoint channel %s。', channel, exc_info=True)
+                    logger.warning('Failed to fully close checkpoint channel %s after initialization failure.',
+                                   channel, exc_info=True)
                 raise
 
         # LoRA sync state: tracks whether the first full sync has been done.
@@ -190,13 +198,24 @@ class CheckpointEngineManager:
         return ranks
 
     def set_receiver_workers(self, worker_ids, *, colocate_trainer_ranks=None):
-        """登记下一次同步的接收成员；通信变更只在 sync_weights 内应用。"""
+        """Register the receiver set for the next sync; communication changes are applied
+        lazily, only inside sync_weights."""
         with self._sync_lock:
             worker_ids = self._validate_receiver_ids(worker_ids)
             if colocate_trainer_ranks is not None:
                 if self.mode != 'colocate':
                     raise ValueError('colocate_trainer_ranks requires mode="colocate".')
                 self.colocate_trainer_ranks = self._validate_colocate_ranks(colocate_trainer_ranks, worker_ids)
+            elif self.mode == 'colocate':
+                if worker_ids is not None and worker_ids != self.receiver_worker_ids:
+                    # A changed receiver subset with stale ranks pairs receivers with trainers that
+                    # share no GPU; the mismatch would only surface -- as a hang -- inside sync.
+                    raise ValueError(
+                        'Changing receiver_worker_ids in mode="colocate" requires colocate_trainer_ranks '
+                        'for the new set; the previous ranks no longer describe the pairing.')
+                if worker_ids is None:
+                    # Back to the full receiver set: the uniform default topology applies again.
+                    self.colocate_trainer_ranks = None
             self.receiver_worker_ids = worker_ids
 
     def _sampler_call(self, method, *args, **kwargs):
@@ -208,8 +227,8 @@ class CheckpointEngineManager:
         if self._channel_closed:
             self._receiver_snapshot = self.receiver_worker_ids
         self._channel_closed = False
-        self.model.activate_checkpoint_engine(self.backend, self.channel)
-        self._sampler_call('activate_checkpoint_engine', self.backend, self.channel)
+        self.model.activate_checkpoint_engine(self.backend, self.channel, auth_key=self._auth_key)
+        self._sampler_call('activate_checkpoint_engine', self.backend, self.channel, auth_key=self._auth_key)
 
     def _close_checkpoint_channel(self):
         if self.mode != 'naive':
@@ -219,7 +238,7 @@ class CheckpointEngineManager:
                 self._sampler_call('reset_checkpoint_engine', self.channel, self.backend)
 
     def close(self) -> None:
-        """只清理最后一次同步使用的接收快照及本 channel。"""
+        """Tear down this channel, cleaning only the receiver snapshot that the last sync used."""
         with self._sync_lock:
             if self._channel_closed:
                 return
@@ -238,7 +257,14 @@ class CheckpointEngineManager:
                 self.base_sync_done = False
             if self._receiver_snapshot == ():
                 return
-            self._sync_weights(merge_and_sync)
+            try:
+                self._sync_weights(merge_and_sync)
+            except BaseException:
+                # A failed sync can leave the transport half-torn -- a NCCL group in error state, a
+                # dead socket -- and the next sync only rebuilds on membership change. Close here so
+                # the next attempt rebuilds the channel instead of reusing the broken one.
+                self.close()
+                raise
 
     def _sync_weights(self, merge_and_sync=True):
         """
@@ -378,59 +404,67 @@ class CheckpointEngineManager:
 
         Each policy rank k and reference rank k form an independent 2-rank NCCL group:
         policy sends its LOCAL shard parameters, reference receives and applies
-        ``param.mul_(alpha).add_(received, alpha=1-alpha)``.  Peak memory per rank is
-        one engine bucket (configurable, default 2-3 GB), independent of model size.
+        ``param.mul_(alpha).add_(received, alpha=1-alpha)``.  Peak memory per rank is two engine
+        buckets -- the engine allocates its staging buffers before the send/receive roles split,
+        so the unused direction's buffer is paid for too (configurable, default 2x3 GB),
+        independent of model size.
 
         Requires policy and reference to have the SAME parallel_spec (identical sharding),
         so local parameter names and shapes match one-to-one across the pair.
+
+        The receiver side is always the full reference world: this method routes every remote
+        call through :meth:`_sampler_call`, so a manager constructed with ``receiver_worker_ids``
+        would filter them -- construct EMA managers without a receiver subset.
 
         Args:
             alpha: EMA decay factor.  ``ref = alpha * ref + (1 - alpha) * policy``.
                    Closer to 1 means slower tracking.
         """
-        if self.mode == 'naive':
-            self._sync_ema_naive(alpha)
-            return
+        with self._sync_lock:
+            if self.mode == 'naive':
+                self._sync_ema_naive(alpha)
+                return
 
-        self._activate_checkpoint_channel()
-        world_size = self.model.device_mesh.world_size
-        ref_world_size = self.sampler.device_mesh.world_size
-        if world_size != ref_world_size:
-            raise ValueError(
-                f'Paired EMA requires policy and reference to have the same world_size '
-                f'(policy={world_size}, reference={ref_world_size}); use the same parallel_spec.')
+            self._activate_checkpoint_channel()
+            world_size = self.model.device_mesh.world_size
+            ref_world_size = self.sampler.device_mesh.world_size
+            if world_size != ref_world_size:
+                raise ValueError(
+                    f'Paired EMA requires policy and reference to have the same world_size '
+                    f'(policy={world_size}, reference={ref_world_size}); use the same parallel_spec.')
 
-        # Phase 1: all policy ranks prepare as master (each gets a unique TCPStore port).
-        all_metadata = self.model.prepare_ema_sender()
-        if not isinstance(all_metadata, list):
-            all_metadata = [all_metadata]
-        # Reference ranks prepare as non-master (allocate receive buffers).
-        # Scalar False: dispatch='slice' broadcasts it identically to every rank.
-        self.sampler.prepare_checkpoint_engine(False)
+            # Phase 1: all policy ranks prepare as master (each gets a unique TCPStore port).
+            all_metadata = self.model.prepare_ema_sender()
+            if not isinstance(all_metadata, list):
+                all_metadata = [all_metadata]
+            # Reference ranks prepare as non-master (allocate receive buffers).
+            # Scalar False: dispatch='slice' broadcasts it identically to every rank.
+            self._sampler_call('prepare_checkpoint_engine', False)
 
-        # Phase 2: init paired 2-rank groups (policy rank k = NCCL rank 0, ref rank k = rank 1).
-        model_init = self.model.init_checkpoint_process_group(
-            rank=[0] * world_size,
-            world_size=[2] * world_size,
-            master_metadata=all_metadata,
-        )
-        sampler_init = self.sampler.init_checkpoint_process_group(
-            rank=[1] * world_size,
-            world_size=[2] * world_size,
-            master_metadata=all_metadata,
-        )
-        model_init()
-        sampler_init()
+            # Phase 2: init paired 2-rank groups (policy rank k = NCCL rank 0, ref rank k = rank 1).
+            model_init = self.model.init_checkpoint_process_group(
+                rank=[0] * world_size,
+                world_size=[2] * world_size,
+                master_metadata=all_metadata,
+            )
+            sampler_init = self._sampler_call(
+                'init_checkpoint_process_group',
+                rank=[1] * world_size,
+                world_size=[2] * world_size,
+                master_metadata=all_metadata,
+            )
+            model_init()
+            sampler_init()
 
-        # Phase 3: concurrent send (local shard) / receive+EMA.
-        send_future = self.model.send_weights(local=True)
-        recv_future = self.sampler.receive_weights_ema(alpha)
-        send_future()
-        recv_future()
+            # Phase 3: concurrent send (local shard) / receive+EMA.
+            send_future = self.model.send_weights(local=True)
+            recv_future = self._sampler_call('receive_weights_ema', alpha)
+            send_future()
+            recv_future()
 
-        # Phase 4: finalize.
-        self.model.finalize_checkpoint_engine()
-        self.sampler.finalize_checkpoint_engine()
+            # Phase 4: finalize.
+            self.model.finalize_checkpoint_engine()
+            self._sampler_call('finalize_checkpoint_engine')
 
     def _sync_ema_naive(self, alpha: float):
         """In-process EMA: iterate policy's local params and blend into reference's."""

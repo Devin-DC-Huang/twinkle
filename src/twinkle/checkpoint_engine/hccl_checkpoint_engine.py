@@ -38,6 +38,8 @@ class MasterMetadata:
 class HCCLCheckpointEngine(CheckpointEngine):
     """HCCL checkpoint engine for Ascend NPU."""
 
+    backend_name = 'hccl'
+
     def __init__(
         self,
         bucket_size: int = 3072 << 20,

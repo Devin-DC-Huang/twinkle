@@ -112,6 +112,8 @@ class BroadcastOperation:
 
 class NCCLCheckpointEngine(CheckpointEngine):
 
+    backend_name = 'nccl'
+
     def __init__(
         self,
         bucket_size: int = 3072 << 20,
