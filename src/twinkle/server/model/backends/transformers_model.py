@@ -104,8 +104,11 @@ class _TransformersTinkerCompatMixin(TwinkleCompatModelBase):
         return to_cpu_safe_output(output)
 
     @remote_function(dispatch='all', collect='none')
-    def preflight_loss_inputs(self, *, inputs: InputFeature | list[InputFeature] | Trajectory | list[Trajectory],
-                              adapter_name: str = None, **kwargs):
+    def preflight_loss_inputs(self,
+                              *,
+                              inputs: InputFeature | list[InputFeature] | Trajectory | list[Trajectory],
+                              adapter_name: str = None,
+                              **kwargs):
         """Validate the full, unsliced batch on every rank before any forward.
 
         The loss's own alignment check runs after a rank has already forwarded

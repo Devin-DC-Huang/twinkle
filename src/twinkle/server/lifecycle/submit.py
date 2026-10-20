@@ -202,8 +202,7 @@ async def run_submit(
         # it may wait in the queue and then execute. A TTL that covers only the
         # execution bound lets a retry re-enqueue while the original is still
         # queued, i.e. applies one gradient update twice.
-        ttl = int(self.task_queue_config.queue_timeout
-                  + self.task_queue_config.effective_execution_timeout) + 60
+        ttl = int(self.task_queue_config.queue_timeout + self.task_queue_config.effective_execution_timeout) + 60
         prior_request_id = await self.state.claim_seq(dedup_key, request_id, ttl)
         if prior_request_id is not None:
             return await self._peek_terminal(prior_request_id, fallback_status='pending')

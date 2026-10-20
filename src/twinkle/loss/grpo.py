@@ -215,8 +215,7 @@ class GRPOLoss(Loss):
     @staticmethod
     def _alignment_supported(n_pos: int, n_sample: int, last_pos: int) -> bool:
         """Whether one ragged row fits the response-only or full-sequence form."""
-        return (n_sample == 1 or n_sample == n_pos or n_pos == 0
-                or (n_sample > 0 and last_pos < n_sample))
+        return (n_sample == 1 or n_sample == n_pos or n_pos == 0 or (n_sample > 0 and last_pos < n_sample))
 
     @staticmethod
     def _raise_alignment_mismatch(sample_index: int, n_pos: int, n_sample: int, seq_len: int):
@@ -285,7 +284,6 @@ class GRPOLoss(Loss):
                 last_pos = int(pos[-1].item()) if n_pos else -1
                 if not self._alignment_supported(n_pos, n_sample, last_pos):
                     self._raise_alignment_mismatch(index, n_pos, n_sample, labels.shape[-1])
-
 
     def _resolve_loss_mask(self, inputs: Dict, labels: 'torch.Tensor') -> 'torch.Tensor':
         """Positions this loss may score: trainable *and* log-prob-bearing.

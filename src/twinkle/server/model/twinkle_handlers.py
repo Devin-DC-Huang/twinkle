@@ -145,10 +145,7 @@ def _register_model_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelMana
                 # fail all ranks before any of them enters its backward collective.
                 await self.call_backend(preflight, inputs=all_inputs, adapter_name=resolved_adapter_name, **kwargs)
             ret = await self.call_backend(
-                self.model.forward_backward,
-                inputs=all_inputs,
-                adapter_name=resolved_adapter_name,
-                **kwargs)
+                self.model.forward_backward, inputs=all_inputs, adapter_name=resolved_adapter_name, **kwargs)
             return {'result': ret}
 
         return await run_submit(
@@ -254,10 +251,7 @@ def _register_model_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelMana
             if preflight is not None and any(key in kwargs for key in ('old_logps', 'ref_logps', 'advantages')):
                 await self.call_backend(preflight, inputs=inputs, adapter_name=resolved_adapter_name, **kwargs)
             ret = await self.call_backend(
-                self.model.forward_backward,
-                inputs=inputs,
-                adapter_name=resolved_adapter_name,
-                **kwargs)
+                self.model.forward_backward, inputs=inputs, adapter_name=resolved_adapter_name, **kwargs)
             return {'result': ret}
 
         return await run_submit(
