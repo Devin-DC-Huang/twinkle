@@ -98,6 +98,10 @@ class RolloutSample:
         return list(self.rollout_logprobs)
 
     @property
+    def rollout_logps(self) -> List[float]:
+        return list(self.rollout_logprobs)
+
+    @property
     def prompt_index(self) -> str:
         """Back-compat alias for the group id."""
         return self.prompt_id
@@ -397,7 +401,12 @@ class MultiTurnRollout(Rollout):
         allow_partial_rollout: bool = False,
         tools_factory: Optional[Callable[[Any], Tuple[Any, List[Any], Any]]] = None,
         tools_config: Any = None,
+        remote_group: Optional[str] = None,
     ):
+        # ``remote_group`` is consumed by the ``@remote_class`` wrapper that places this
+        # rollout on its own DeviceGroup (dev's disaggregated loop passes it); it is not
+        # rollout state. Older revisions omitted it from the signature, so the wrapper
+        # forwarded it into this __init__ and every disaggregated run raised TypeError.
         super().__init__()
         if isinstance(sampler, (API, APISampler)):
             if api is not None:
@@ -810,7 +819,9 @@ class MultiTurnRollout(Rollout):
             return
         getattr(self, '_episode_futures', {}).pop(handle.submission_id, None)
 
-    @remote_function(dispatch='first', collect='none', lazy_collect=False)
+    # `dispatch` has no 'first' mode (only all / slice / slice_dp); the single-worker
+    # placement already comes from @remote_class(execute='first'), so 'all' reaches it.
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
     def abort_all_inflight(self) -> None:
         """Abort every in-flight sampler generation so an in-place republish can resume them.
 

@@ -2134,6 +2134,10 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
     def _save_training_state(self, output_dir, **kwargs):
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         defer_trainer_state = kwargs.pop('defer_trainer_state', False)
+        # The optimizer/scheduler files are written before _write_weights() gets a chance to
+        # create the checkpoint dir via save_pretrained; torch.save then raises
+        # "Parent directory ... does not exist".
+        os.makedirs(output_dir, exist_ok=True)
         self._save_optimizer(output_dir, adapter_name=adapter_name)
 
         optimizer_config = self.optimizer_group[adapter_name]

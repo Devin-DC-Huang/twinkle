@@ -384,7 +384,11 @@ class RayHelper:
                     # blocking continuous-work methods off the actor's event loop.
                     env_vars['TWINKLE_ACTOR_MAX_CONCURRENCY'] = str(max_concurrency)
 
-                runtime_env = RuntimeEnv(env_vars=env_vars, worker_process_setup_hook=run_worker_setup_hook)
+                # Ray serialises runtime_env to JSON; a callable setup hook is rejected by Ray 2.58
+                # ("Object of type function is not JSON serializable"). Pass the import path instead.
+                runtime_env = RuntimeEnv(
+                    env_vars=env_vars,
+                    worker_process_setup_hook='twinkle.utils.loader.run_worker_setup_hook')
 
                 worker_options = {
                     'scheduling_strategy':
@@ -446,7 +450,11 @@ class RayHelper:
                     # blocking continuous-work methods off the actor's event loop.
                     env_vars['TWINKLE_ACTOR_MAX_CONCURRENCY'] = str(max_concurrency)
 
-                runtime_env = RuntimeEnv(env_vars=env_vars, worker_process_setup_hook=run_worker_setup_hook)
+                # Ray serialises runtime_env to JSON; a callable setup hook is rejected by Ray 2.58
+                # ("Object of type function is not JSON serializable"). Pass the import path instead.
+                runtime_env = RuntimeEnv(
+                    env_vars=env_vars,
+                    worker_process_setup_hook='twinkle.utils.loader.run_worker_setup_hook')
 
                 worker_options = {
                     'scheduling_strategy':

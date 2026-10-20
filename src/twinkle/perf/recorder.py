@@ -63,6 +63,18 @@ class TimeRecorder:
 
     # ------------------------------------------------------------------ control
 
+    def __reduce__(self):
+        """Pickle by reference to the process-wide recorder.
+
+        The recorder holds a threading.Lock, so any ``@timed`` wrapper that closes
+        over it is unpicklable. Ray serialises actor classes by value (the modified
+        class is dynamic), and a single ``@timed`` method then makes the whole
+        actor un-exportable ("cannot pickle '_thread.lock' object"). The recorder
+        is process-global state, so a worker must time into ITS OWN default
+        recorder rather than a stale copy.
+        """
+        return (_get_default_recorder, ())
+
     def enable(self) -> None:
         self._enabled = True
 
@@ -278,6 +290,11 @@ class TimeRecorder:
 #: Process-wide recorder bound by the module-level :func:`timed` / :func:`span`.
 #: Disabled by default so importing perf never changes existing behaviour.
 default_recorder = TimeRecorder(enabled=False)
+
+
+def _get_default_recorder() -> TimeRecorder:
+    """Unpickling entry point for :meth:`TimeRecorder.__reduce__`."""
+    return default_recorder
 
 #: Decorator bound to :data:`default_recorder`; ``@timed`` or ``@timed('name')``.
 timed = default_recorder.timed
