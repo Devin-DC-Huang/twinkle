@@ -22,12 +22,34 @@ if TYPE_CHECKING:
 
 import httpx
 
+import twinkle.protocol.types as types
+from twinkle.server.lifecycle.envelope import envelope_from_record
 from twinkle.server.utils import get_template_for_model
 from twinkle.utils.logger import get_logger
 from . import routes
 from .openai_bridge import make_error, translate_chat_request, translate_response, translate_stream_chunk
+from .use_cases import poll_future
 
 logger = get_logger()
+
+_TERMINAL_STATUSES = frozenset({'completed', 'failed', 'cancelled'})
+
+
+async def _resolve_sampler_envelope(gateway: GatewayServer, sampler_data: dict[str, Any]) -> types.TaskEnvelope | None:
+    """Resolve the sampler's TaskEnvelope to a terminal state.
+
+    ``/twinkle/sample`` always answers with a TaskEnvelope; a slow sample is
+    still ``queued``/``running`` when the proxy returns. Polling the shared
+    state backend is the only way to obtain its result without changing the
+    upstream wire contract. Returns ``None`` when the future record was lost.
+    """
+    envelope = types.TaskEnvelope.model_validate(sampler_data)
+    while envelope.status not in _TERMINAL_STATUSES:
+        outcome = await poll_future(gateway.state, envelope.request_id)
+        if outcome.record is None:
+            return None
+        envelope = envelope_from_record(envelope.request_id, outcome.record)
+    return envelope
 
 
 def _register_openai_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) -> None:
@@ -105,8 +127,37 @@ def _register_openai_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
                 )
 
             sampler_data = json.loads(response.body)
+            envelope = await _resolve_sampler_envelope(self, sampler_data)
+            if envelope is None:
+                return JSONResponse(
+                    status_code=404,
+                    content=make_error(
+                        message=f'Sampling task {sampler_data.get("request_id")} was not found',
+                        error_type='server_error',
+                    ),
+                )
+            if envelope.status != 'completed':
+                error = envelope.error
+                message = error.error if error is not None else f'Sampling task {envelope.status}'
+                error_type = ('invalid_request_error'
+                              if error is not None and error.category.value == 'user' else 'server_error')
+                return JSONResponse(
+                    status_code=error.error_code if error is not None else 500,
+                    content=make_error(message=message, error_type=error_type),
+                )
+
+            sampler_result = envelope.result or {}
+            if not sampler_result.get('samples'):
+                return JSONResponse(
+                    status_code=502,
+                    content=make_error(
+                        message='Sampler completed without returning any samples',
+                        error_type='server_error',
+                    ),
+                )
+
             request_id = f'chatcmpl-{uuid.uuid4().hex[:24]}'
-            openai_response = translate_response(sampler_data, model, request_id)
+            openai_response = translate_response(sampler_result, model, request_id)
             resp_headers = {}
             replica_id = response.headers.get('x-twinkle-replica-id')
             if replica_id:

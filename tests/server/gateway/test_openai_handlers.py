@@ -50,10 +50,14 @@ def mock_gateway():
 
 class TestChatCompletions:
 
-    def _make_sample_response(self, text='Hello!', stop_reason='stop'):
-        """Build a mock Response matching what proxy_request returns."""
+    def _make_sample_response(self, text='Hello!', stop_reason='stop', status='completed'):
+        """Build a mock Response matching what proxy_request returns.
+
+        ``/twinkle/sample`` always answers with a TaskEnvelope whose completed
+        result carries the samples; the raw samples dict is not the wire shape.
+        """
         from fastapi import Response
-        body = json.dumps({
+        result = {
             'samples': [{
                 'sequences': [{
                     'stop_reason': stop_reason,
@@ -61,8 +65,23 @@ class TestChatCompletions:
                     'decoded': text,
                 }]
             }]
-        }).encode()
+        }
+        payload = {'request_id': 'req-mock', 'status': status}
+        if status == 'completed':
+            payload['result'] = result
+        body = json.dumps(payload).encode()
         return Response(content=body, status_code=200, media_type='application/json')
+
+    def _samples_result(self, text='Hello!'):
+        return {
+            'samples': [{
+                'sequences': [{
+                    'stop_reason': 'stop',
+                    'tokens': list(range(len(text))),
+                    'decoded': text,
+                }]
+            }]
+        }
 
     def test_basic_chat_completion(self, mock_gateway):
         mock_self, app = mock_gateway
@@ -210,6 +229,67 @@ class TestChatCompletions:
         # Verify proxy was called with the correct base_model
         call_kwargs = mock_self.proxy.proxy_request.call_args
         assert call_kwargs.kwargs.get('base_model') or call_kwargs.args[2] == 'Qwen/Qwen3.5-4B'
+
+    def test_non_stream_polls_queued_task_to_completion(self, mock_gateway):
+        """A queued sampler envelope is polled until completed, then translated."""
+        mock_self, app = mock_gateway
+        mock_self.proxy.proxy_request.return_value = self._make_sample_response(status='queued')
+        mock_self.state.get_future = AsyncMock(return_value={
+            'status': 'completed',
+            'result': self._samples_result('Polled!'),
+        })
+
+        client = TestClient(app)
+        resp = client.post(
+            '/chat/completions',
+            json={
+                'model': 'Qwen/Qwen3.5-4B',
+                'messages': [{
+                    'role': 'user',
+                    'content': 'Hello'
+                }],
+            },
+            headers={'Authorization': 'Bearer key'},
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()['choices'][0]['message']['content'] == 'Polled!'
+        mock_self.state.get_future.assert_awaited()
+
+    def test_non_stream_failed_task_returns_error(self, mock_gateway):
+        """A failed sampler envelope becomes an OpenAI error, never an empty 200."""
+        from fastapi import Response
+        mock_self, app = mock_gateway
+        envelope = {
+            'request_id': 'req-failed',
+            'status': 'failed',
+            'result': None,
+            'error': {
+                'error': 'data/mask length mismatch at sample 0',
+                'category': 'server',
+                'error_code': 500,
+                'request_id': 'req-failed',
+            },
+        }
+        mock_self.proxy.proxy_request.return_value = Response(
+            content=json.dumps(envelope).encode(), status_code=200, media_type='application/json')
+
+        client = TestClient(app)
+        resp = client.post(
+            '/chat/completions',
+            json={
+                'model': 'Qwen/Qwen3.5-4B',
+                'messages': [{
+                    'role': 'user',
+                    'content': 'Hello'
+                }],
+            },
+            headers={'Authorization': 'Bearer key'},
+        )
+
+        assert resp.status_code == 500
+        assert 'mismatch' in resp.json()['error']['message']
+        assert resp.json()['error']['type'] == 'server_error'
 
 
 # ---------- /chat/completions streaming tests ------------------------------ #
