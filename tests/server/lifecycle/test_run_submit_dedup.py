@@ -95,7 +95,10 @@ async def test_dedup_ttl_covers_queue_and_execution():
     mgmt = _FakeManagement(record_after_claim={'status': 'queued'})
     with pytest.raises(RuntimeError):
         await run_submit(mgmt, _request(), _body(), task_type='forward_backward', backend_call=_call)
-    assert mgmt.state.claim_ttls == [2160]
+    config = mgmt.task_queue_config
+    assert mgmt.state.claim_ttls == [int(config.queue_timeout + config.effective_execution_timeout) + 60]
+    # An execution-only window is exactly what let a queued first copy expire.
+    assert mgmt.state.claim_ttls[0] > int(config.effective_execution_timeout) + 60
 
 
 @pytest.mark.asyncio
