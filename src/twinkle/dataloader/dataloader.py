@@ -7,11 +7,11 @@ from twinkle import DeviceMesh, remote_class, remote_function
 from twinkle.dataset import Dataset
 from twinkle.processor import InputProcessor
 from twinkle.utils import construct_class, get_logger
-from .device_mesh_dataset import DeviceMeshDataset
-from .device_mesh_sampler import DeviceMeshSampler
+from .stream_shard_dataset import StreamShardDataset
+from .sharded_batch_sampler import ShardedBatchSampler
 from .epoch_sampler import EpochSampler
 from .random_state import derive_seed, seed_process_rng
-from .retry_dataset import RetryDataset
+from .map_retry_dataset import MapRetryDataset
 from .skip_sampler import SkipSampler
 
 logger = get_logger()
@@ -54,7 +54,7 @@ class DataLoader:
         lengths: One length per sample, for ``group_by_length``.
         max_retries: How many replacements to try for a sample that cannot be read. 0 substitutes
             nothing and lets the original failure through -- the strict mode, for a caller that would
-            rather stop on a bad row than train on a different one. See :class:`RetryDataset`.
+            rather stop on a bad row than train on a different one. See :class:`MapRetryDataset`.
         retry_seed: Seeds the replacement draw, so a given failing index resolves to the same
             replacement on every rank and on every run. Defaults to the process-wide torch seed
             (see :meth:`_resolve_retry_seed`); pass the caller's own data seed to tie the two together.
@@ -112,8 +112,8 @@ class DataLoader:
         self._data_generator = None
         # The iterable wrapper, kept because a stream carries its resume offset there rather than in a
         # sampler (see `_begin_pass`). None for a map-style dataset.
-        self._stream_dataset: Optional[DeviceMeshDataset] = None
-        self._retry_dataset: Optional[RetryDataset] = None
+        self._stream_dataset: Optional[StreamShardDataset] = None
+        self._map_retry_dataset: Optional[MapRetryDataset] = None
         self._retry_seed = self._resolve_retry_seed() if retry_seed is None else int(retry_seed)
         self._set_worker_init_fn()
 
@@ -125,7 +125,7 @@ class DataLoader:
 
     @staticmethod
     def _resolve_retry_seed() -> int:
-        """The seed :class:`RetryDataset` draws replacements with, so they match across ranks.
+        """The seed :class:`MapRetryDataset` draws replacements with, so they match across ranks.
 
         Reads the process-wide torch knob set -- the ``EXTRA_TORCH_KWARGS`` blob that ``initialize``
         writes and a Ray worker inherits through its runtime_env -- so the draw agrees everywhere
@@ -197,7 +197,7 @@ class DataLoader:
             params['generator'] = self._data_generator
         from torch.utils.data import IterableDataset
         if isinstance(self.dataset, IterableDataset):
-            # `DeviceMeshDataset` has already taken this rank's slice out of each global batch, so what
+            # `StreamShardDataset` has already taken this rank's slice out of each global batch, so what
             # reaches the DataLoader is this rank's share alone and is batched at that width. Batching
             # it at the global width again would make every batch `data_world_size` times too wide.
             if self.device_mesh is not None:
@@ -255,7 +255,7 @@ class DataLoader:
         """
         from torch.utils.data import IterableDataset
         if isinstance(dataset, IterableDataset):
-            self._stream_dataset = DeviceMeshDataset(
+            self._stream_dataset = StreamShardDataset(
                 dataset,
                 self.batch_size,
                 self.device_mesh,
@@ -264,8 +264,8 @@ class DataLoader:
                 track_source_size=True,
                 data_seed=self.data_seed)
             return self._stream_dataset
-        self._retry_dataset = RetryDataset(dataset, max_retries=self.max_retries, seed=self._retry_seed)
-        return self._retry_dataset
+        self._map_retry_dataset = MapRetryDataset(dataset, max_retries=self.max_retries, seed=self._retry_seed)
+        return self._map_retry_dataset
 
     @remote_function()
     def __iter__(self):
@@ -336,8 +336,8 @@ class DataLoader:
                 self.dataloader.worker_init_fn = self.dataloader_params['worker_init_fn']
             if self._epoch_sampler is not None:
                 self._epoch_sampler.base_seed = self.data_seed
-            if self._retry_dataset is not None:
-                self._retry_dataset.seed = self._retry_seed
+            if self._map_retry_dataset is not None:
+                self._map_retry_dataset.seed = self._retry_seed
             if self._stream_dataset is not None:
                 self._stream_dataset.set_data_seed(self.data_seed)
             batch_sampler = getattr(self.dataloader, 'batch_sampler', None)
@@ -425,12 +425,12 @@ class DataLoader:
     def _rebuild_sampler_stack(self):
         """Put the resume offset and the device-mesh slice back on top of the untouched base samplers.
 
-        Both only decide which indices this rank takes; reading them is :class:`RetryDataset`'s job, so
+        Both only decide which indices this rank takes; reading them is :class:`MapRetryDataset`'s job, so
         nothing here touches the dataset. Called again after :meth:`skip_consumed_samples`, which is why
         the bases are kept aside rather than rewrapped in place.
         """
         if self._base_batch_sampler is not None:
-            batch_sampler = DeviceMeshSampler(
+            batch_sampler = ShardedBatchSampler(
                 self._base_batch_sampler,
                 self.device_mesh,
                 self.min_batch_size,

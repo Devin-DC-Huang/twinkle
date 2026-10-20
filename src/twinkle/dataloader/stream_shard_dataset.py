@@ -15,10 +15,10 @@ class _IterableSample(NamedTuple):
     source_size: int
 
 
-class DeviceMeshDataset(IterableDataset):
+class StreamShardDataset(IterableDataset):
     """One data-parallel rank's share of an iterable dataset, taken where the data is actually read.
 
-    The peer of :class:`RetryDataset`: both wrap the dataset rather than hooking the DataLoader, because
+    The peer of :class:`MapRetryDataset`: both wrap the dataset rather than hooking the DataLoader, because
     the wrapped dataset is the one thing a worker process is guaranteed to go through.
 
     This used to be a torch dataset *fetcher*, installed by assigning over the DataLoader iterator's
@@ -116,7 +116,7 @@ class DeviceMeshDataset(IterableDataset):
     def _read(self) -> Iterator:
         """The data, with a resume offset applied and unreadable samples skipped.
 
-        Skipped rather than replaced, unlike :class:`RetryDataset`: there is no index here to draw a
+        Skipped rather than replaced, unlike :class:`MapRetryDataset`: there is no index here to draw a
         replacement by. A sample that all ranks fail on keeps them aligned; one that fails on a single
         rank -- a flaky read -- shifts that rank's grouping by one, which is why only a run of failures is
         treated as fatal rather than any single one.

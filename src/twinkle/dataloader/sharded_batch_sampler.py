@@ -4,10 +4,10 @@ from collections import deque
 from torch.utils.data import BatchSampler
 
 from twinkle import DeviceMesh
-from .random_state import SampleIndex
+from .random_state import SampleIndex, derive_seed
 
 
-class DeviceMeshSampler(BatchSampler):
+class ShardedBatchSampler(BatchSampler):
     """A sampler that returns the slice of the current dp rank.
 
     Two modes:
@@ -105,7 +105,7 @@ class DeviceMeshSampler(BatchSampler):
         # skip_samples // dp_world of its own bucket (legacy: bucket_offset = current // dp).
         bucket_offset = self.skip_samples // dp_world
         generator = torch.Generator()
-        generator.manual_seed(self.data_seed + self.epoch)
+        generator.manual_seed(derive_seed(self.data_seed, self.epoch))
         random_idx = torch.randperm(bucket_size, generator=generator).tolist()
 
         batch = []

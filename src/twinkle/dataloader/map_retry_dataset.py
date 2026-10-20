@@ -9,7 +9,7 @@ from .random_state import derive_seed, isolated_random_state, split_sample_index
 logger = get_logger()
 
 
-class RetryDataset:
+class MapRetryDataset:
     """A map-style dataset that stands in a replacement sample when one fails to load.
 
     This wraps the dataset, not the sampler, and that is the whole point. A sampler cannot tell whether
