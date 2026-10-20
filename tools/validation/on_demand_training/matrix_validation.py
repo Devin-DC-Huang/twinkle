@@ -34,6 +34,7 @@ def main():
     source = root / 'tests/server/config' / ('server_config_4b_e2e.yaml' if args.backend == 'transformers' else
                                              'server_config_4b_e2e_megatron.yaml')
     raw = yaml.safe_load(source.read_text())
+    raw.setdefault('training', {})['shutdown_timeout_s'] = 180
     raw['ray_namespace'] = namespace
     raw['http_options'] = {'host': '127.0.0.1', 'port': port}
     for app in raw['applications']:
