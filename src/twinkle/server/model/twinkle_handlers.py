@@ -582,7 +582,14 @@ def _register_model_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelMana
                 session_id=session_id,
             )
             try:
-                self.register_resource(adapter_name, token, session_id)
+                # Re-check at creation time: the admission check above runs
+                # before the async state write, so two concurrent creates can
+                # both pass it. The claim below is one synchronous step, which
+                # makes exactly one of them win.
+                if self.is_full_mode:
+                    self.claim_full_mode_resource(adapter_name, token, session_id)
+                else:
+                    self.register_resource(adapter_name, token, session_id)
                 if self.is_full_mode:
                     # No PEFT adapter to add; the default optimizer group is used.
                     self.set_resource_state(adapter_name, 'grad_ready', False)

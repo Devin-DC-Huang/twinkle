@@ -269,6 +269,16 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
         if holder is not None:
             raise FullModeBusyError(holder)
 
+    def claim_full_mode_resource(self, adapter_name: str, token: str, session_id: str) -> None:
+        """Atomically take the exclusive full-mode resource for one tenant.
+
+        The check and the registration are synchronous neighbours: no coroutine
+        can interleave between them, so two concurrent creates cannot both pass
+        the availability check before either is recorded.
+        """
+        self.assert_full_mode_available(adapter_name)
+        self.register_resource(adapter_name, token, session_id)
+
     async def _on_adapter_expired(self, adapter_name: str) -> None:
         self.fail_pending_tasks_for_model(adapter_name, reason='Adapter expired')
         await self._cleanup_adapter(adapter_name)
