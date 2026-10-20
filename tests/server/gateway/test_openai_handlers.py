@@ -291,6 +291,59 @@ class TestChatCompletions:
         assert 'mismatch' in resp.json()['error']['message']
         assert resp.json()['error']['type'] == 'server_error'
 
+    def test_template_request_uses_only_declared_sampler_fields(self, mock_gateway):
+        """The sampler's strict schema rejects top-level model_id; do not send it."""
+        from fastapi import Response
+        mock_self, app = mock_gateway
+        mock_self.proxy.proxy_request.side_effect = [
+            Response(content=b'{"status":"ok"}', status_code=200, media_type='application/json'),
+            self._make_sample_response('Hi'),
+        ]
+
+        client = TestClient(app)
+        resp = client.post(
+            '/chat/completions',
+            json={
+                'model': 'Qwen/Qwen3.5-4B',
+                'messages': [{
+                    'role': 'user',
+                    'content': 'Hello'
+                }],
+            },
+            headers={'Authorization': 'Bearer key'},
+        )
+
+        assert resp.status_code == 200
+        template_call = mock_self.proxy.proxy_request.call_args_list[0]
+        template_body = json.loads(template_call.kwargs['body_override'])
+        assert set(template_body) == {'template_cls', 'adapter_name'}
+        assert 'Qwen/Qwen3.5-4B' in mock_self._template_initialized
+
+    def test_failed_template_call_is_not_cached(self, mock_gateway):
+        """A rejected set_template must not be marked initialized."""
+        from fastapi import Response
+        mock_self, app = mock_gateway
+        mock_self.proxy.proxy_request.side_effect = [
+            Response(content=b'{}', status_code=422, media_type='application/json'),
+            self._make_sample_response('Hi'),
+        ]
+
+        client = TestClient(app)
+        resp = client.post(
+            '/chat/completions',
+            json={
+                'model': 'Qwen/Qwen3.5-4B',
+                'messages': [{
+                    'role': 'user',
+                    'content': 'Hello'
+                }],
+            },
+            headers={'Authorization': 'Bearer key'},
+        )
+
+        assert resp.status_code == 200
+        assert 'Qwen/Qwen3.5-4B' not in mock_self._template_initialized
+
 
 # ---------- /chat/completions streaming tests ------------------------------ #
 

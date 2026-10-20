@@ -278,9 +278,11 @@ async def _ensure_template(
         return
 
     template_cls = get_template_for_model(base_model)
+    # The sampler's strict schema accepts only template_cls / adapter_name /
+    # init_kwargs. It already knows its own model_id and injects it when the
+    # template constructor needs one, so sending model_id here is rejected 422.
     set_template_body = json.dumps({
         'template_cls': template_cls,
-        'model_id': base_model,
         'adapter_name': '',
     }).encode()
 
