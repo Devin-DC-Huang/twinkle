@@ -13,6 +13,7 @@ import time
 import traceback
 from collections import deque
 from dataclasses import replace
+from ray.exceptions import RayTaskError
 from typing import TYPE_CHECKING, Any, Callable, Deque
 
 from twinkle.protocol.types.errors import ErrorCategory
@@ -36,16 +37,21 @@ logger = get_logger()
 
 
 def _exception_summary(exc: BaseException) -> str:
-    """Build a single-line summary from the deepest available cause.
+    """Build a single-line summary, unwrapping Ray's transport wrapper.
 
     A RayTaskError's own ``str`` starts with the Ray call header (actor id,
     pid, repr); the actionable error (e.g. the loss assertion) is in ``cause``.
-    Preferring the cause keeps the summary useful without enlarging the wire
-    field, while the full traceback still travels separately.
+    Preferring it keeps the summary useful without enlarging the wire field,
+    while the full traceback still travels separately.
+
+    Only Ray's wrapper is unwrapped: elsewhere ``raise X from e`` is a
+    deliberate message and must not be replaced by its inner cause.
     """
-    cause = getattr(exc, 'cause', None)
-    if not isinstance(cause, BaseException):
-        cause = exc.__cause__
+    cause = None
+    if isinstance(exc, RayTaskError):
+        cause = getattr(exc, 'cause', None)
+        if not isinstance(cause, BaseException):
+            cause = exc.__cause__
     if isinstance(cause, BaseException):
         return f'{type(cause).__name__}: {cause}'
     return f'{type(exc).__name__}: {exc}'
