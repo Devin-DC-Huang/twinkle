@@ -35,6 +35,22 @@ if TYPE_CHECKING:
 logger = get_logger()
 
 
+def _exception_summary(exc: BaseException) -> str:
+    """Build a single-line summary from the deepest available cause.
+
+    A RayTaskError's own ``str`` starts with the Ray call header (actor id,
+    pid, repr); the actionable error (e.g. the loss assertion) is in ``cause``.
+    Preferring the cause keeps the summary useful without enlarging the wire
+    field, while the full traceback still travels separately.
+    """
+    cause = getattr(exc, 'cause', None)
+    if not isinstance(cause, BaseException):
+        cause = exc.__cause__
+    if isinstance(cause, BaseException):
+        return f'{type(cause).__name__}: {cause}'
+    return f'{type(exc).__name__}: {exc}'
+
+
 def _reason_code_for_server_error(exc: TwinkleServerError) -> str:
     """Map typed execution failures to protocol-independent reason codes."""
     mappings: tuple[tuple[type[TwinkleServerError], str], ...] = (
@@ -481,7 +497,7 @@ class ComputeWorker:
             exec_time = time.monotonic() - exec_start
             # error is a single-line summary; the full traceback goes only to the
             # traceback field, never into `error`.
-            error = f'{type(exc).__name__}: {exc}'
+            error = _exception_summary(exc)
             logger.error(f'[ComputeWorker] Task {task.request_id} FAILED after {exec_time:.2f}s, '
                          f'type={task_type}:\n{traceback.format_exc(limit=3)}')
             await self._store_task_failed(

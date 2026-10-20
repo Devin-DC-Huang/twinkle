@@ -5,7 +5,19 @@ import pytest_asyncio
 from twinkle.server.task_queue.config import TaskQueueConfig
 from twinkle.server.task_queue.mixin import TaskQueueMixin
 from twinkle.server.task_queue.types import UserTaskError
-from twinkle.server.task_queue.worker import ComputeWorker
+from twinkle.server.task_queue.worker import ComputeWorker, _exception_summary
+
+
+def test_exception_summary_prefers_the_wrapped_cause():
+    class _RayWrapped(Exception):
+
+        def __init__(self):
+            super().__init__('RayTaskError(AssertionError): ray::Model.forward_backward() (pid=1, repr=...)')
+            self.cause = AssertionError('data/mask length mismatch at sample 0')
+
+    summary = _exception_summary(_RayWrapped())
+    assert summary.startswith('AssertionError:')
+    assert 'mismatch' in summary
 
 
 class _DummyState:
