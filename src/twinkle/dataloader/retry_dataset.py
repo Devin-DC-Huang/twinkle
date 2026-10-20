@@ -94,6 +94,12 @@ class RetryDataset:
             return None
         return data if data else None
 
+    def __getitems__(self, indexes: Any) -> list:
+        # torch's batched fetch calls this INSTEAD of per-index __getitem__; letting __getattr__
+        # forward it to the wrapped dataset would bypass both the SampleIndex unwrap and the retry
+        # substitution (an HF Dataset answers it with a raw batched read), so serve it per index.
+        return [self[index] for index in indexes]
+
     def __getattr__(self, name: str) -> Any:
         # Anything else the caller reaches for belongs to the dataset being wrapped; `dataset` itself is
         # a real attribute, so this cannot recurse through it.

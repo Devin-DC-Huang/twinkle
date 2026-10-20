@@ -2014,6 +2014,10 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         checkpoint_dir = os.path.join(output_dir, name)
         if optimizer_config.cur_step % interval != 0:
             return
+        # The synchronous path writes optimizer/trainer state BEFORE the weights (whose
+        # save_pretrained used to be the only thing creating the directory), so create it here;
+        # exist_ok makes concurrent ranks and the async path harmless.
+        os.makedirs(checkpoint_dir, exist_ok=True)
         model = self.strategy.unwrap_model(self.model)
         save_kwargs = {
             'safe_serialization': safe_serialization,
