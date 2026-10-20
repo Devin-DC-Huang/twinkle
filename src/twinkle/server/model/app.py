@@ -28,6 +28,7 @@ from twinkle.server.state import ServerState, get_server_state
 from twinkle.server.task_queue import TaskQueueConfig, TaskQueueMixin
 from twinkle.server.utils import wrap_builder_with_device_group_env
 from twinkle.utils.logger import get_logger
+from twinkle.utils.unsafe import trust_remote_code
 from .tinker_handlers import _register_model_tinker_routes
 from .twinkle_handlers import _register_model_twinkle_routes
 
@@ -98,6 +99,19 @@ def _make_megatron_model(kw: dict[str, Any]) -> Any:
     return TwinkleCompatMegatronModel(**kw)
 
 
+def _require_trusted_imports(spec: str) -> None:
+    """Gate a ``module:attr`` import spec behind the trust-remote-code switch.
+
+    The specs are plain data crossing the Ray boundary, which is exactly what lets them slip past
+    the remote-class layer's ``check_unsafe`` (that check sees only the constructor kwargs, not the
+    import the replica performs later). Importing arbitrary code on request of a deployment config
+    must stay behind the same switch the rest of remote-code execution honors, or safe mode
+    (``TWINKLE_TRUST_REMOTE_CODE=0``) would promise more than it delivers.
+    """
+    if not trust_remote_code():
+        raise ValueError(f'import spec {spec!r} requires TWINKLE_TRUST_REMOTE_CODE != 0')
+
+
 def _resolve_model_loader(spec: str, model_id: str) -> Any:
     """Resolve a ``module:callable`` loader-factory spec and build the loader for ``model_id``.
 
@@ -106,12 +120,19 @@ def _resolve_model_loader(spec: str, model_id: str) -> Any:
     its own ``swift.dev.model.loader:build_model_loader``, which owns family resolution and returns a
     ``ModelLoaderProtocol`` object, or ``None`` to keep the generic AutoConfig/AutoModel path.
     """
+    _require_trusted_imports(spec)
     module_name, _, attr = spec.partition(':')
     if not attr:
         raise ValueError(
             f'model_loader must be a "module:callable" import spec naming a loader factory, got {spec!r}')
     factory = getattr(importlib.import_module(module_name), attr)
-    return factory(model_id)
+    loader = factory(model_id)
+    # Fail here, not at first use inside the model constructor: a misspelled factory that returns
+    # something else would otherwise surface as an opaque AttributeError deep in the backend.
+    if loader is not None and not callable(getattr(loader, 'build_config', None)):
+        raise TypeError(f'model_loader factory {spec!r} returned {loader!r}, which is neither None nor a '
+                        'ModelLoaderProtocol (missing callable build_config)')
+    return loader
 
 
 def _resolve_model_cls(spec: str) -> type:
@@ -122,6 +143,7 @@ def _resolve_model_cls(spec: str) -> type:
     swift points this at its own class, e.g.
     ``swift.dev.model.multi_lora_sentence_transformer_model:MultiLoraSentenceTransformerModel``.
     """
+    _require_trusted_imports(spec)
     module_name, _, attr = spec.partition(':')
     if not attr:
         raise ValueError(f'model_cls must be a "module:attr" import spec naming a model class, got {spec!r}')

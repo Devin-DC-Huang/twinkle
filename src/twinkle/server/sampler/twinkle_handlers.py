@@ -10,10 +10,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-import traceback
 import uuid
 from collections.abc import Callable, Mapping
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.responses import StreamingResponse
 from typing import TYPE_CHECKING
 
@@ -23,7 +22,7 @@ if TYPE_CHECKING:
 import numpy as np
 
 import twinkle.protocol.types as types
-from twinkle.data_format import InputFeature, PoolingParams, SamplingParams, Trajectory
+from twinkle.data_format import PoolingParams, SamplingParams
 from twinkle.protocol.json_utils import json_safe
 from twinkle.protocol.serialize import deserialize_object
 from twinkle.protocol.types import sampler as sampler_types
@@ -79,24 +78,6 @@ def _serialize_input_feature(feature: dict) -> dict:
     """Convert an InputFeature into a JSON-safe dict for the HTTP response."""
     safe = _json_safe_value(feature)
     return safe if isinstance(safe, dict) else {}
-
-
-def _coerce_inputs(inputs):
-    """Normalize a raw-JSON ``inputs`` payload into a list of ``InputFeature`` / ``Trajectory``.
-
-    A payload may carry pre-encoded token ids (``input_ids``) or a chat ``messages`` trajectory, as a
-    single dict or a list; the shape of the first entry decides which. The queued routes receive
-    wire-validated models and go through ``to_backend_inputs``; this is the raw-body path the encode
-    route (plain JSON) takes.
-    """
-    if isinstance(inputs, list) and inputs:
-        first = inputs[0]
-        if isinstance(first, dict) and 'input_ids' in first:
-            return [InputFeature(**item) for item in inputs]
-        return [Trajectory(**item) for item in inputs]
-    if isinstance(inputs, dict):
-        return [InputFeature(**inputs)] if 'input_ids' in inputs else [Trajectory(**inputs)]
-    return inputs
 
 
 def _build_rollout_rows_and_tags(
@@ -256,21 +237,6 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
     It is wired in via Depends so it is resolved lazily at request time.
     """
 
-    async def run_task(coro):
-        """Await a schedule_task_and_wait coroutine and surface any exception as a
-        structured HTTP 500 response so the client receives the full traceback instead
-        of an opaque connection-level error.
-
-        Note: HTTPException is re-raised directly to preserve its status code and detail.
-        """
-        try:
-            return await coro
-        except HTTPException:
-            raise
-        except Exception:
-            logger.error(traceback.format_exc())
-            raise HTTPException(status_code=500, detail=traceback.format_exc())
-
     @app.post('/twinkle/create', response_model=sampler_types.SamplerCreateResponse)
     async def create(
         request: Request, self: SamplerManagement = Depends(self_fn)) -> sampler_types.SamplerCreateResponse:
@@ -380,37 +346,31 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         return await self.submit_concurrent_and_peek(
             _generate_and_store, model_id=full_adapter_name or None, task_type='sample_to_data_plane')
 
-    @app.post('/twinkle/encode')
+    @app.post('/twinkle/encode', response_model=types.TaskEnvelope)
     async def encode(
             request: Request,
+            body: types.EncodeRequest,
             self: SamplerManagement = Depends(self_fn),
-    ):
+    ) -> types.TaskEnvelope:
         """Run a pooling forward (embedding / classify) and return the pooled output per input.
 
         The pooling counterpart of ``/twinkle/sample``: it accepts the same Trajectory / InputFeature
         ``inputs`` plus a ``pooling_params`` block, calls ``sampler.encode``, and returns one flat float
         list per input under ``data``. Only a sampler built with a pooling head (vLLM ``runner='pooling'``
-        / SGLang ``is_embedding``) can serve it; a generation-only sampler raises, which ``run_task``
-        surfaces as a 500 rather than returning hidden states that would look like embeddings.
+        / SGLang ``is_embedding``) can serve it; a generation-only sampler raises inside the queued
+        task, which comes back as a failed envelope.
         """
         token = await self._on_request_start(request)
-        body = await request.json()
 
         async def _task():
-            inputs = _coerce_inputs(body.get('inputs'))
-            pooling_params = (PoolingParams.from_dict(body['pooling_params'])
-                              if body.get('pooling_params') else None)
-            adapter_name = resolve_twinkle_adapter_name(request, body.get('adapter_name')) or ''
-            responses = self.sampler.encode(inputs, pooling_params, adapter_name=adapter_name)
+            inputs = to_backend_inputs(body.inputs)
+            pooling_params = PoolingParams.from_dict(body.pooling_params) if body.pooling_params else None
+            adapter_name = resolve_twinkle_adapter_name(request, body.adapter_name) or ''
+            responses = await self.call_backend(self.sampler.encode, inputs, pooling_params,
+                                                adapter_name=adapter_name)
             return {'data': [list(response.data) for response in responses]}
 
-        return await run_task(
-            self.schedule_task_and_wait(
-                _task,
-                token=token,
-                input_tokens=0,
-                task_type='encode',
-            ))
+        return await self.submit_concurrent_and_peek(_task, token=token, input_tokens=0, task_type='encode')
 
     @app.post('/twinkle/unload_adapter_paths')
     async def unload_adapter_paths(
@@ -445,7 +405,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         not clobber it. The response is still success, so a caller that sets templates lazily is
         unaffected either way.
         """
-        if getattr(self, '_template_pinned', False):
+        if self._template_pinned:
             logger.debug('set_template ignored: this sampler was configured with a pinned template.')
             return sampler_types.SamplerSetTemplateResponse()
         # Multi-tenant safety: this sampler replica is shared, and set_template mutates a single

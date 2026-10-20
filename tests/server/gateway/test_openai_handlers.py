@@ -51,16 +51,25 @@ def mock_gateway():
 class TestChatCompletions:
 
     def _make_sample_response(self, text='Hello!', stop_reason='stop'):
-        """Build a mock Response matching what proxy_request returns."""
+        """Build a mock Response matching what proxy_request returns.
+
+        The sampler replies with a completed TaskEnvelope: the payload rides under ``result``,
+        never at the top level. Mocking any other shape here would make the tests pass against a
+        contract the real server never sends.
+        """
         from fastapi import Response
         body = json.dumps({
-            'samples': [{
-                'sequences': [{
-                    'stop_reason': stop_reason,
-                    'tokens': list(range(len(text))),
-                    'decoded': text,
+            'request_id': 'req-test',
+            'status': 'completed',
+            'result': {
+                'samples': [{
+                    'sequences': [{
+                        'stop_reason': stop_reason,
+                        'tokens': list(range(len(text))),
+                        'decoded': text,
+                    }]
                 }]
-            }]
+            },
         }).encode()
         return Response(content=body, status_code=200, media_type='application/json')
 

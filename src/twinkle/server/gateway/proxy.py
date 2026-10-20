@@ -41,8 +41,16 @@ class ServiceProxy:
     ):
         self.http_options = http_options or {}
         self.route_prefix = route_prefix
-        # Disable proxy env vars to avoid external routing
-        self.client = httpx.AsyncClient(timeout=None, trust_env=False)
+        # Disable proxy env vars to avoid external routing. Verification is off iff TLS is on:
+        # every outbound target is this deployment's own listener (localhost), whose certificate is
+        # whatever ssl_certfile configured -- typically self-signed and in no CA store, so default
+        # verification would fail every internal call with CERTIFICATE_VERIFY_FAILED. This is a
+        # self-connection, not a trust decision about a remote peer.
+        self.client = httpx.AsyncClient(
+            timeout=None,
+            trust_env=False,
+            verify=not self.http_options.get('ssl_certfile'),
+        )
 
     async def close(self) -> None:
         """Close the underlying httpx.AsyncClient to release connections."""
@@ -65,7 +73,11 @@ class ServiceProxy:
         if host == '0.0.0.0':
             host = 'localhost'
 
-        base_url = f'http://{host}:{port}'
+        # The listener these URLs target serves HTTPS when the deployment set an ssl_certfile
+        # (HttpOptions forwards the pair to Ray Serve verbatim), so the outbound scheme has to
+        # follow it -- a fixed ``http://`` would send plaintext to a TLS port and fail every proxy.
+        scheme = 'https' if self.http_options.get('ssl_certfile') else 'http'
+        base_url = f'{scheme}://{host}:{port}'
         return f'{base_url}{routes.target_url(self.route_prefix, service_type, base_model, endpoint)}'
 
     def _prepare_headers(self, request_headers) -> dict[str, str]:
