@@ -23,7 +23,6 @@ from twinkle.infra import remote_function  # noqa: E402
 from twinkle.infra.continuous_work import get_worker_id  # noqa: E402
 from twinkle.infra.worker_pool import WorkerSlot, with_worker_pool  # noqa: E402
 from twinkle.sampler.base import Sampler  # noqa: E402
-from twinkle.sampler.generation_submission import ASYNC_SUBMISSION_METHODS, _dispatch_generation  # noqa: E402
 
 PROBE_SLEEP = 0.4
 
@@ -174,12 +173,10 @@ class _ProbeSampler(Sampler):
         return None
 
 
-# Tests are infra consumers, so they mount the pool facade and the capability bundle
-# explicitly instead of going through remote_class (whose construction path is
-# bypassed by this hand-built driver).
+# Tests are infra consumers, so they mount the pool facade explicitly instead of going
+# through remote_class (whose construction path is bypassed by this hand-built driver).
+# The submit protocol itself is inherited from the Sampler base class body.
 with_worker_pool(_ProbeSampler)
-for _name, _func in ASYNC_SUBMISSION_METHODS.items():
-    setattr(_ProbeSampler, _name, _func)
 
 
 @pytest.fixture(scope='module', autouse=True)
@@ -459,8 +456,8 @@ def test_router_extension_point(driver):
 
 def test_dispatch_generation_sticky_for_small_batch():
     """Same submission id routes to one worker; the batch smaller than the DP size lands whole."""
-    sticky_a = _dispatch_generation(2, 0, ('sid-a', ['x']), {})
-    sticky_b = _dispatch_generation(2, 1, ('sid-a', ['x']), {})
+    sticky_a = Sampler._dispatch_generation(2, 0, ('sid-a', ['x']), {})
+    sticky_b = Sampler._dispatch_generation(2, 1, ('sid-a', ['x']), {})
     shards = [sticky_a[0][1], sticky_b[0][1]]
     assert sorted(shards, key=len) == [[], ['x']], 'one worker gets everything, the other nothing'
     # ids with different crc32 modulo route to different workers
@@ -468,16 +465,16 @@ def test_dispatch_generation_sticky_for_small_batch():
     mods = {i: zlib.crc32(sid.encode('utf-8')) % 2 for i, sid in enumerate(ids)}
     id_a = next(sid for i, sid in enumerate(ids) if mods[i] == 0)
     id_b = next(sid for i, sid in enumerate(ids) if mods[i] == 1)
-    first_a = _dispatch_generation(2, 0, (id_a, ['x']), {})[0][1]
-    first_b = _dispatch_generation(2, 0, (id_b, ['x']), {})[0][1]
+    first_a = Sampler._dispatch_generation(2, 0, (id_a, ['x']), {})[0][1]
+    first_b = Sampler._dispatch_generation(2, 0, (id_b, ['x']), {})[0][1]
     assert [first_a, first_b] in ([['x'], []], [[], ['x']])
     # a batch at least the worker count is split evenly
-    a = _dispatch_generation(2, 0, ('sid-a', [0, 1, 2, 3, 4]), {})
-    b = _dispatch_generation(2, 1, ('sid-a', [0, 1, 2, 3, 4]), {})
+    a = Sampler._dispatch_generation(2, 0, ('sid-a', [0, 1, 2, 3, 4]), {})
+    b = Sampler._dispatch_generation(2, 1, ('sid-a', [0, 1, 2, 3, 4]), {})
     assert (a[0][1], b[0][1]) == ([0, 1, 2], [3, 4])
     # explicit target_worker wins
-    t0 = _dispatch_generation(2, 0, ('sid-a', ['x']), {'target_worker': 1})
-    t1 = _dispatch_generation(2, 1, ('sid-a', ['x']), {'target_worker': 1})
+    t0 = Sampler._dispatch_generation(2, 0, ('sid-a', ['x']), {'target_worker': 1})
+    t1 = Sampler._dispatch_generation(2, 1, ('sid-a', ['x']), {'target_worker': 1})
     assert t0[0][1] == [] and t1[0][1] == ['x'], 'only the targeted worker receives the batch'
     assert 'target_worker' not in t0[1]
 
@@ -485,35 +482,21 @@ def test_dispatch_generation_sticky_for_small_batch():
 # --- G: serialization boundary -----------------------------------------------------
 
 
-def test_remote_class_attaches_capabilities(driver):
-    """A plain ``_CAPABILITIES`` dict is attached by remote_class; undeclared classes stay clean,
-    and a class-body name colliding with the bundle fails loudly at decoration time."""
-    from twinkle.infra import remote_class
-
-    def _cap_method(self):
-        return 'cap'
-
-    bundle = {'cap_probe': _cap_method}
-
-    class _Capable:
-        _CAPABILITIES = bundle
-
-    class _Bare:
-        pass
-
-    capable = remote_class()(_Capable)
-    remote_class()(_Bare)
-    assert capable().cap_probe() == 'cap'
-    assert not hasattr(_Bare, 'cap_probe'), 'capability must not leak onto undeclared classes'
-
-    class _Conflict:
-        _CAPABILITIES = bundle
-
-        def cap_probe(self):
-            return 'own'
-
-    with pytest.raises(ValueError, match='already defines'):
-        remote_class()(_Conflict)
+def test_submit_protocol_lives_on_class_body():
+    """The async generation protocol is declared on the Sampler class body itself: grep-visible,
+    IDE-navigable, present without any decoration -- no injection, no bundle dictionary."""
+    for name in ('submit_generation', 'get_generation_status', 'collect_generation', 'cancel_generation',
+                 'pause_generation', 'abort_all_inflight', '_dispatch_generation', '_subset_normalize',
+                 '_subset_dispatch', '_generate_inputs'):
+        assert name in vars(Sampler), f'{name} must be defined on the Sampler class body'
+    # the scheduling metadata lists reference only worker-side names, all of which
+    # the class body now defines directly
+    for listed in ('_PAUSE_METHODS', '_CONTROL_METHODS'):
+        for name in getattr(Sampler, listed):
+            assert name in vars(Sampler), f'{name} listed in {listed} must exist on the class body'
+    # the dispatch strategy is a plain static callable on the class, usable undecorated
+    t = Sampler._dispatch_generation(1, 0, ('sid', ['x']), {})
+    assert t[0][1] == ['x']
 
 
 def test_remote_class_auto_attaches_pool_facade(driver):

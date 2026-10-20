@@ -46,6 +46,11 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
             acc_strategy: str = 'token',
             model_arch: Optional[Dict[str, Any]] = None,
             **kwargs):
+        new_special_tokens = kwargs.pop('new_special_tokens', None)
+        if new_special_tokens:
+            # Tenants share one frozen base tokenizer/embedding, so the vocab cannot be grown here;
+            # pre-grow the tokenizer or use the single-tenant TransformersModel.
+            raise ValueError('new_special_tokens is not supported on the multi-LoRA model.')
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
         self._try_init_process_group()
         super(PreTrainedModel, self).__init__()

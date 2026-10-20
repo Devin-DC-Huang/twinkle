@@ -56,6 +56,11 @@ class MultiLoraMegatronModel(MegatronModel):
         **kwargs,
     ):
         requires('megatron_core')
+        new_special_tokens = kwargs.pop('new_special_tokens', None)
+        if new_special_tokens:
+            # Tenants share one frozen base tokenizer/embedding, so the vocab cannot be grown here;
+            # pre-grow the tokenizer or use the single-tenant MegatronModel.
+            raise ValueError('new_special_tokens is not supported on the multi-LoRA model.')
         nn.Module.__init__(self)
         from twinkle.patch.megatron_peft import MegatronPeft
 

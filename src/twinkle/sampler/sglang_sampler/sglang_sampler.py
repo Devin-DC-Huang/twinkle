@@ -18,8 +18,6 @@ from twinkle.hub import HubOperation
 from twinkle.patch import Patch, apply_patch
 from twinkle.perf import timed
 from twinkle.sampler.base import Sampler
-from twinkle.sampler.generation_submission import ASYNC_SUBMISSION_METHODS
-from twinkle.sampler.partial_rollout import PARTIAL_ROLLOUT_METHODS
 from twinkle.utils import Platform
 
 logger = get_logger()
@@ -63,10 +61,6 @@ class SGLangSampler(Sampler, CheckpointEngineMixin):
         ``sync_weights(merge_and_sync=False)`` cannot push adapter deltas incrementally -- use the
         default ``sync_weights(merge_and_sync=True)``, which sends merged base weights.
     """
-
-    # Capability declaration: remote_class attaches these method bundles before its
-    # method scan, so the engine's MRO stays free of any mixin base.
-    _CAPABILITIES = {**ASYNC_SUBMISSION_METHODS, **PARTIAL_ROLLOUT_METHODS}
 
     def __init__(self, model_id: str, engine_args: Dict[str, Any] = None, device_mesh: DeviceMesh = None, **kwargs):
         """Initialize SGLangSampler.
@@ -249,6 +243,66 @@ class SGLangSampler(Sampler, CheckpointEngineMixin):
     @remote_function(dispatch='slice_dp', collect='flatten', lazy_collect=False, enable_continous_work=True,
                      worker_selector='_sampling_worker_ids')
     @timed
+    async def _generate_inputs(
+        self,
+        inputs: Any,
+        sampling_params: SamplingParams | Dict[str, Any] | None,
+        *,
+        adapter_name: str,
+        adapter_path: Optional[str],
+        use_base_model: bool,
+    ) -> List[SampleResponse]:
+        """Asynchronous counterpart of ``sample``: the coroutine the submit protocol schedules.
+
+        Mirrors ``sample``'s semantics (trajectory encoding, per-input LoRA, multimodal extraction)
+        with two sglang-specific nudges: the sampled token's logprob is forced on (sglang only
+        returns generated token ids as a side effect of asking for logprobs -- without them the
+        engine re-tokenises the completion text and those ids can drift from what the model actually
+        ran), and a zero-token request asks for one token and drops it.
+        """
+        if sampling_params is None:
+            sampling_params = SamplingParams()
+        elif isinstance(sampling_params, dict):
+            sampling_params = SamplingParams.from_dict(sampling_params)
+
+        inputs_list = self._normalize_inputs(inputs)
+        if not inputs_list:
+            return []
+
+        sampling_params = copy(sampling_params)
+        if not sampling_params.logprobs:
+            sampling_params.logprobs = 1
+
+        is_trajectory = 'input_ids' not in inputs_list[0]
+        logprobs_only = False
+        if sampling_params.max_tokens == 0:
+            sampling_params.max_tokens = 1
+            logprobs_only = True
+
+        image_data_list = [self._extract_image_data(feat) for feat in inputs_list]
+        if is_trajectory:
+            if self.template is None:
+                raise ValueError('Use set_template to add a template when trying to input Trajectory')
+            encoded_inputs = [
+                self.encode_trajectory_for_sglang(trajectory, adapter_name, not logprobs_only)
+                for trajectory in inputs_list
+            ]
+        else:
+            encoded_inputs = inputs_list
+
+        lora_name = None
+        if not use_base_model:
+            lora_name = await self._aregister_lora(adapter_path, adapter_name)
+
+        return await asyncio.gather(*(
+            self._sample_single(
+                feat,
+                sampling_params,
+                image_data=image_data,
+                lora_name=lora_name,
+                logprobs_only=logprobs_only,
+            ) for feat, image_data in zip(encoded_inputs, image_data_list)))
+
     def sample(
         self,
         inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],

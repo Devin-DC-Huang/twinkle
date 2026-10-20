@@ -38,7 +38,7 @@ from twinkle.perf import timed
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
 from twinkle.utils import construct_class, get_logger, selective_log_softmax
-from .utils import mtp
+from .utils.mtp import MtpTrainingState
 from .utils._mindspeed_runtime import ensure_mindspeed_adaptor_patched
 from .utils.utils import _find_embedding, _find_layers
 from .strategy import MegatronStrategy
@@ -207,11 +207,9 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
 
         self._model_wrapped = False
         self._finish_config = False
-        # One-shot guard so the "MTP has no trainable parameter" warning fires once, not per step.
-        self._mtp_trainable_checked = False
-        # Microbatch count of the last forward_backward, so pop_mtp_metrics can normalize a tracker
-        # that accumulates per microbatch. Set here because a pop before any step must not divide by 0.
-        self._last_num_microbatches = 1
+        # MTP bookkeeping (pass gating, one-shot trainability warning, loss-tracker draining)
+        # lives in the MtpTrainingState instance; the model keeps thin same-named shells below.
+        self._mtp = MtpTrainingState()
         # This correctly handles vocab sharding in Tensor Parallelism
         self.optimizer_group: Dict[str, MegatronOptimizerGroup] = {
             _default_adapter_name: self._construct_default_optimizer_group()
@@ -406,29 +404,17 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
     # Multi-Token Prediction (MTP) joint training
     # =========================================================================
 
-    # MTP training: thin shells over twinkle.model.megatron.mtp module functions. The
-    # same-named methods stay so subclasses can override them and duck-typed callers
+    # MTP training: thin shells over the MtpTrainingState instance. The same-named methods stay
+    # so subclasses can override them and duck-typed callers
     # (``getattr(model, 'pop_mtp_metrics')`` in swift) keep resolving.
 
     def _mtp_training_enabled(self, *, forward_only: bool, task: str, disable_lora: bool) -> bool:
-        if not mtp.mtp_pass_enabled(getattr(self.strategy.config, 'enable_mtp_training', False),
-                                    forward_only=forward_only, task=task, disable_lora=disable_lora):
-            return False
-        if not self._mtp_trainable_checked:
-            self._mtp_trainable_checked = True
-            self._warn_if_mtp_not_trainable()
-        return True
-
-    def _iter_mtp_modules(self):
-        return mtp.iter_mtp_modules(self.strategy.unwrap_model(self.model))
-
-    def _warn_if_mtp_not_trainable(self):
-        mtp.warn_if_mtp_not_trainable(list(self._iter_mtp_modules()))
+        return self._mtp.training_enabled(self, forward_only=forward_only, task=task, disable_lora=disable_lora)
 
     @remote_function(collect='last_pp_first', lazy_collect=False)
     def pop_mtp_metrics(self, loss_scale: Optional[float] = None) -> dict[str, float]:
-        """Drain megatron's MTP loss tracker; see :func:`mtp.pop_mtp_metrics`."""
-        return mtp.pop_mtp_metrics(self._last_num_microbatches, loss_scale)
+        """Drain megatron's MTP loss tracker; see :meth:`MtpTrainingState.pop`."""
+        return self._mtp.pop(loss_scale)
 
 
     # lazy_collect=False: forward_only exists to hand its outputs back to the caller, so the driver must
@@ -620,7 +606,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
                 seq_length = original_seq_length
 
         num_microbatches = len(inputs)
-        self._last_num_microbatches = num_microbatches
+        self._mtp.note_num_microbatches(num_microbatches)
         global_normalizer = None
         if transactional:
             local_normalizer = num_microbatches if local_batch_normalizer is None else local_batch_normalizer

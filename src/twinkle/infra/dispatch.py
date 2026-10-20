@@ -431,14 +431,6 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
         if any(hasattr(cls, name) for name in ('_REPLAY_METHODS', '_PAUSE_METHODS', '_CONTROL_METHODS',
                                                '_GENERATION_METHODS')):
             with_worker_pool(cls)
-        _capabilities = getattr(cls, '_CAPABILITIES', None)
-        if _capabilities is not None and getattr(cls, '_capabilities_attached', None) is not _capabilities:
-            for _name, _func in _capabilities.items():
-                if _name in cls.__dict__:
-                    raise ValueError(f'{cls.__name__} already defines {_name!r}; _CAPABILITIES cannot '
-                                     'attach it.')
-                setattr(cls, _name, _func)
-            cls._capabilities_attached = _capabilities
         # Give every continuous-work method its awaitable form on the class, so Ray
         # has something to await instead of a call that would sit on the actor's
         # event loop and make the others wait behind it.

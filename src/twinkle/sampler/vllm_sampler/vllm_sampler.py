@@ -18,8 +18,6 @@ from twinkle.patch import Patch, apply_patch
 from twinkle.patch.vllm_lora_weights import VLLMLoraWeights
 from twinkle.perf import timed
 from twinkle.sampler.base import Sampler
-from twinkle.sampler.generation_submission import ASYNC_SUBMISSION_METHODS
-from twinkle.sampler.partial_rollout import PARTIAL_ROLLOUT_METHODS
 from twinkle.utils import Platform
 
 logger = get_logger()
@@ -74,20 +72,16 @@ def _load_vllm_image(entry: Any) -> Any:
     return unwrapped
 
 
-_MAX_CONCURRENCY = max(1, int(os.environ.get('TWINKLE_SAMPLER_MAX_CONCURRENCY') or 24))
+SAMPLER_MAX_CONCURRENCY = max(1, int(os.environ.get('TWINKLE_SAMPLER_MAX_CONCURRENCY') or 24))
 
 
-@remote_class(max_concurrency=_MAX_CONCURRENCY)
+@remote_class(max_concurrency=SAMPLER_MAX_CONCURRENCY)
 class vLLMSampler(Sampler, CheckpointEngineMixin):
     """A vLLM-based sampler using VLLMEngine (AsyncLLM).
 
     This sampler automatically configures vLLM based on available GPUs.
     When gpus_per_worker > 1 is set in DeviceGroup, tensor parallelism is used.
     """
-
-    # Capability declaration: remote_class attaches these method bundles before its
-    # method scan, so the engine's MRO stays free of any mixin base.
-    _CAPABILITIES = {**ASYNC_SUBMISSION_METHODS, **PARTIAL_ROLLOUT_METHODS}
 
     def __init__(self, model_id: str, engine_args: Dict[str, Any] = None, device_mesh: DeviceMesh = None, **kwargs):
         """Initialize vLLMSampler.

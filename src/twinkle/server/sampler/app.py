@@ -41,10 +41,15 @@ def _make_vllm_sampler(kw: dict[str, Any]) -> Any:
 
 
 def _make_vllm_async_sampler(kw: dict[str, Any]) -> Any:
-    """Construct the vLLM backend with non-blocking generation admission."""
-    from .backends.vllm_async import ServerVLLMSampler
+    """The vLLM backend with non-blocking generation admission.
 
-    return ServerVLLMSampler(**kw, context_manager=None)
+    The same :class:`vLLMSampler` as the plain ``vllm`` key: its class body carries the
+    submit/poll/collect/cancel quartet (and the engine's own Ray concurrency), so the async
+    key is kept only so existing deployments keep their ``sampler_type``.
+    """
+    from twinkle.sampler import vLLMSampler
+
+    return vLLMSampler(**kw)
 
 
 def _make_sglang_sampler(kw: dict[str, Any]) -> Any:
@@ -54,10 +59,15 @@ def _make_sglang_sampler(kw: dict[str, Any]) -> Any:
 
 
 def _make_sglang_async_sampler(kw: dict[str, Any]) -> Any:
-    """Construct the sglang backend with non-blocking generation admission (for the data plane)."""
-    from twinkle_agentic.async_rl.sglang_sampler_tq import SGLangSamplerTQ
+    """The sglang backend with non-blocking generation admission (for the data plane).
 
-    return SGLangSamplerTQ(**kw)
+    The same :class:`SGLangSampler` as the plain ``sglang`` key: its class body carries the
+    submit/poll/collect/cancel quartet and the ``_generate_inputs`` engine hook, so the async key
+    is kept only so existing deployments keep their ``sampler_type``.
+    """
+    from twinkle.sampler import SGLangSampler
+
+    return SGLangSampler(**kw)
 
 
 def _make_torch_sampler(kw: dict[str, Any]) -> Any:
