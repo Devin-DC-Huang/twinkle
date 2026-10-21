@@ -1,15 +1,23 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import getpass
 import hashlib
 import inspect
 import os
 import re
+import tempfile
 from collections import defaultdict
 from contextlib import contextmanager
 from datasets.utils.filelock import FileLock
 from datetime import timedelta
 
-_LOCK_DIR = '.locks'
-os.makedirs(_LOCK_DIR, exist_ok=True)
+# Workers may start in read-only or different working directories. Keep their
+# locks in one writable runtime directory, without creating it during import.
+# TWINKLE_HOME overrides the default per-user temporary directory.
+_LOCK_DIR = os.path.abspath(
+    os.path.join(
+        os.path.expanduser(
+            os.environ.get('TWINKLE_HOME') or os.path.join(tempfile.gettempdir(), 'twinkle', getpass.getuser())),
+        '.locks'))
 
 # Coordination store: derived from MASTER_PORT so every rank of a group agrees on it without
 # talking to each other first. A collision with another job's MASTER_PORT surfaces as a bind
@@ -293,6 +301,7 @@ def processing_lock(lock_file: str, sticky: bool = False):
         return
 
     lock_name = _sanitize_lock_name(lock_file)
+    os.makedirs(_LOCK_DIR, exist_ok=True)
     lock: FileLock = FileLock(os.path.join(_LOCK_DIR, f'{lock_name}.lock'))  # noqa
 
     if acquire_lock(lock, False):
