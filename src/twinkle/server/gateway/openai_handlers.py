@@ -8,7 +8,9 @@ Translates OpenAI request/response shapes and proxies to the existing sampler
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 import uuid
 from collections.abc import Callable
 from fastapi import Depends, FastAPI, Request
@@ -22,12 +24,67 @@ if TYPE_CHECKING:
 
 import httpx
 
+import twinkle.protocol.types as types
+from twinkle.server.lifecycle.envelope import envelope_from_record
 from twinkle.server.utils import get_template_for_model
 from twinkle.utils.logger import get_logger
 from . import routes
 from .openai_bridge import make_error, translate_chat_request, translate_response, translate_stream_chunk
+from .use_cases import poll_future
 
 logger = get_logger()
+
+_OPENAI_SAMPLE_TIMEOUT_ENV = 'TWINKLE_OPENAI_SAMPLE_TIMEOUT'
+_DEFAULT_OPENAI_SAMPLE_TIMEOUT = 1800.0
+
+
+class SamplerWaitTimeoutError(TimeoutError):
+    """The sampler task did not reach a terminal state inside the gateway's budget."""
+
+
+def _sample_wait_timeout() -> float:
+    return float(os.environ.get(_OPENAI_SAMPLE_TIMEOUT_ENV, str(_DEFAULT_OPENAI_SAMPLE_TIMEOUT)))
+
+
+async def _resolve_sampler_envelope(gateway: GatewayServer, sampler_data: dict[str, Any],
+                                    request: Request) -> types.TaskEnvelope | None:
+    """Resolve the sampler's TaskEnvelope to a terminal state.
+
+    ``/twinkle/sample`` always answers with a TaskEnvelope; a slow sample is
+    still ``queued``/``running`` when the proxy returns. Polling the shared
+    state backend is the only way to obtain its result without changing the
+    upstream wire contract. Returns ``None`` when the future record was lost.
+
+    ``TWINKLE_OPENAI_SAMPLE_TIMEOUT`` bounds the entire terminal-state wait,
+    including state reads. Client disconnection is checked between long polls.
+    """
+    envelope = types.TaskEnvelope.model_validate(sampler_data)
+    if envelope.status in types.TERMINAL_STATUSES:
+        return envelope
+
+    async def wait_for_terminal(envelope: types.TaskEnvelope) -> types.TaskEnvelope | None:
+        while envelope.status not in types.TERMINAL_STATUSES:
+            if await request.is_disconnected():
+                raise SamplerWaitTimeoutError('Client disconnected while waiting for the sampling task.')
+            # ``poll_future`` waits out its whole window before reporting a missing
+            # record, so check once here: a lost record is a terminal answer, not a
+            # reason to keep the coroutine alive.
+            if await gateway.state.get_future(envelope.request_id) is None:
+                return None
+            outcome = await poll_future(gateway.state, envelope.request_id)
+            if outcome.record is None:
+                return None
+            envelope = envelope_from_record(envelope.request_id, outcome.record)
+        return envelope
+
+    timeout = _sample_wait_timeout()
+    try:
+        return await asyncio.wait_for(wait_for_terminal(envelope), timeout=timeout)
+    except SamplerWaitTimeoutError:
+        raise
+    except asyncio.TimeoutError:
+        raise SamplerWaitTimeoutError(
+            f'Sampling task {envelope.request_id} did not finish within {timeout:g}s.') from None
 
 
 def _register_openai_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) -> None:
@@ -105,8 +162,43 @@ def _register_openai_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
                 )
 
             sampler_data = json.loads(response.body)
+            try:
+                envelope = await _resolve_sampler_envelope(self, sampler_data, request)
+            except SamplerWaitTimeoutError as e:
+                return JSONResponse(
+                    status_code=504,
+                    content=make_error(message=str(e), error_type='timeout'),
+                )
+            if envelope is None:
+                return JSONResponse(
+                    status_code=500,
+                    content=make_error(
+                        message=f'Sampling task {sampler_data.get("request_id")} was lost by the server',
+                        error_type='server_error',
+                    ),
+                )
+            if envelope.status != 'completed':
+                error = envelope.error
+                message = error.error if error is not None else f'Sampling task {envelope.status}'
+                error_type = ('invalid_request_error'
+                              if error is not None and error.category.value == 'user' else 'server_error')
+                return JSONResponse(
+                    status_code=error.error_code if error is not None else 500,
+                    content=make_error(message=message, error_type=error_type),
+                )
+
+            sampler_result = envelope.result or {}
+            if not sampler_result.get('samples'):
+                return JSONResponse(
+                    status_code=502,
+                    content=make_error(
+                        message='Sampler completed without returning any samples',
+                        error_type='server_error',
+                    ),
+                )
+
             request_id = f'chatcmpl-{uuid.uuid4().hex[:24]}'
-            openai_response = translate_response(sampler_data, model, request_id)
+            openai_response = translate_response(sampler_result, model, request_id)
             resp_headers = {}
             replica_id = response.headers.get('x-twinkle-replica-id')
             if replica_id:
@@ -227,9 +319,11 @@ async def _ensure_template(
         return
 
     template_cls = get_template_for_model(base_model)
+    # The sampler's strict schema accepts only template_cls / adapter_name /
+    # init_kwargs. It already knows its own model_id and injects it when the
+    # template constructor needs one, so sending model_id here is rejected 422.
     set_template_body = json.dumps({
         'template_cls': template_cls,
-        'model_id': base_model,
         'adapter_name': '',
     }).encode()
 

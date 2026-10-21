@@ -133,11 +133,19 @@ def _register_model_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelMana
                 for key in inputs:
                     if isinstance(inputs[key], list) and isinstance(first_element(inputs[key]), (int, float)):
                         inputs[key] = torch.tensor(inputs[key])
+            kwargs = backend_kwargs(body)
+            resolved_adapter_name = self.resolve_model_adapter_name(adapter_name)
+            preflight = getattr(self.model, 'preflight_loss_inputs', None)
+            if preflight is not None and any(key in kwargs for key in ('old_logps', 'ref_logps', 'advantages')):
+                # Full, unsliced batch on every rank: a loss alignment error must
+                # fail all ranks before any of them enters its backward collective.
+                await self.call_backend(preflight, inputs=all_inputs, adapter_name=resolved_adapter_name, **kwargs)
+            elif preflight is None:
+                logger.warning(
+                    'Backend %s has no preflight_loss_inputs; a loss alignment error can still deadlock the DP peers.',
+                    type(self.model).__name__)
             ret = await self.call_backend(
-                self.model.forward_backward,
-                inputs=all_inputs,
-                adapter_name=self.resolve_model_adapter_name(adapter_name),
-                **backend_kwargs(body))
+                self.model.forward_backward, inputs=all_inputs, adapter_name=resolved_adapter_name, **kwargs)
             return {'result': ret}
 
         return await run_submit(
@@ -237,11 +245,17 @@ def _register_model_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelMana
         async def _call(self, body, adapter_name, token):
             raw_inputs, field_kwargs = await resolve_data_plane_model_inputs(body, self.data_plane)
             kwargs = merge_forward_kwargs(backend_kwargs(body), field_kwargs)
+            inputs = to_backend_inputs(raw_inputs)
+            resolved_adapter_name = self.resolve_model_adapter_name(adapter_name)
+            preflight = getattr(self.model, 'preflight_loss_inputs', None)
+            if preflight is not None and any(key in kwargs for key in ('old_logps', 'ref_logps', 'advantages')):
+                await self.call_backend(preflight, inputs=inputs, adapter_name=resolved_adapter_name, **kwargs)
+            elif preflight is None:
+                logger.warning(
+                    'Backend %s has no preflight_loss_inputs; a loss alignment error can still deadlock the DP peers.',
+                    type(self.model).__name__)
             ret = await self.call_backend(
-                self.model.forward_backward,
-                inputs=to_backend_inputs(raw_inputs),
-                adapter_name=self.resolve_model_adapter_name(adapter_name),
-                **kwargs)
+                self.model.forward_backward, inputs=inputs, adapter_name=resolved_adapter_name, **kwargs)
             return {'result': ret}
 
         return await run_submit(

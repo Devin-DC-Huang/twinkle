@@ -13,6 +13,7 @@ import time
 import traceback
 from collections import deque
 from dataclasses import replace
+from ray.exceptions import RayTaskError
 from typing import TYPE_CHECKING, Any, Callable, Deque
 
 from twinkle.protocol.types.errors import ErrorCategory
@@ -33,6 +34,27 @@ if TYPE_CHECKING:
     from twinkle.server.telemetry.metrics import TaskMetrics
 
 logger = get_logger()
+
+
+def _exception_summary(exc: BaseException) -> str:
+    """Build a single-line summary, unwrapping Ray's transport wrapper.
+
+    A RayTaskError's own ``str`` starts with the Ray call header (actor id,
+    pid, repr); the actionable error (e.g. the loss assertion) is in ``cause``.
+    Preferring it keeps the summary useful without enlarging the wire field,
+    while the full traceback still travels separately.
+
+    Only Ray's wrapper is unwrapped: elsewhere ``raise X from e`` is a
+    deliberate message and must not be replaced by its inner cause.
+    """
+    cause = None
+    if isinstance(exc, RayTaskError):
+        cause = getattr(exc, 'cause', None)
+        if not isinstance(cause, BaseException):
+            cause = exc.__cause__
+    if isinstance(cause, BaseException):
+        return f'{type(cause).__name__}: {cause}'
+    return f'{type(exc).__name__}: {exc}'
 
 
 def _reason_code_for_server_error(exc: TwinkleServerError) -> str:
@@ -497,7 +519,7 @@ class ComputeWorker:
             exec_time = time.monotonic() - exec_start
             # error is a single-line summary; the full traceback goes only to the
             # traceback field, never into `error`.
-            error = f'{type(exc).__name__}: {exc}'
+            error = _exception_summary(exc)
             logger.error(f'[ComputeWorker] Task {task.request_id} FAILED after {exec_time:.2f}s, '
                          f'type={task_type}:\n{traceback.format_exc(limit=3)}')
             await self._store_task_failed(

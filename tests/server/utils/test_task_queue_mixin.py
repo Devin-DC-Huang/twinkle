@@ -5,7 +5,47 @@ import pytest_asyncio
 from twinkle.server.config.task_queue import TaskQueueConfig
 from twinkle.server.task_queue.mixin import TaskQueueMixin
 from twinkle.server.task_queue.types import UserTaskError
-from twinkle.server.task_queue.worker import ComputeWorker
+from twinkle.server.task_queue.worker import ComputeWorker, _exception_summary
+
+
+def test_exception_summary_prefers_the_wrapped_cause():
+    from ray.exceptions import RayTaskError
+
+    err = RayTaskError(
+        'TwinkleCompatTransformersModel.preflight_loss_inputs',
+        'ray::TwinkleCompatTransformersModel.preflight_loss_inputs() (pid=1, ip=10.0.0.1)',
+        AssertionError('data/mask length mismatch at sample 0'),
+    )
+
+    summary = _exception_summary(err)
+    assert summary.startswith('AssertionError:')
+    assert 'mismatch' in summary
+
+
+def test_exception_summary_keeps_a_deliberate_wrapper_message():
+    """``raise X from e`` is a deliberate message; only Ray's wrapper is unwrapped."""
+
+    class _Rejected(Exception):
+        pass
+
+    try:
+        try:
+            raise ValueError('internal detail')
+        except ValueError as inner:
+            raise _Rejected('adapter_name is required') from inner
+    except _Rejected as outer:
+        summary = _exception_summary(outer)
+
+    assert summary == '_Rejected: adapter_name is required'
+
+
+def test_exception_summary_falls_back_to_the_ray_error_itself():
+    from ray.exceptions import RayTaskError
+
+    err = RayTaskError('Model.step', 'ray::Model.step() (pid=1)', None)
+    summary = _exception_summary(err)
+    assert summary.startswith('RayTaskError')
+    assert 'Model.step' in summary
 
 
 class _DummyState:

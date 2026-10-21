@@ -420,3 +420,22 @@ async def test_reserved_sampler_name_is_rejected_before_backend_or_file_io(manag
         await manager.save_sampler('run', 'latest', save)
     save.assert_not_awaited()
     assert not Path(manager.get_save_dir('run', is_sampler=True)).exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('manager', ['tinker', 'twinkle'], indirect=True)
+async def test_delete_rejects_non_checkpoint_paths(manager):
+    """Only a concrete checkpoint may be deleted, never a kind root, alias, or the run root."""
+    await manager.save_training('run', 'step', _writer('training'))
+    await manager.save_sampler('run', None, _writer('live'))
+    run_dir = manager.training_run_manager.get_model_dir('run')
+
+    def snapshot():
+        return sorted(path.relative_to(run_dir).as_posix() for path in run_dir.rglob('*'))
+
+    before = snapshot()
+    for checkpoint_id in ('weights', 'sampler_weights', '.', 'sampler_weights/latest', 'weights/../weights/step'):
+        assert manager.delete('run', checkpoint_id) is False, checkpoint_id
+    assert snapshot() == before
+    assert manager.delete('run', 'weights/step') is True
+    assert not (run_dir / 'weights/step').exists()
