@@ -36,7 +36,7 @@ from twinkle.loss import CrossEntropyLoss, Loss
 from twinkle.metric import Accuracy, LossMetric, Metric, TrainMetric
 from twinkle.model.base import ModelLoaderProtocol, TrainableModel, copy_checkpoint_args, rotate_checkpoints
 from twinkle.model.state_dict_utils import normalize_adapter_keys
-from twinkle.model.micro_batch import MicroBatchConfig, plan_micro_batches, select_batch
+from twinkle.model.micro_batch import MicroBatchConfig, merge_micro_batch_outputs, plan_micro_batches, select_batch
 from twinkle.model.optimizer_group import BaseOptimizerGroup, TrainStatus
 from twinkle.model.transformers.moe import apply_expert_parallel
 from twinkle.model.transformers.strategy import AccelerateStrategy, DeepSpeedStrategy, NativeFSDPStrategy
@@ -1013,40 +1013,124 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             **kwargs:
                 adapter_name: Lora adapter name.
                 disable_lora: If True, disable LoRA and use base model for inference.
+                micro_batch_size: Maximum samples per local micro-batch (fixed-count slicing).
+                dynamic_batching: Pack samples under max_tokens_per_micro_batch.
+                max_tokens_per_micro_batch: Token budget required for dynamic batching.
+                packing_algorithm: Dynamic packing strategy, 'ffd' (default) or 'kk'.
         Returns:
             The output of the model forward.
         """
+        config = MicroBatchConfig.from_kwargs(kwargs)
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
+        optimizer_config = self.optimizer_group[adapter_name]
+        inputs = self._prepare_forward_only_inputs(inputs, optimizer_config)
+        if config is None:
+            return self._forward_only_single(inputs=inputs, optimizer_config=optimizer_config, **kwargs)
+        return self._forward_only_micro_batches(
+            inputs=inputs, config=config, optimizer_config=optimizer_config, **kwargs)
+
+    def _prepare_forward_only_inputs(self, inputs, optimizer_config):
+        """Normalize and encode the local batch once, before optional micro-batching."""
+        if isinstance(inputs, dict):
+            inputs = [inputs]
+        if not inputs:
+            raise ValueError('inputs empty, check your DataLoader outputs')
+        if self._not_encoded(inputs[0]):
+            assert optimizer_config.template is not None, \
+                'Use set_template to add a template when trying to input `List[Trajectory]`'
+            inputs = optimizer_config.template.batch_encode(inputs)  # noqa
+        if not inputs:
+            raise ValueError('encoded inputs empty, check your template outputs')
+        return inputs
+
+    def _forward_only_micro_batches(self, *, inputs, config, optimizer_config, **kwargs):
+        """Execute a local micro-batch plan and restore the complete return value.
+
+        Each micro-batch runs the full single-batch path (logps postprocessing included), so the
+        raw logits never span batches; ``merge_micro_batch_outputs`` then reassembles the
+        sample-ordered whole-batch return, reducing the per-batch ``aux_loss`` with the loss's
+        own micro-batch scales. Parallel-list kwargs (``ref_logps`` and friends) are sliced by
+        ``select_batch`` alongside the inputs, so per-feature alignment survives the split.
+        """
+        plan = self._build_micro_batch_plan(inputs, config, optimizer_config)
+        batches = []
+        for indices in plan:
+            micro_kwargs = {key: select_batch(value, indices, len(inputs)) for key, value in kwargs.items()}
+            outputs = self._forward_only_single(
+                inputs=[inputs[index] for index in indices],
+                optimizer_config=optimizer_config,
+                **micro_kwargs,
+            )
+            batches.append(dict(outputs))
+        micro_batch_scales = None
+        if any(output.get('aux_loss') is not None for output in batches):
+            loss_instance = optimizer_config.get_loss(kwargs.get('loss_key'))
+            micro_batch_scales = [loss_instance.micro_batch_scale(inputs, indices) for indices in plan]
+        return merge_micro_batch_outputs(
+            batches, plan, task=kwargs.get('task', 'causal_lm'), micro_batch_scales=micro_batch_scales)
+
+    def _build_micro_batch_plan(self, inputs, config, optimizer_config):
+        """Plan the local micro-batches; under data parallelism every rank agrees on the count.
+
+        The token-cost packing is the same kernel ``forward_backward`` uses. Model DP ranks hold
+        different sequence lengths, so uncoordinated plans would disagree on the micro-batch
+        count; the all-gather loop below raises the minimum count until every rank returns the
+        same number, and fails loudly when no common count exists.
+        """
+        processor = optimizer_config.processor
+        assert isinstance(processor, InputProcessor), 'Set InputProcessor correctly before forwarding'
+        optimizer_config._ensure_dp_group()
+        dp_group = optimizer_config._dp_group
+        min_micro_batches = 1
+        while True:
+            try:
+                plan = plan_micro_batches(
+                    inputs, config, padding_free=processor.padding_free,
+                    min_micro_batches=min_micro_batches)
+                planning_error = None
+            except Exception as exc:
+                if dp_group is None:
+                    raise
+                plan = None
+                planning_error = f'{type(exc).__name__}: {exc}'
+            if dp_group is None:
+                return plan
+            local_state = {
+                'micro_batch_count': len(plan) if plan is not None else None,
+                'input_count': len(inputs),
+                'error': planning_error,
+            }
+            states = [None] * dist.get_world_size(dp_group)
+            dist.all_gather_object(states, local_state, group=dp_group)
+            errors = [
+                f'rank {rank}: {state["error"]}'
+                for rank, state in enumerate(states) if state['error'] is not None]
+            if errors:
+                raise RuntimeError('micro-batch planning failed on one or more model DP ranks: '
+                                   + '; '.join(errors))
+            counts = [state['micro_batch_count'] for state in states]
+            if all(count == len(plan) for count in counts):
+                return plan
+            min_micro_batches = max(counts)
+            if any(min_micro_batches > state['input_count'] for state in states):
+                raise ValueError('model DP ranks cannot execute the same number of non-empty '
+                                 'micro-batches; make the input batch divisible by the model '
+                                 'data-parallel size')
+
+    def _forward_only_single(self, *, inputs, optimizer_config, **kwargs):
+        """Run one evaluation micro-batch (or, without micro-batching, the whole batch)."""
         disable_lora = kwargs.pop('disable_lora', False)
         temperature = float(kwargs.pop('temperature', 1.0))
         sampling_masks = kwargs.pop('sampling_masks', None)
         return_logits = kwargs.pop('return_logits', False)
         task = kwargs.pop('task', 'causal_lm')
         loss_key = kwargs.pop('loss_key', None)
-        # Megatron's forward_only schedules by a fixed ``micro_batch_size`` (its 1F1B pipeline); this
-        # backend's no-grad forward runs the whole batch at once, so the knob has no effect here --
-        # say so instead of silently dropping it.
-        micro_batch_size = kwargs.pop('micro_batch_size', None)
-        if micro_batch_size is not None:
-            logger.warning('micro_batch_size is a Megatron-only forward_only knob; the transformers '
-                           'backend runs the whole batch and ignores it.')
         # Accepted for backend parity with Megatron's empty-loss probe entry (``compute_loss=False``). This
         # forward_only derives logps via selective_log_softmax and never calls the loss, so there is nothing
         # to skip here; popped so it does not linger in eval_status.forward_kwargs.
         kwargs.pop('compute_loss', None)
-        optimizer_config = self.optimizer_group[adapter_name]
         self._lazy_wrap_model()
-        if not inputs:
-            raise ValueError('inputs empty, check your DataLoader outputs')
         self.model.eval()
-        if (isinstance(inputs, dict) and self._not_encoded(inputs)) or (isinstance(inputs, list)
-                                                                        and self._not_encoded(inputs[0])):
-            # Trajectory or List[Trajectory]
-            assert optimizer_config.template is not None, \
-                'Use set_template to add a template when trying to input `List[Trajectory]`'
-            if isinstance(inputs, dict):
-                inputs = [inputs]
-            inputs = optimizer_config.template.batch_encode(inputs)  # noqa
         with torch.no_grad():
             processor: InputProcessor = optimizer_config.processor
             assert isinstance(processor, InputProcessor), 'Set InputProcessor correctly before forwarding'
