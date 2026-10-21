@@ -5,10 +5,13 @@ import numpy as np
 import os
 import random
 import re
+import threading
+import time
 import torch
+from collections import OrderedDict
 import torch.distributed as dist
 import transformers
-from copy import copy
+from copy import copy, deepcopy
 from dataclasses import dataclass, field
 from peft import PeftConfig, PeftModel, get_peft_model
 from peft.utils import load_peft_weights
@@ -28,7 +31,8 @@ from twinkle.checkpoint_engine import CheckpointEngine
 from twinkle.checkpoint_engine.mixin import CheckpointEngineMixin
 from twinkle.checkpoint_engine.weight_keys import (add_base_layer_suffix, is_lora_key, normalize_param_name,
                                                    print_weight_example)
-from twinkle.data_format import InputFeature, ModelOutput, SampleResponse, SamplingParams, Trajectory
+from twinkle.data_format import (InputFeature, ModelOutput, SampleResponse, SamplingParams, Trajectory,
+                                 prepare_sampling_call, request_identity)
 from twinkle.hub import HubOperation
 from twinkle.infra import collect_dp_and_flatten, collect_tensor_dict
 from twinkle.loss import CrossEntropyLoss, Loss
@@ -466,6 +470,10 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         }
         self.optimizer_group[_default_adapter_name].adapter_name = _default_adapter_name
         self.active_group = _default_adapter_name
+        self._generation_lock = threading.RLock()
+        self._generation_model_lock = threading.RLock()
+        self._generation_engines = {}
+        self._generation_pre_stops = OrderedDict()
 
     # Optional-feature thin shells over twinkle.model.transformers.feature_hooks; the
     # same-named methods stay so subclasses can override them.
@@ -734,52 +742,30 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         if not self._router_replay_enabled or self._router_replay_applied:
             return
         model = self.strategy.unwrap_model(self.model)
-        from .moe.router_replay import apply_router_replay_patch
-        apply_router_replay_patch(model)
+        from .moe.router_replay import RouterReplay
+        RouterReplay.apply_router_replay_patch(model)
         self._router_replay_applied = True
 
-    def _router_replay_setup(self,
-                             router_replay_action,
-                             routed_experts=None,
-                             batch_size=1,
-                             manual_cleanup=False,
-                             replay_mask=None):
-        """Set up routing replay before a model forward.
+    def _router_replay(self, action, *, routed_experts=None, batch_size=1, manual_cleanup=False,
+                       replay_mask=None):
+        """Set up routing replay before a model forward; returns the per-call :class:`RouterReplay`.
 
-        Returns ``cleanup_fn``.
-        Call *cleanup_fn* after the forward to gather recorded indices(when RECORD) and clear global state.
+        A disabled/absent action yields the null object (all methods no-op); call ``finish()``
+        after the forward to gather recorded indices (RECORD) and clear global state.
         """
-        if not getattr(self, '_router_replay_enabled', False):
-            return lambda: None
-
+        from .moe.router_replay import RouterReplay
+        if not getattr(self, '_router_replay_enabled', False) or action is None:
+            return RouterReplay(action=None)
         self._maybe_apply_router_replay()
-
-        if router_replay_action is None:
-            return lambda: None
-
-        from .moe.router_replay import (RouterReplayAction, clear_global_indices, clear_global_router_replay_action,
-                                        get_router_replay_data, resolve_router_replay_action,
-                                        set_global_router_replay_action, set_router_replay_data)
-        # Callers (swift/dev) pass a backend-neutral string token (basic principle 1: the two backends are
-        # driven identically, and Megatron's RouterReplayAction is a different class), so resolve it to this
-        # backend's enum before the ``== RouterReplayAction.*`` comparisons and the per-block state below.
-        router_replay_action = resolve_router_replay_action(router_replay_action)
-        unwrapped = self.strategy.unwrap_model(self.model)
-        set_global_router_replay_action(router_replay_action)
-        if router_replay_action == RouterReplayAction.REPLAY_FORWARD:
-            assert routed_experts is not None, 'routed_experts must be not None'
-            set_router_replay_data(routed_experts, unwrapped, replay_mask)
-
-        def cleanup():
-            recorded = None
-            if router_replay_action == RouterReplayAction.RECORD:
-                recorded = get_router_replay_data(unwrapped, batch_size)
-            if not manual_cleanup:
-                clear_global_router_replay_action()
-                clear_global_indices()
-            return recorded
-
-        return cleanup
+        return RouterReplay(
+            action,
+            routed_experts=routed_experts,
+            batch_size=batch_size,
+            manual_cleanup=manual_cleanup,
+            replay_mask=replay_mask,
+            model=lambda: self.strategy.unwrap_model(self.model),
+            apply_patch=None,  # already applied by _maybe_apply_router_replay above
+        )
 
     def _ensure_optimizer_dp_groups(self):
         for optimizer_group in self.optimizer_group.values():
@@ -869,17 +855,17 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
 
         # Routing replay: the driver passes the MODE scalar; the model layer owns the mode->action mapping
         # (resolve_router_replay_mode -- the training forward always REPLAYS, so a missing routed_experts
-        # still fails loudly in _router_replay_setup).
+        # still fails loudly in RouterReplay.__init__).
         router_replay_mode = kwargs.pop('router_replay_mode', None)
         router_replay_manual_cleanup = kwargs.pop('router_replay_manual_cleanup', False)
         routed_experts = inputs.pop('routed_experts', None)
         replay_mask = inputs.pop('replay_mask', None)
         batch_size = labels.shape[0] if labels is not None else (
             inputs['input_ids'].shape[0] if 'input_ids' in inputs else 1)
-        from .moe.router_replay import resolve_router_replay_mode
-        rr_cleanup = self._router_replay_setup(
-            resolve_router_replay_mode(router_replay_mode), routed_experts, batch_size,
-            router_replay_manual_cleanup, replay_mask)
+        from .moe.router_replay import RouterReplay
+        rr = self._router_replay(
+            RouterReplay.resolve_router_replay_mode(router_replay_mode), routed_experts=routed_experts,
+            batch_size=batch_size, manual_cleanup=router_replay_manual_cleanup, replay_mask=replay_mask)
 
         # Per-forward task patches probe module attributes (score/classifier heads,
         # get_image_features) that DDP-wrapped models do not forward -- resolve them on the
@@ -890,7 +876,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
                 _resolve_mm_graph_context(unwrapped_model, optimizer_config.template):
             outputs = self.model(**inputs)
 
-        recorded_routing = rr_cleanup()
+        recorded_routing = rr.finish()
 
         inputs['labels'] = labels
         if loss_scale is not None:
@@ -1029,10 +1015,11 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             replay_mask = inputs.pop('replay_mask', None)
             batch_size = labels.shape[0] if labels is not None else (
                 inputs['input_ids'].shape[0] if 'input_ids' in inputs else 1)
-            from .moe.router_replay import resolve_router_replay_mode
-            rr_cleanup = self._router_replay_setup(
-                resolve_router_replay_mode(router_replay_mode, allow_record=True), routed_experts,
-                batch_size, router_replay_manual_cleanup, replay_mask)
+            from .moe.router_replay import RouterReplay
+            rr = self._router_replay(
+                RouterReplay.resolve_router_replay_mode(router_replay_mode, allow_record=True),
+                routed_experts=routed_experts, batch_size=batch_size,
+                manual_cleanup=router_replay_manual_cleanup, replay_mask=replay_mask)
 
             lora_ctx = (
                 unwrapped_model.disable_adapter()
@@ -1041,7 +1028,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             with _resolve_task_context(unwrapped_model, task, template=optimizer_config.template), lora_ctx:
                 outputs = self.model(**inputs)
 
-            recorded_routing = rr_cleanup()
+            recorded_routing = rr.finish()
 
             inputs['labels'] = labels
             if loss_scale is not None:
@@ -1090,7 +1077,8 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
                 return_outputs['routed_experts'] = recorded_routing
             return return_outputs
 
-    @remote_function(dispatch='slice_dp', collect=collect_dp_and_flatten, lazy_collect=False)
+    @remote_function(dispatch='slice_dp', collect=collect_dp_and_flatten, lazy_collect=False,
+                     prepare=prepare_sampling_call)
     def generate(
         self,
         inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
@@ -1102,6 +1090,10 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         use_base_model: bool = False,
         adapter_paths: Optional[List[Optional[str]]] = None,
         strict: bool = True,
+        token_only: bool = False,
+        request_ids: Optional[List[str]] = None,
+        stopped_mask: Optional[List[bool]] = None,
+        **generation_kwargs,
     ) -> List[SampleResponse]:
         """Generate completions on the weights this model already holds, inside its own workers.
 
@@ -1144,9 +1136,6 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         Returns:
             One ``SampleResponse`` per input, in input order, each holding ``num_samples`` sequences.
         """
-        # Deferred: the model package must not import the sampler package at module load (it would be a
-        # cycle), and both are only needed once generation is actually requested.
-        from twinkle.sampler import generation
         from twinkle.sampler.transformers_sampler.transformers_engine import TransformersEngine
 
         if adapter_path is not None or adapter_paths is not None:
@@ -1165,56 +1154,74 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         if template is None:
             raise ValueError('Set a template with set_template() before generate(): a Trajectory input '
                              'needs it to encode, and the engine needs its tokenizer to pad and decode.')
-        inputs_list = [inputs] if isinstance(inputs, dict) else list(inputs)
+        inputs_list = deepcopy([inputs] if isinstance(inputs, dict) else list(inputs))
         if not inputs_list:
             return []
-        if isinstance(sampling_params, dict):
-            params = SamplingParams.from_dict(sampling_params)
-        elif sampling_params is None:
-            params = SamplingParams()
-        else:
-            params = sampling_params
-        logprobs_only = params.max_tokens == 0
-        if logprobs_only:
-            params = copy(params)
-            params.max_tokens = 1
+        if request_ids is None:
+            from twinkle.sampler.base import Sampler
+            request_ids = [Sampler._engine_request_id(request_identity(item), 0) for item in inputs_list]
+        if len(request_ids) != len(inputs_list):
+            raise ValueError('request_ids 与输入必须等长。')
+        if stopped_mask is not None and (len(stopped_mask) != len(inputs_list)
+                                         or any(type(value) is not bool for value in stopped_mask)):
+            raise ValueError('stopped_mask 必须为逐输入等长的 bool 列表。')
+        # 模型初始化可能执行 collective；不能占用控制状态锁。
+        with self._generation_model_lock:
+            self._lazy_wrap_model()
+            unwrapped_model = self.strategy.unwrap_model(self.model)
+            # FSDP 的 all-gather hooks 必须由实际持有权重的包装模型执行。
+            target = self.model if hasattr(self.model, 'generate') else unwrapped_model
+            with self._generation_lock:
+                engine = self._generation_engines.get(adapter_name)
+                if engine is None:
+                    engine = TransformersEngine(self.tokenizer_id, model=target, tokenizer=template.tokenizer)
+                    engine._model_lock = self._generation_model_lock
+                    self._generation_engines[adapter_name] = engine
+                engine.model = target
+                engine.tokenizer = template.tokenizer
+                stopped = [rid for index, rid in enumerate(request_ids)
+                           if (stopped_mask is not None and stopped_mask[index])
+                           or rid in self._generation_pre_stops]
+                engine.register_requests(request_ids, stopped=stopped)
+                for rid in request_ids:
+                    self._generation_pre_stops.pop(rid, None)
+        return engine.generate_inputs(
+            inputs_list, sampling_params, adapter_name, template=template, strict=strict,
+            use_base_model=use_base_model, token_only=token_only, return_encoded=return_encoded,
+            request_ids=request_ids, registered=True, max_batch_size=_GENERATION_MAX_BATCH_SIZE,
+            **generation_kwargs)
 
-        self._lazy_wrap_model()
-        self.model.eval()
-        unwrapped_model = self.strategy.unwrap_model(self.model)
-        # FSDP2 fully_shard is in place, so self.model still exposes .generate and its all-gather hooks
-        # must run -- generate on the wrapped model. A DDP/DeepSpeed wrapper has no .generate, so fall
-        # back to the unwrapped module (the wrapper only exists for gradient sync, irrelevant here).
-        generation_target = self.model if hasattr(self.model, 'generate') else unwrapped_model
-        engine = TransformersEngine(self.tokenizer_id, model=generation_target, tokenizer=template.tokenizer)
+    @remote_function(dispatch='all', collect='first', lazy_collect=False, control=True)
+    def pause_generation(self, request_ids: List[str]) -> None:
+        """cohort 内发出停止，等待已启动的本地生成；排队调用由 sampler Future 确认结束。"""
+        if any(not isinstance(rid, str) or not rid for rid in request_ids):
+            raise ValueError('request_ids 必须包含非空字符串。')
+        pending = []
+        with self._generation_lock:
+            now = time.monotonic()
+            for rid, created in tuple(self._generation_pre_stops.items()):
+                if now - created > 300:
+                    self._generation_pre_stops.pop(rid)
+            matched = set()
+            for engine in self._generation_engines.values():
+                with engine._request_lock:
+                    local_ids = [rid for rid in request_ids if rid in engine._requests]
+                if local_ids:
+                    engine.request_stop(local_ids)
+                    matched.update(local_ids)
+                    pending.append((engine, local_ids))
+            # 控制可先于普通执行抵达；跨 rank 广播的非本地请求只保留有界停止命令。
+            unmatched = set(request_ids) - matched
+            if len(set(self._generation_pre_stops) | unmatched) > 4096:
+                raise RuntimeError('模型排队停止命令容量已满。')
+            for rid in unmatched:
+                self._generation_pre_stops.setdefault(rid, now)
+        for engine, local_ids in pending:
+            engine.wait_requests(local_ids)
 
-        encoded, failures = generation.encode_all(template, inputs_list, logprobs_only=logprobs_only, strict=strict)
-        results: List[Optional[SampleResponse]] = [None] * len(inputs_list)
-        for index, response in failures.items():
-            results[index] = response
-        pending = [index for index in range(len(inputs_list)) if results[index] is None]
-
-        def call_batch(prompts, extra):
-            # The engine's synchronous core, driven inline: this worker has no event loop to keep
-            # responsive and Ray forbids asyncio.run, so there is nothing to gain from batch_sample's
-            # loop-and-thread hop (and its lock, which would be bound to the wrong loop).
-            return engine.generate_batch(
-                prompts, params, num_samples=params.num_samples, logprobs=params.logprobs is not None,
-                extra_model_inputs=extra or None)
-
-        lora_ctx = (unwrapped_model.disable_adapter()
-                    if use_base_model and isinstance(unwrapped_model, PeftModel) else contextlib.nullcontext())
-        with lora_ctx:
-            for chunk in generation.chunks(pending, _GENERATION_MAX_BATCH_SIZE):
-                for index, response in zip(
-                        chunk, generation.run_chunk(chunk, encoded, params, template, call_batch, strict=strict)):
-                    results[index] = response
-
-        if not logprobs_only:
-            generation.attach_features(template, results, encoded)
-        return [
-            r if r is not None else generation.error_response(encoded.get(i, {})) for i, r in enumerate(results)
-        ]
+    @remote_function(dispatch='all', collect='first', lazy_collect=False, control=True)
+    def stop_generation(self, request_ids: List[str]) -> None:
+        self.pause_generation(request_ids)
 
     def generate_stream(self, *args, **kwargs):
         """Refuse streaming in-place generation rather than half-build it.
@@ -1297,18 +1304,18 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             no_sync_ctx = self.model.no_sync()
 
         router_replay_mode = kwargs.pop('router_replay_mode', None)
-        rr_cleanup = None
+        rr = None
         if router_replay_mode is not None:
-            from .moe.router_replay import RouterReplayAction
-            rr_cleanup = self._router_replay_setup(router_replay_action=RouterReplayAction.REPLAY_BACKWARD)
+            from .moe.router_replay import RouterReplay, RouterReplayAction
+            rr = self._router_replay(RouterReplayAction.REPLAY_BACKWARD)
 
         with no_sync_ctx:
             if scaler is not None:
                 scaler.scale(loss_value).backward()
             else:
                 loss_value.backward()
-        if rr_cleanup is not None:
-            rr_cleanup()
+        if rr is not None:
+            rr.finish()
         optimizer_config.train_status.loss_value = None
 
     def _build_micro_batch_plan(self, inputs, config, optimizer_config):
@@ -2329,7 +2336,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
     def get_state_dict(self, **kwargs):
         return self._get_trainable_parameters(kwargs.pop('adapter_name', self._get_default_group()))
 
-    @remote_function(collect='first', lazy_collect=False)
+    @remote_function(collect='first', lazy_collect=False, exclusive=True)
     def get_peft_config_dict(self, adapter_name: str = None) -> dict:
         """Return the PEFT config as a dict for vLLM's PEFTHelper.
 

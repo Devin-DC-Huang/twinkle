@@ -4,6 +4,12 @@ from typing import TYPE_CHECKING, Any
 from ._lazy_module import _LazyModule  # noqa
 
 
+def initialize(*args, **kwargs):
+    """延迟加载基础设施初始化入口。"""
+    from .infra import initialize as initialize_infra
+    return initialize_infra(*args, **kwargs)
+
+
 def init_tinker_client(**kwargs) -> None:
     """Initialize the Tinker-compatible client without eager client imports."""
     from twinkle_client import init_tinker_client as _init_tinker_client
@@ -28,7 +34,7 @@ def init_twinkle_client(
 
 if TYPE_CHECKING:
     from twinkle_client import init_tinker_client, init_twinkle_client
-    from .infra import get_device_placement, get_mode, initialize, remote_class, remote_function
+    from .infra import configure, get_device_placement, get_mode, remote_class, remote_function
     from .infra import remote_map as _remote_map
     from .utils import is_master
 
@@ -46,8 +52,9 @@ else:
             'find_free_port', 'trust_remote_code', 'check_unsafe', 'DeviceMesh', 'Plugin', 'DeviceGroup',
             'get_logger', 'is_master'
         ],
-        'infra': ['initialize', 'remote_class', 'remote_function', 'remote_map', 'get_device_placement',
-                  'get_mode', 'with_worker_pool'],
+        'infra': ['remote_class', 'remote_function', 'remote_map', 'get_device_placement',
+                  'get_mode', 'configure', 'LazyCollect', 'WorkerPool', 'WorkerPoolView',
+                  'Router', 'LeastInflightRouter', 'StickyRouter'],
     }
 
     import sys
@@ -58,6 +65,7 @@ else:
         _import_structure,
         module_spec=__spec__,  # noqa
         extra_objects={
+            'initialize': initialize,
             'init_tinker_client': init_tinker_client,
             'init_twinkle_client': init_twinkle_client,
         },

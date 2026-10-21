@@ -27,12 +27,12 @@ from twinkle.notifier import Notifier
 from twinkle.utils import DeviceGroup, DeviceMesh, Platform, requires
 from . import _torch_setup
 from .collectors import collect_dp_and_flatten, collect_tensor_dict
-from .continuous_work import _cw_drop_locked, _cw_unregister, _select_workers, get_worker_id
+from .continuous_work import get_worker_id
 from .dispatch import (_dispatch_args, _get_device_mesh_param_name, get_device_placement, remote_class,
                        remote_function)
 from .ray_tasks import remote_map
-from twinkle.utils.lazy_collect import set_lazy_collect
-from .worker_pool import with_worker_pool
+from ._ray.ray_helper import LazyCollect
+from .worker_pool import CallContext, WorkerPool, WorkerPoolView, Router, LeastInflightRouter, StickyRouter
 
 __all__ = [
     'initialize',
@@ -45,9 +45,48 @@ __all__ = [
     'get_worker_id',
     'collect_dp_and_flatten',
     'collect_tensor_dict',
+    'configure',
+    'worker_pool',
+    'LazyCollect',
+    'project',
+    'call',
+    'WorkerPool',
+    'WorkerPoolView',
+    'CallContext',
+    'Router',
+    'LeastInflightRouter',
+    'StickyRouter',
 ]
 
+def call(function, *args, executor=None, **kwargs):
+    """非阻塞调用仍使用原远程 Future；本地阻塞调用由指定 executor 执行。"""
+    component = getattr(function, '__self__', None)
+    invoke = getattr(function, '_invoke', None)
+    if component is not None and invoke is not None and '_actors' in component.__dict__:
+        return invoke(component, args, kwargs, wait=False)
+    if executor is None:
+        raise ValueError('本地非阻塞调用需要调用方提供 executor。')
+    def execute():
+        import asyncio
+        from .continuous_work import _await_result
+        return asyncio.run(_await_result(function(*args, **kwargs)))
+    return executor.submit(execute)
+
+
+def project(value, *path):
+    """远程投影保持引用；本地 Future 在所属进程完成后读取同一路径。"""
+    if isinstance(value, LazyCollect):
+        return value.select(*path)
+    from concurrent.futures import Future
+    if isinstance(value, Future):
+        value = value.result()
+    for key in path:
+        value = value[key] if isinstance(value, (dict, list, tuple)) else getattr(value, key)
+    return value
+
+
 _mode: Optional[Literal['local', 'ray']] = 'local'
+_lazy_collect = True
 
 if os.environ.get('TWINKLE_MODE', 'local') == 'ray':
     _mode = 'ray'
@@ -116,11 +155,13 @@ def initialize(mode: Literal['local', 'ray'] = 'local',
             method raises. The original exception is always re-raised; the
             notifier is best-effort and its own failures are swallowed.
     """
-    global _mode, _device_group, _extra_torch_kwargs, _device_mesh, _name, _notifier
+    global _mode, _device_group, _extra_torch_kwargs, _device_mesh, _name, _notifier, _lazy_collect
     assert mode in ('local', 'ray')
     _mode = mode
     _name = name
-    set_lazy_collect(lazy_collect)
+    if type(lazy_collect) is not bool:
+        raise TypeError('lazy_collect 必须为 bool。')
+    _lazy_collect = lazy_collect
     _notifier = notifier
     if name is not None:
         os.environ['TWINKLE_NAME'] = name
@@ -162,6 +203,22 @@ def initialize(mode: Literal['local', 'ray'] = 'local',
         _device_group = groups
         RayHelper.initialize(
             nproc_per_node=nproc_per_node, ncpu_proc_per_node=ncpu_proc_per_node, device_groups=_device_group)
+
+
+def worker_pool(component, *, required=True) -> Optional[WorkerPool]:
+    """取得已有通信池；required=False 在本地返回 None，不创建隐式池。"""
+    pool = component.__dict__.get('_worker_pool')
+    if pool is None and required:
+        raise ValueError('该组件没有远程 WorkerPool。')
+    return pool
+
+
+def configure(component, *, router=None, execution=None, replay=None, shutdown=None):
+    """组装方集中配置通信规则，不向业务类注入生命周期方法。"""
+    pool = component.__dict__.get('_worker_pool')
+    if pool is not None:
+        pool.configure(router=router, execution=execution, replay=replay, shutdown=shutdown)
+    return component
 
 
 def get_device_mesh() -> Optional[DeviceMesh]:

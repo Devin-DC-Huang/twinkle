@@ -262,6 +262,7 @@ class ResourceManager:
                         local_device_groups.append(
                             dict(
                                 gpu_rank=gpu_ranks_local,
+                                physical_ranks=tuple(worker_ranks),
                                 placement_group=self.node2pg[node_rank],
                                 ray_address=ray_address))
                 else:
@@ -269,7 +270,8 @@ class ResourceManager:
                         node_rank = alloc_rank // nproc_per_node
                         gpu_rank = self.visible_devices[node_rank - self.min_node_idx][alloc_rank % nproc_per_node]
                         local_device_groups.append(
-                            dict(gpu_rank=[gpu_rank], placement_group=self.node2pg[node_rank], ray_address=ray_address))
+                            dict(gpu_rank=[gpu_rank], physical_ranks=(alloc_rank,),
+                                 placement_group=self.node2pg[node_rank], ray_address=ray_address))
 
                 self.device_groups[group.name] = local_device_groups
 
@@ -281,9 +283,10 @@ class ResourceManager:
                 assert getattr(group, 'gpus_per_worker', 1) == 1
                 ranks = group.ranks
                 local_device_groups = []
-                for _ in range(ranks):
+                for cpu_rank in range(ranks):
                     local_device_groups.append(
                         dict(
+                            physical_ranks=(cpu_rank,),
                             placement_group=self.cpu_placement_groups[self.cpu_node_map[global_cpu_proc_idx][0]],
                             ray_address=ray_address))
                     global_cpu_proc_idx += 1

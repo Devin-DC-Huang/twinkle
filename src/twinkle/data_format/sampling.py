@@ -207,6 +207,7 @@ class SamplingParams:
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> 'SamplingParams':
         """Create SamplingParams from a dict."""
+        d = dict(d)
         if 'max_new_tokens' in d and 'max_tokens' not in d:
             d['max_tokens'] = d.pop('max_new_tokens')
 
@@ -242,6 +243,24 @@ class SampleResponse:
     prompt_token_ids: Optional[List[int]] = None
     prompt_logprobs: Optional[List[Optional[float]]] = None
     topk_prompt_logprobs: Optional[List[Optional[List[Tuple[int, float]]]]] = None
+
+
+@dataclass
+class SamplingState:
+    """一次生成尝试的快照；暂停结果携带下一次尝试及业务续接许可。"""
+    attempt: int = 0
+    status: Literal['new', 'paused', 'completed', 'stopped'] = 'new'
+    response: Optional[SampleResponse] = None
+    params: Optional[SamplingParams] = None
+    resume_token: Optional[str] = None
+
+    def __post_init__(self):
+        if type(self.attempt) is not int or self.attempt < 0:
+            raise ValueError('sampling_state.attempt 必须为非负整数。')
+        if self.status not in ('new', 'paused', 'completed', 'stopped'):
+            raise ValueError(f'未知 sampling_state.status：{self.status!r}')
+        if self.status == 'paused' and (self.attempt < 1 or not self.resume_token):
+            raise ValueError('暂停快照必须包含下一次尝试序号与续接许可。')
 
 
 #: The pooling heads a backend can serve, in vLLM's vocabulary -- and deliberately only the two vLLM's

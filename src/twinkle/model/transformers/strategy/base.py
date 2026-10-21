@@ -23,7 +23,7 @@ is a chunk list whose state-dict collection and optimizer persistence go through
 the bridge backend and mcore's dist-checkpoint (MegatronModel never calls
 ``get_full_state_dict`` / ``save_optimizer_checkpoint`` / ``pretrained_load_context``
 on its strategy). What the two families DO share is the smaller contact surface
-MegatronModel actually calls (wrap/unwrap, init_kwargs, offload/reload, reduce_loss,
+``MegatronModel`` actually calls (wrap/unwrap, offload/reload, reduce_loss,
 the mcore-specific hooks). A second megatron-side strategy, if one ever appears,
 would take ``MegatronStrategy`` itself as the reference face.
 """

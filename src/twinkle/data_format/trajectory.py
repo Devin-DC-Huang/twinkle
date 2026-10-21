@@ -1,10 +1,13 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import json
 import sys
+import uuid
+from copy import deepcopy
 from collections.abc import Mapping
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from .message import Message, Tool
+from .sampling import SamplingState
 
 if sys.version_info[:2] <= (3, 11):
     # Pydantic requirements.
@@ -22,6 +25,85 @@ class Trajectory(TypedDict, total=False):
     videos: Optional[List[Union[str, Any]]]
     audios: Optional[List[Union[str, Any]]]
     prompt: Optional[str]
+    request_id: str
+    session_id: Optional[str]
+    request_namespace: str
+    sampling_state: SamplingState
+    episode_state: Dict[str, Any]
+
+
+def request_identity(trajectory, *, control=False):
+    """不转换、不裁剪身份；旧控制仅针对旧尝试。"""
+    if not isinstance(trajectory, Mapping):
+        raise TypeError('生成请求必须为 trajectory/encoded input 映射。')
+    request_id = trajectory.get('request_id')
+    if not isinstance(request_id, str) or not request_id:
+        raise ValueError('request_id 必须在提交前创建，且为非空字符串。')
+    session_id = trajectory.get('session_id')
+    if session_id is not None and (not isinstance(session_id, str) or not session_id):
+        raise ValueError('session_id 必须为非空字符串或 None。')
+    namespace = trajectory.get('request_namespace', '')
+    if not isinstance(namespace, str):
+        raise TypeError('request_namespace 必须为字符串。')
+    state = trajectory.get('sampling_state')
+    if state is None:
+        state = SamplingState()
+    if not isinstance(state, SamplingState):
+        raise TypeError('sampling_state 必须通过 schema 还原为 SamplingState。')
+    state.__post_init__()
+    return namespace, request_id, state.attempt
+
+
+def trajectory_sticky_key(read, *, state='sampling_state'):
+    """生成尝试的组合键；read 仅投影身份字段。"""
+    namespace = read('trajectory.request_namespace', '')
+    request_id = read('trajectory.request_id')
+    attempt = read(f'trajectory.{state}.attempt', 0)
+    if not isinstance(request_id, str) or not request_id:
+        raise ValueError('request_id 必须在提交前创建，且为非空字符串。')
+    if not isinstance(namespace, str) or type(attempt) is not int or attempt < 0:
+        raise ValueError('request_namespace 或尝试序号无效。')
+    return namespace, request_id, attempt
+
+
+def trajectory_sticky_affinity(read, *, argument='trajectory'):
+    """会话亲和不代替一次生成尝试的调用归属。"""
+    namespace = read(f'{argument}.request_namespace', '')
+    session_id = read(f'{argument}.session_id')
+    if session_id is None:
+        session_id = read(f'{argument}.request_id')
+    if not isinstance(namespace, str) or not isinstance(session_id, str) or not session_id:
+        raise ValueError('会话亲和需要有效的命名空间和 session_id/request_id。')
+    return namespace, session_id
+
+
+def trajectory_sticky_fallback(read, *, state='sampling_state'):
+    """未提交的暂停续接许可仍控制签发它的上一尝试。"""
+    namespace, request_id, attempt = trajectory_sticky_key(read, state=state)
+    if read(f'trajectory.{state}.status', 'new') == 'paused' and attempt > 0:
+        return namespace, request_id, attempt - 1
+    return None
+
+
+def prepare_sampling_call(signature, component, args, kwargs):
+    """批量便利入口在发送前补身份，同时保护嵌套输入。"""
+    bound = signature.bind(component, *args, **kwargs)
+    batch_arg = 'inputs' if 'inputs' in bound.arguments else 'trajectories'
+    inputs = bound.arguments[batch_arg]
+    if isinstance(inputs, Mapping):
+        if batch_arg == 'trajectories':
+            raise TypeError('rollout 批入口需要 List[Trajectory]。')
+        inputs = [inputs]
+    if isinstance(inputs, (list, tuple)):
+        inputs = deepcopy(list(inputs))
+        for trajectory in inputs:
+            if not isinstance(trajectory, Mapping):
+                raise TypeError('每个采样输入必须为映射。')
+            if 'request_id' not in trajectory:
+                trajectory['request_id'] = uuid.uuid4().hex
+            request_identity(trajectory)
+        bound.arguments[batch_arg] = inputs
+    return bound.args[1:], bound.kwargs
 
 
 def pack_value(value: Any) -> str:

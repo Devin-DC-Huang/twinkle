@@ -576,8 +576,10 @@ class ClusterAdapter:
         if sleep_level not in (0, 1):
             raise ValueError('the shared sampler supports only sleep_level 0 or 1.')
         from twinkle.checkpoint_engine import CheckpointEngineManager
+        from twinkle.infra import worker_pool
 
         self.sampler = sampler
+        self._pool = worker_pool(sampler)
         self.plan = plan
         self.models = (model, *tuple(additional_models))
         self.backend = backend
@@ -624,7 +626,7 @@ class ClusterAdapter:
             self.shared_manager = CheckpointEngineManager(
                 model=model, sampler=sampler, platform='GPU', mode='colocate', channel='sampler:ipc',
                 receiver_worker_ids=shared_ids,
-                colocate_trainer_ranks=[ranks[0] for ranks in sampler.worker_ranks(shared_ids)])
+                colocate_trainer_ranks=[ranks[0] for ranks in self._pool.worker_ranks(shared_ids)])
 
     @classmethod
     def build(cls, *, model: Any, sampler: Any, plan: RLResourcePlan, rollout_config: Any,
@@ -638,7 +640,9 @@ class ClusterAdapter:
         """
         adapter = None
         try:
-            sampler.configure_workers(plan.sampler.ranks, state='ACTIVE')
+            from twinkle.infra import worker_pool
+            pool = worker_pool(sampler)
+            pool.configure_workers(plan.sampler.ranks, state='ACTIVE')
             adapter = cls(
                 sampler=sampler,
                 plan=plan,
@@ -652,7 +656,7 @@ class ClusterAdapter:
 
             adapter.dedicated_manager = CheckpointEngineManager(
                 model=model, sampler=sampler, platform='GPU', mode='standalone', channel='sampler:nccl',
-                receiver_worker_ids=sampler.worker_ids(shared=False))
+                receiver_worker_ids=pool.worker_ids(shared=False))
             return adapter
         except BaseException:
             # Either failure point restores the trainer's GPU residency before re-raising: an __init__
@@ -661,7 +665,7 @@ class ClusterAdapter:
             if adapter is not None:
                 adapter.close_channels()
                 try:
-                    sampler.close_workers()
+                    worker_pool(sampler).close_workers()
                 except Exception:
                     pass
                 try:
@@ -670,7 +674,7 @@ class ClusterAdapter:
                     pass
             else:
                 try:
-                    sampler.close_workers()
+                    worker_pool(sampler).close_workers()
                 except Exception:
                     pass
             raise
@@ -686,18 +690,19 @@ class ClusterAdapter:
         every ACTIVE sampler replica generates from one policy version. The recipe's visible loop
         body is ``adapter.publish() if adapter else engine.sync_weights()``.
         """
-        suspended = self.sampler.worker_ids()
-        self.sampler.suspend_admission(suspended)
-        dedicated_ids = self.sampler.worker_ids(shared=False, states=('ACTIVE', 'DRAINING'))
+        suspended = self._pool.worker_ids()
+        self._pool.suspend_admission(suspended)
+        dedicated_ids = self._pool.worker_ids(shared=False, states=('ACTIVE', 'DRAINING'))
         try:
-            self.sampler.pause_generation(_worker_ids=dedicated_ids)
+            self._pool.wait_idle(dedicated_ids)
             dedicated_ids = self.prepare_publish()
             self.dedicated_manager.set_receiver_workers(dedicated_ids)
             self.dedicated_manager.sync_weights(merge_and_sync=True)
             self._borrow_shared(publish=True)
             self.finish_publish()
-            self.sampler.resume_generation(_worker_ids=dedicated_ids)
-            self.sampler.resume_admission(suspended + dedicated_ids)
+            available = set(self._pool.worker_ids(states=('ACTIVE',)))
+            self._pool.resume_admission(tuple(dict.fromkeys(
+                worker_id for worker_id in (*suspended, *dedicated_ids) if worker_id in available)))
         except BaseException as error:
             try:
                 self.fail_publish(error)
@@ -718,19 +723,19 @@ class ClusterAdapter:
         try:
             for one in self.models:
                 _wait(one.offload_to_cpu())
-            worker_ids = self.sampler.add_workers(group, list(ranks), shared=True, engine_args={
+            worker_ids = self._pool.add_workers(group, list(ranks), shared=True, engine_args={
                 ('enable_sleep_mode' if self.backend == 'vllm' else 'enable_memory_saver'): True})
-            self.sampler.pause_workers(worker_ids)
-            self.sampler.pause_generation(_worker_ids=worker_ids)
+            self._pool.pause_workers(worker_ids)
+            self._pool.wait_idle(worker_ids)
             _wait(self.sampler.sleep(level=self.sleep_level, _worker_ids=worker_ids))
         except BaseException as exc:
             initialization_error = exc
             try:
-                if worker_ids and not self.sampler.remove_workers(worker_ids):
+                if worker_ids and not self._pool.remove_workers(worker_ids):
                     raise RuntimeError('Shared sampler initialization still has unfinished worker calls.')
             except Exception:
                 pass
-            can_reload = not set(worker_ids) & set(self.sampler.worker_ids(shared=True))
+            can_reload = not set(worker_ids) & set(self._pool.worker_ids(shared=True))
             raise
         finally:
             if can_reload:
@@ -744,8 +749,8 @@ class ClusterAdapter:
 
     def _borrow_shared(self, *, publish: bool) -> None:
         """Wake the shared engines for a generation window, on the freshly published weights."""
-        shared_ids = self.sampler.worker_ids(shared=True)
-        outstanding = any(self.sampler.worker_inflight(shared_ids))
+        shared_ids = self._pool.worker_ids(shared=True)
+        outstanding = any(self._pool.worker_inflight(shared_ids))
         if not shared_ids or (not self._shared_enabled and not outstanding) or self.in_generation:
             return
         started = time.perf_counter()
@@ -755,15 +760,15 @@ class ClusterAdapter:
         try:
             _wait(self.sampler.wake_up(tags=['weights'], _worker_ids=shared_ids))
             if publish:
-                trainer_ranks = [ranks[0] for ranks in self.sampler.worker_ranks(shared_ids)]
+                trainer_ranks = [ranks[0] for ranks in self._pool.worker_ranks(shared_ids)]
                 self.shared_manager.set_receiver_workers(shared_ids, colocate_trainer_ranks=trainer_ranks)
                 self.shared_manager.sync_weights(merge_and_sync=True)
             for one in self.models:
                 _wait(one.offload_to_cpu())
             _wait(self.sampler.wake_up(tags=['kv_cache'], _worker_ids=shared_ids))
-            self.sampler.resume_generation(_worker_ids=shared_ids)
             if self._shared_enabled:
-                self.sampler.activate_workers(shared_ids)
+                paused = self._pool.worker_ids(shared=True, states=('WARMING', 'PAUSED'))
+                self._pool.activate_workers(paused)
         except BaseException:
             try:
                 self.reclaim()
@@ -777,10 +782,10 @@ class ClusterAdapter:
         if not self.in_generation:
             return
         started = time.perf_counter()
-        shared_ids = self.sampler.worker_ids(shared=True)
+        shared_ids = self._pool.worker_ids(shared=True)
         try:
-            self.sampler.pause_workers(shared_ids)
-            self.sampler.pause_generation(_worker_ids=shared_ids)
+            self._pool.pause_workers(shared_ids)
+            self._pool.wait_idle(shared_ids)
             _wait(self.sampler.sleep(level=self.sleep_level, _worker_ids=shared_ids))
             # On a pause/sleep failure keep the hand-over state; the trainer's memory is restored
             # only after the engines are down.
@@ -831,14 +836,14 @@ class ClusterAdapter:
         elif decision == 'scale_up_sampler' and self._free_flex_groups:
             group = self._free_flex_groups.popleft()
             try:
-                self._pending = (group, self._executor.submit(self.sampler.add_workers, group,
+                self._pending = (group, self._executor.submit(self._pool.add_workers, group,
                                                               list(self._flex_groups[group])))
             except BaseException:
                 self._free_flex_groups.appendleft(group)
                 raise
         elif decision == 'scale_down_sampler' and self._flex_workers:
             group, worker_ids = next(reversed(self._flex_workers.items()))
-            self.sampler.drain_workers(worker_ids)
+            self._pool.drain_workers(worker_ids)
             self._draining = (group, worker_ids)
         elif decision is not None and decision.startswith('scale_up_rm:'):
             role = decision[len('scale_up_rm:'):]
@@ -846,22 +851,27 @@ class ClusterAdapter:
             if handle is not None and self._free_flex_groups:
                 group = self._free_flex_groups.popleft()
                 try:
-                    worker_ids = handle.add_workers(group, list(self._flex_groups[group]))
+                    from twinkle.infra import worker_pool
+                    role_pool = worker_pool(handle)
+                    worker_ids = role_pool.add_workers(group, list(self._flex_groups[group]))
                     self._rm_flex_workers[role] = (group, worker_ids)
+                    role_pool.activate_workers(worker_ids)
                 except BaseException:
-                    self._free_flex_groups.appendleft(group)
+                    if role not in self._rm_flex_workers:
+                        self._free_flex_groups.appendleft(group)
                     raise
         elif decision is not None and decision.startswith('scale_down_rm:'):
             role = decision[len('scale_down_rm:'):]
             held = self._rm_flex_workers.get(role)
             if held is not None:
                 group, worker_ids = held
-                # A frozen RM is a stateless forward service: no drain phase, the removal is the
-                # whole retirement (the scoring worker's in-flight call finishes on the actor Ray
-                # keeps alive until the call returns).
-                handle = self.elastic_models[role]
-                handle.remove_workers(worker_ids)
-                self._rm_flex_workers.pop(role, None)
+                from twinkle.infra import worker_pool
+                role_pool = worker_pool(self.elastic_models[role])
+                role_pool.drain_workers(worker_ids)
+                role_pool.wait_idle(worker_ids)
+                if not role_pool.remove_workers(worker_ids):
+                    raise RuntimeError('评分副本仍有调用或硬租约；不能归还 flex 资源。')
+                self._rm_flex_workers.pop(role)
                 self._free_flex_groups.append(group)
         if decision is not None:
             self._shared_pressure_windows = 0
@@ -873,9 +883,9 @@ class ClusterAdapter:
             except Exception as error:
                 self.last_error = f'{type(error).__name__}: {error}'
                 self._free_flex_groups.appendleft(group)
-        if self._draining is not None and self.sampler.workers_idle(self._draining[1]):
+        if self._draining is not None and self._pool.workers_idle(self._draining[1]):
             self._removal = self._draining
-        receivers = self.sampler.worker_ids(shared=False, states=('ACTIVE', 'DRAINING'))
+        receivers = self._pool.worker_ids(shared=False, states=('ACTIVE', 'DRAINING'))
         if self._addition is not None:
             receivers += self._addition[1]
         removed = () if self._removal is None else self._removal[1]
@@ -887,18 +897,18 @@ class ClusterAdapter:
         if self._removal is not None:
             group, worker_ids = self._removal
             try:
-                if not self.sampler.remove_workers(worker_ids):
+                if not self._pool.remove_workers(worker_ids):
                     raise RuntimeError('A drained sampler actor received new work during its publication '
                                        'barrier.')
             finally:
                 # Even when removal errored, return the slot exactly once, and only if the actors are gone.
-                if not set(worker_ids) & set(self.sampler.worker_ids()):
+                if not set(worker_ids) & set(self._pool.worker_ids()):
                     self._flex_workers.pop(group)
                     self._free_flex_groups.append(group)
                     self._removal = self._draining = None
         if self._addition is not None:
             group, worker_ids = self._addition
-            self.sampler.activate_workers(worker_ids)
+            self._pool.activate_workers(worker_ids)
             self._flex_workers[group] = worker_ids
             self._addition = None
             self.last_error = None
@@ -924,18 +934,18 @@ class ClusterAdapter:
             except BaseException as exc:
                 error = exc
             try:
-                if not self.sampler.remove_workers(worker_ids):
+                if not self._pool.remove_workers(worker_ids):
                     raise RuntimeError('Failed publication left a sampler actor with unfinished '
                                        'initialization work.')
             except BaseException as exc:
                 error = error or exc
             finally:
-                if not set(worker_ids) & set(self.sampler.worker_ids()):
+                if not set(worker_ids) & set(self._pool.worker_ids()):
                     self._free_flex_groups.appendleft(group)
                     self._addition = None
         try:
             self.dedicated_manager.set_receiver_workers(
-                self.sampler.worker_ids(shared=False, states=('ACTIVE', 'DRAINING')))
+                self._pool.worker_ids(shared=False, states=('ACTIVE', 'DRAINING')))
         except BaseException as exc:
             error = error or exc
         if error is not None:
@@ -945,35 +955,28 @@ class ClusterAdapter:
         """Tear the adapter down without leaking a pin, an actor, or the trainer's GPU residency."""
         if self._closed:
             return
-        self._closed = True
-        self.sampler.close_admission()
-        # Retire RM flex replicas first: their actors live on the flex span, and the flex-span
-        # teardown below (close_workers / reclaim) must not race a still-alive RM actor on it.
+        from twinkle.infra import worker_pool
+        self._pool.close_admission()
+        self._executor.shutdown(wait=True, cancel_futures=True)
+        if self._pending is not None:
+            group, future = self._pending
+            if not future.cancelled():
+                self._addition = (group, future.result())
+            self._pending = None
         for role, (group, worker_ids) in list(self._rm_flex_workers.items()):
-            try:
-                self.elastic_models[role].remove_workers(list(worker_ids))
-            except Exception:
-                pass
-        self._rm_flex_workers.clear()
-        try:
-            self._executor.shutdown(wait=True, cancel_futures=True)
-            if self._pending is not None and not self._pending[1].cancelled():
-                try:
-                    self._pending[1].result()
-                except Exception:
-                    pass
-            try:
-                self.sampler.cancel_all_generations()
-            finally:
-                self.reclaim()
-        finally:
-            try:
-                self.close_channels()
-            finally:
-                try:
-                    self.sampler.close_workers()
-                finally:
-                    self.reclaim()
+            role_pool = worker_pool(self.elastic_models[role])
+            role_pool.drain_workers(worker_ids)
+            role_pool.wait_idle(worker_ids)
+            if not role_pool.remove_workers(worker_ids):
+                raise RuntimeError('评分副本清理未完成；保留 flex 资源归属。')
+            self._rm_flex_workers.pop(role)
+            self._free_flex_groups.append(group)
+        # 业务请求由 driver stop；这里只等待实际 RPC 结束和释放资源。
+        self._pool.wait_idle(self._pool.worker_ids())
+        self.reclaim()
+        self.close_channels()
+        self._pool.close_workers()
+        self._closed = True
 
     # --- observation / decision ------------------------------------------------------------------------
 
@@ -983,7 +986,7 @@ class ClusterAdapter:
             'train': float(driver_stats.train_active_time),
             'idle': float(driver_stats.idle_time),
             'score': float(score_time),
-            'sampler': float(self.sampler.service_time),
+            'sampler': float(self._pool.service_time),
             'handover': self.borrow_time + self.reclaim_time,
         }
         delta = {key: value - self._last_stats.get(key, value) for key, value in current.items()}
@@ -1000,7 +1003,7 @@ class ClusterAdapter:
             return None
         idle = statistics.fmean(window.trainer_idle for window in self._windows)
         handover = statistics.fmean(window.handover_time for window in self._windows)
-        loaded = self.sampler.inflight_count > 0
+        loaded = self._pool.inflight_count > 0
         profitable = loaded and idle > 0 and idle > 1.25 * handover
         self._shared_pressure_windows = self._shared_pressure_windows + 1 if profitable else 0
         if self._shared_pressure_windows >= 2:
@@ -1034,6 +1037,6 @@ class ClusterAdapter:
 
 def _wait(result: Any) -> Any:
     """Resolve a lazily-collected remote result (twinkle's LazyCollect), or pass the value through."""
-    if callable(result) and getattr(result, '_is_lazy_collect', False):
-        return result()
+    if callable(getattr(result, 'result', None)):
+        return result.result()
     return result

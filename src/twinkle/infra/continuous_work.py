@@ -1,315 +1,198 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Continuous-work bookkeeping and the per-worker async machinery it depends on.
-
-This module owns the driver-side ledger behind ``enable_continous_work`` plus the
-worker-side thread/awaitable plumbing that lets one actor run several blocking
-methods side by side. ``dispatch`` imports from here; nothing here imports back,
-so worker identity and the ledger stay a leaf.
-"""
+"""通用 worker 执行适配与独立请求的批分片，不维护第二份调用归属。"""
+import asyncio
 import functools
+import inspect
 import os
 import threading
-from typing import Any, List, Optional
+import uuid
+from concurrent.futures import Future, ThreadPoolExecutor
 
-from twinkle.utils import get_logger
-
-logger = get_logger()
-
-# Guards creating the per-handle state below. Without it two threads arriving at
-# once each build their own state, with their own lock, and one overwrites the
-# other -- after which the two are no longer excluding each other and the requests
-# charged to the discarded one are never given back.
-_CW_CREATE_LOCK = threading.Lock()
-
-# Prefix of the awaitable companion generated for a continuous-work method. The
-# companion is what the driver actually calls on the worker; see
-# ``_make_worker_async_companion``.
 _WORKER_ASYNC_PREFIX = '_twinkle_async_'
+_WORKER_RUNTIME_METHOD = '_twinkle_runtime'
+_CREATE_LOCK = threading.Lock()
 
 
-def get_worker_id(worker) -> str:
-    """Stable identity of a Ray actor, independent of its position in a handle."""
+def get_worker_id(worker):
+    """actor ID 同时标识当前 incarnation。"""
     return worker._actor_id.hex()
 
 
-def _select_workers(self, worker_ids=None):
-    workers = tuple(self._actors)
-    if worker_ids is None:
-        return workers
-    worker_ids = tuple(worker_ids)
-    if any(not isinstance(worker_id, str) for worker_id in worker_ids):
-        raise ValueError('_worker_ids must contain stable actor ID strings.')
-    if len(set(worker_ids)) != len(worker_ids):
-        raise ValueError('_worker_ids must not contain duplicate actor IDs.')
-    by_id = {get_worker_id(worker): worker for worker in workers}
-    unknown = set(worker_ids) - by_id.keys()
-    if unknown:
-        raise ValueError(f'Unknown actor IDs in _worker_ids: {sorted(unknown)}')
-    return tuple(by_id[worker_id] for worker_id in worker_ids)
+def _worker_state(component):
+    with _CREATE_LOCK:
+        state = component.__dict__.get('_twinkle_execution')
+        if state is None:
+            state = {'lock': threading.RLock(), 'calls': {}, 'executors': {}}
+            component.__dict__['_twinkle_execution'] = state
+        return state
 
 
-def ready_refs(refs) -> List[Any]:
-    """ObjectRefs already finished, without materializing the rest.
-
-    Shared zero-timeout probe of the ledger users: ``_cw_unregister`` drops only
-    what has completed, the ``_cw_barrier`` finally-block settles what it waited
-    for, and ``_run_continous_work`` reaps stale charges before planning.
-    """
-    import ray
-
-    ready, _ = ray.wait(list(refs), num_returns=len(refs), timeout=0)
-    return ready
+def _worker_executor(component, group):
+    state = _worker_state(component)
+    with state['lock']:
+        if group not in state['executors']:
+            sizes = {'ordinary': int(os.environ.get('TWINKLE_ACTOR_MAX_CONCURRENCY') or 1),
+                     'control': 2, 'exclusive': 1}
+            state['executors'][group] = ThreadPoolExecutor(
+                max_workers=sizes[group], thread_name_prefix=f'twinkle-{group}')
+        return state['executors'][group]
 
 
-def _worker_executor(self, ):
-    """Threads for running a blocking worker method off the actor's event loop.
-
-    Sized from ``TWINKLE_ACTOR_MAX_CONCURRENCY``, which ``create_workers`` sets to
-    the actor's ``max_concurrency``: any fewer threads than that would throttle
-    below the concurrency the actor was configured for. A private executor rather
-    than the loop's default one, so this never changes behaviour for anything else
-    running on that loop.
-    """
-    executor = getattr(self, '_twinkle_worker_executor', None)
-    if executor is not None:
-        return executor
-    with _CW_CREATE_LOCK:
-        executor = getattr(self, '_twinkle_worker_executor', None)
-        if executor is None:
-            from concurrent.futures import ThreadPoolExecutor
-            n = int(os.environ.get('TWINKLE_ACTOR_MAX_CONCURRENCY') or 0) or 1
-            executor = ThreadPoolExecutor(max_workers=n, thread_name_prefix='twinkle-worker')
-            self._twinkle_worker_executor = executor
-        return executor
+async def _await_result(value):
+    """Future 始终在原 loop/线程完成；取消等待不取消正在运行的业务。"""
+    while isinstance(value, Future) or inspect.isawaitable(value):
+        if isinstance(value, Future):
+            value = await asyncio.shield(asyncio.wrap_future(value))
+        elif isinstance(value, asyncio.Future) and value.get_loop() is not asyncio.get_running_loop():
+            async def wait_original(future):
+                return await asyncio.shield(future)
+            loop = value.get_loop()
+            if not loop.is_running():
+                raise RuntimeError('业务 Future 的事件循环未运行。')
+            bridge = asyncio.run_coroutine_threadsafe(wait_original(value), loop)
+            value = await asyncio.shield(asyncio.wrap_future(bridge))
+        else:
+            value = await asyncio.shield(value)
+    return value
 
 
 def _make_worker_async_companion(func, wrapper):
-    """Wrap a blocking worker method so the actor can run several of them at once.
-
-    Ray makes a class with any ``async def`` into an asyncio actor, and there a
-    blocking method holds the actor's single event loop for its whole duration --
-    so calls queue and run one after another however high ``max_concurrency`` is.
-    Measured on this sampler: four concurrent one-prompt calls took 3.98x as long
-    as one, while the same four prompts in a single call took 1.02x. Handing the
-    blocking body to a thread leaves the loop free to accept the next call, which
-    is what puts several requests in the worker's engine together.
-    """
-    import asyncio
-
     @functools.wraps(func)
-    async def companion(self, *args, **kwargs):
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(_worker_executor(self), functools.partial(wrapper, self, *args, **kwargs))
-
+    async def companion(component, *args, **kwargs):
+        # 准入只由调用池在发送前判定；worker 只登记实际执行。
+        group = kwargs.pop('_infra_group', 'ordinary')
+        if group not in ('ordinary', 'control', 'exclusive'):
+            raise ValueError(f'未知执行组：{group!r}')
+        state = _worker_state(component)
+        call_id = uuid.uuid4().hex
+        with state['lock']:
+            state['calls'][call_id] = group
+        async def execute():
+            # 参数解引用和阻塞 body 不占用 Ray actor 的事件循环。
+            from ._ray.ray_helper import RayHelper
+            dispatch_context = kwargs.pop('_dispatch_context', None)
+            call_args, call_kwargs = await asyncio.get_running_loop().run_in_executor(
+                _worker_executor(component, group),
+                functools.partial(RayHelper.do_get_and_collect, args, kwargs))
+            if dispatch_context is not None:
+                from .dispatch import _dispatch_args
+                count, index, dispatch, execute_mode = dispatch_context
+                mesh = getattr(component, 'device_mesh', None)
+                parts = _dispatch_args([None] * count, dispatch, execute_mode, mesh, call_args, call_kwargs)
+                _, call_args, call_kwargs = parts[index]
+            if inspect.iscoroutinefunction(func):
+                result = func(component, *call_args, **call_kwargs)
+            else:
+                result = await asyncio.get_running_loop().run_in_executor(
+                    _worker_executor(component, group), functools.partial(func, component, *call_args, **call_kwargs))
+            return await _await_result(result)
+        task = asyncio.create_task(execute())
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # 重复取消等待也不能提前归还执行容量。
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
+            if not task.cancelled():
+                task.exception()
+            raise
+        except Exception as exc:
+            from twinkle import infra
+            from twinkle.notifier import notify_exception
+            infra._maybe_load_worker_notifier()
+            notify_exception(infra._notifier, f'{type(component).__name__}.{func.__name__}', exc, infra._name)
+            raise
+        finally:
+            with state['lock']:
+                state['calls'].pop(call_id, None)
     companion.__name__ = _WORKER_ASYNC_PREFIX + func.__name__
     return companion
 
 
-def _cw_state(self):
-    """Driver-side bookkeeping for ``enable_continous_work``, created on first use.
-
-    ``load`` counts requests handed to each worker and not yet returned, which is
-    what picks the next worker. ``inflight`` keeps those counts honest per method
-    name, and is also what the barrier reads: a method other than the one with
-    requests in flight must wait for them, because the worker now runs methods
-    side by side and something like receiving weights or sleeping would otherwise
-    land on an engine mid-generation.
-
-    The state's own lock is a plain ``Lock``: nothing here takes it while already
-    holding it, so re-entrance is not needed.
-    """
-    state = getattr(self, '_continous_work_state', None)
-    if state is not None:
-        return state
-    with _CW_CREATE_LOCK:
-        state = getattr(self, '_continous_work_state', None)
-        if state is None:
-            state = {
-                'lock': threading.Lock(),
-                'load': {},
-                'inflight': {},
-                'owners': {},
-            }
-            self._continous_work_state = state
-        return state
-
-
-def _cw_drop_locked(state, refs):
-    for ref in refs:
-        owner = state['owners'].pop(ref, None)
-        if owner is not None:
-            worker_id, charge = owner
-            state['load'][worker_id] = state['load'].get(worker_id, 0) - charge
-        for name, pending in tuple(state['inflight'].items()):
-            if ref in pending:
-                pending.remove(ref)
-            if not pending:
-                state['inflight'].pop(name, None)
-
-
-def _cw_barrier(self, current_func: str, workers, *, materialize=True) -> None:
-    """Drain every other method's in-flight work before proceeding.
-
-    Best effort by construction: another thread may submit again the moment this
-    returns. It removes the case this exists for -- a weight update or a sleep
-    issued while generations are still running -- but it is not a global lock on
-    the worker.
-    """
-    state = getattr(self, '_continous_work_state', None)
-    if not state:
-        return
-    worker_ids = {get_worker_id(worker) for worker in workers}
-    # Pool-backed components carry their conflict policy on the pool; others wait for everything.
-    pool = getattr(self, '_worker_pool', None)
-    conflicts = pool.conflicts if pool is not None else None
+async def _worker_runtime(component, operation):
+    """仅通信生命周期；不调用任何领域方法。"""
+    state = _worker_state(component)
+    if operation not in ('ready', 'idle', 'drain'):
+        raise ValueError(f'未知 worker 生命周期操作：{operation!r}')
+    if operation == 'drain':
+        while True:
+            with state['lock']:
+                if not state['calls']:
+                    break
+            await asyncio.sleep(0.01)
     with state['lock']:
-        others = {
-            name: [ref for ref in refs if state['owners'][ref][0] in worker_ids
-                   and (conflicts is None or conflicts(current_func, name, state['owners'][ref][0]))]
-            for name, refs in state['inflight'].items() if name != current_func
-        }
-        others = {name: refs for name, refs in others.items() if refs}
-    if not others:
-        return
-    import ray
-    flat = [ref for refs in others.values() for ref in refs]
-    logger.debug(f'continous_work barrier: {current_func} waits for {len(flat)} pending request(s) '
-                 f'from {sorted(others)}')
-    try:
-        if materialize:
-            ray.get(flat)
-        else:
-            ray.wait(flat, num_returns=len(flat))
-    finally:
-        with state['lock']:
-            _cw_drop_locked(state, ready_refs(flat))
+        return not state['calls'] if operation == 'idle' else True
 
 
-def _cw_object_refs(result) -> List[Any]:
-    """Every ObjectRef inside a dispatch result, tuples included."""
-    import ray
+def _cw_batch_len(args, kwargs):
+    return next((len(value) for value in (*args, *kwargs.values()) if isinstance(value, list)), None)
+
+
+def _cw_sub_args(args, kwargs, indices, batch_len):
+    def pick(value):
+        return [value[index] for index in indices] if isinstance(value, list) and len(value) == batch_len else value
+    return tuple(pick(value) for value in args), {key: pick(value) for key, value in kwargs.items()}
+
+
+def _collect_ordered(plan, results, device_mesh=None):
+    size, partitions = plan
+    output = [None] * size
+    if len(partitions) != len(results):
+        raise ValueError('批调用的分片数量与结果数量不一致。')
+    for indices, part in zip(partitions, results):
+        if not isinstance(part, (list, tuple)) or len(part) != len(indices):
+            raise TypeError('独立请求的批调用必须按输入项返回等长结果。')
+        for index, value in zip(indices, part):
+            output[index] = value
+    return output
+
+
+def _run_continous_work(component, func_name, args, kwargs, batch_len, timeout, pool,
+                        *, batch_arg=None, aligned_args=(), signature=None):
+    """在 pool 的同一临界区选择、预留、发送；只返回通用 Future。"""
+    from ._ray.ray_helper import LazyCollect
+    partitions = {}
+    reservations = {}
     refs = []
-    for item in (result or []):
-        for candidate in (item if isinstance(item, tuple) else (item, )):
-            if isinstance(candidate, ray.ObjectRef):
-                refs.append(candidate)
-    return refs
-
-
-def _cw_register(self, func_name: str, result, workers) -> List[Any]:
-    """Record a non-continuous call's refs so a later different method waits for it.
-
-    Needed because a lazily collected method returns before its work finishes:
-    ``receive_weights`` hands back a handle while the worker is still swapping
-    weights, and with actor concurrency on, a sample issued right after would read
-    them half written.
-    """
-    refs = _cw_object_refs(result)
-    if not refs:
-        return refs
-    state = _cw_state(self)
-    with state['lock']:
-        for worker, item in zip(workers, result):
-            for ref in _cw_object_refs([item]):
-                state['owners'][ref] = (get_worker_id(worker), 0)
-        state['inflight'].setdefault(func_name, []).extend(refs)
-    return refs
-
-
-def _cw_unregister(self, func_name: str, refs: List[Any]) -> None:
-    state = getattr(self, '_continous_work_state', None)
-    if not state or not refs:
-        return
-    with state['lock']:
-        _cw_drop_locked(state, ready_refs(refs))
-
-
-def _cw_plan(n_workers: int, load: List[int], batch_len: int) -> List[List[int]]:
-    """Assign each request to the worker holding the fewest, updating ``load``.
-
-    Least-loaded-first, one request at a time, so a call of one request goes to
-    one worker instead of being padded up to the worker count, and a call of many
-    spreads out. ``load`` is mutated by the caller's lock holder.
-    """
-    per_worker: List[List[int]] = [[] for _ in range(n_workers)]
-    for idx in range(batch_len):
-        target = min(range(n_workers), key=lambda w: load[w])
-        per_worker[target].append(idx)
-        load[target] += 1
-    return per_worker
-
-
-def _cw_batch_len(args, kwargs) -> Optional[int]:
-    """Length of the request list, i.e. the first list argument's length.
-
-    Same convention as ``dispatch='slice'``: list arguments are the batch and
-    everything else is broadcast. Returns None when there is no list to split,
-    which is how the caller knows to fall back to the normal dispatch.
-    """
-    for arg in list(args) + list(kwargs.values()):
-        if isinstance(arg, list):
-            return len(arg)
-    return None
-
-
-def _cw_sub_args(args, kwargs, indices: List[int], batch_len: int):
-    """The arguments for one worker: list arguments indexed, the rest as-is."""
-
-    def pick(arg):
-        if isinstance(arg, list) and len(arg) == batch_len:
-            return [arg[i] for i in indices]
-        return arg
-
-    return tuple(pick(a) for a in args), {k: pick(v) for k, v in kwargs.items()}
-
-
-def _run_continous_work(self, func_name: str, execute_method, workers, args, kwargs, batch_len: int,
-                        ray_get_timeout: Optional[float], *, on_dispatched=None):
-    """Submit one call per chosen worker and return results in the caller's order.
-
-    Submission happens under the lock so that picking a worker and charging it are
-    one step -- several caller threads land here at once, and a split of the two
-    would let them all pick the same idle worker. Waiting happens outside it.
-    """
-    import ray
-
-    state = _cw_state(self)
-    worker_ids = tuple(get_worker_id(worker) for worker in workers)
-    submitted = []
-    # The awaitable form, so the worker can hold several of these at once. Book-
-    # keeping still uses the plain name, which is what callers and the barrier see.
-    remote_name = _WORKER_ASYNC_PREFIX + func_name
-    try:
-        with state['lock']:
-            pending = [ref for ref, (owner, _) in state['owners'].items() if owner in worker_ids]
-            if pending:
-                _cw_drop_locked(state, ready_refs(pending))
-            load = [state['load'].get(worker_id, 0) for worker_id in worker_ids]
-            plan = _cw_plan(len(workers), load, batch_len)
-            for worker_index, indices in enumerate(plan):
-                if not indices:
-                    continue
+    indices_by_ref = []
+    prepared = []
+    for index in range(batch_len):
+        sub_args, sub_kwargs = _cw_sub_args(args, kwargs, [index], batch_len)
+        if batch_arg is not None:
+            bound = signature.bind(component, *args, **kwargs)
+            for name in (batch_arg, *aligned_args):
+                value = bound.arguments.get(name)
+                if value is not None:
+                    if not isinstance(value, list) or len(value) != batch_len:
+                        raise ValueError(f'{name} 必须与 {batch_arg} 等长并为 list。')
+                    bound.arguments[name] = [value[index]]
+            sub_args, sub_kwargs = bound.args[1:], bound.kwargs
+        prepared.append((sub_args, sub_kwargs, pool.prepare_context(func_name, sub_args, sub_kwargs)))
+    with pool.lock:
+        try:
+            for index, (sub_args, sub_kwargs, context) in enumerate(prepared):
+                ids = pool.choose(func_name, sub_args, sub_kwargs, independent=True, context=context)
+                if len(ids) != 1:
+                    raise ValueError('独立请求路由必须选择一个完整 worker。')
+                partitions.setdefault(ids[0], []).append(index)
+                record = pool.reserve(func_name, ids, sub_args, sub_kwargs, context=context)
+                reservations.setdefault(ids[0], []).append(record)
+            for worker_id, indices in partitions.items():
                 sub_args, sub_kwargs = _cw_sub_args(args, kwargs, indices, batch_len)
-                ref = execute_method(remote_name, [(workers[worker_index], sub_args, sub_kwargs)])[0]
-                worker_id = worker_ids[worker_index]
-                state['load'][worker_id] = state['load'].get(worker_id, 0) + len(indices)
-                state['owners'][ref] = (worker_id, len(indices))
-                state['inflight'].setdefault(func_name, []).append(ref)
-                submitted.append((worker_index, indices, ref))
-    finally:
-        if on_dispatched is not None:
-            on_dispatched()
-
-    try:
-        ordered: List[Any] = [None] * batch_len
-        for _, indices, ref in submitted:
-            part = ray.get(ref, timeout=ray_get_timeout) if ray_get_timeout is not None else ray.get(ref)
-            if not isinstance(part, (list, tuple)) or len(part) != len(indices):
-                raise TypeError(f'{func_name}: enable_continous_work needs one result per request, but a worker given '
-                                f'{len(indices)} request(s) returned {type(part).__name__} of length '
-                                f'{len(part) if isinstance(part, (list, tuple)) else "n/a"}.')
-            for local_index, original_index in enumerate(indices):
-                ordered[original_index] = part[local_index]
-        return ordered
-    finally:
-        _cw_unregister(self, func_name, [ref for _, _, ref in submitted])
+                if batch_arg is not None:
+                    bound = signature.bind(component, *args, **kwargs)
+                    for name in (batch_arg, *aligned_args):
+                        value = bound.arguments.get(name)
+                        if value is not None:
+                            bound.arguments[name] = [value[index] for index in indices]
+                    sub_args, sub_kwargs = bound.args[1:], bound.kwargs
+                ref = pool.send(func_name, (worker_id,), sub_args, sub_kwargs, charge=len(indices),
+                                record=tuple(reservations[worker_id]))[0]
+                refs.append(ref)
+                indices_by_ref.append(tuple(indices))
+        finally:
+            pool.finish_reservations()
+    return LazyCollect(refs, (batch_len, tuple(indices_by_ref)), _collect_ordered, timeout=timeout)

@@ -2146,7 +2146,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
                 state[f'chunk{chunk_idx}.{name}'] = param.data
         return state
 
-    @remote_function(collect='first', lazy_collect=False)
+    @remote_function(collect='first', lazy_collect=False, exclusive=True)
     def get_peft_config_dict(self, adapter_name: str = None) -> Optional[Dict[str, Any]]:
         """Return the PEFT config as a dict for vLLM's PEFTHelper.
 

@@ -163,6 +163,8 @@ class SGLangEngine(BaseSamplerEngine):
             sampling_params = SamplingParams.from_dict(sampling_params)
         logprobs_k = sampling_params.logprobs or 0
         prompt_logprobs_k = sampling_params.prompt_logprobs or 0
+        # 精确 token 输出不依赖 decoded 文本；即使不返回 logprobs 也向引擎请求。
+        return_token_logprobs = max(1, logprobs_k)
 
         request: Dict[str, Any] = {'sampling_params': sampling_params.to_sglang(**kwargs)}
         if isinstance(prompt, str):
@@ -170,9 +172,9 @@ class SGLangEngine(BaseSamplerEngine):
         else:
             request['input_ids'] = list(prompt)
 
-        if logprobs_k or prompt_logprobs_k:
+        if return_token_logprobs or prompt_logprobs_k:
             request['return_logprob'] = True
-            top_k = max(logprobs_k, prompt_logprobs_k)
+            top_k = max(return_token_logprobs, prompt_logprobs_k)
             if top_k > 1:
                 request['top_logprobs_num'] = top_k
             # -1 keeps sglang on the generated tokens only; 0 makes it score the prompt as well, which
@@ -197,7 +199,7 @@ class SGLangEngine(BaseSamplerEngine):
         sequences = []
         for output in outputs:
             meta = output.get('meta_info') or {}
-            tokens = self._output_token_ids(meta, output, await self.get_tokenizer())
+            tokens = self._output_token_ids(meta, output)
             sequences.append(
                 SampledSequence(
                     stop_reason=self._map_finish_reason(meta.get('finish_reason')),
@@ -343,17 +345,20 @@ class SGLangEngine(BaseSamplerEngine):
         return _FINISH_REASONS.get(str(reason), 'error')
 
     @staticmethod
-    def _output_token_ids(meta: Dict[str, Any], output: Dict[str, Any], tokenizer) -> List[int]:
-        """The generated token ids.
-
-        sglang returns text, and the ids only as a side effect of asking for logprobs, so without
-        logprobs they have to be recovered by tokenising the completion.
-        """
+    def _output_token_ids(meta: Dict[str, Any], output: Dict[str, Any]) -> List[int]:
+        """只接收引擎原生 token，缺失时明确失败。"""
         token_logprobs = meta.get('output_token_logprobs')
-        if token_logprobs:
-            return [int(entry[1]) for entry in token_logprobs]
-        text = output.get('text') or ''
-        return tokenizer.encode(text, add_special_tokens=False) if text else []
+        if token_logprobs is not None:
+            tokens = [entry[1] for entry in token_logprobs]
+        elif output.get('output_ids') is not None:
+            tokens = list(output['output_ids'])
+        elif meta.get('completion_tokens') == 0:
+            tokens = []
+        else:
+            raise RuntimeError('SGLang 未返回原生生成 token；需要支持 return_logprob 的引擎版本。')
+        if any(type(token) is not int for token in tokens):
+            raise TypeError('SGLang 生成 token 必须为整数。')
+        return tokens
 
     @classmethod
     def _sequence_logprobs(cls, meta: Dict[str, Any], tokens: List[int],
@@ -564,8 +569,5 @@ class SGLangEngine(BaseSamplerEngine):
         await self.engine.async_unload_lora_adapter(lora_name=lora_name)
 
     async def shutdown(self) -> None:
-        try:
-            # Unlike the rest, Engine.shutdown only tears down subprocesses and touches no event loop.
-            self.engine.shutdown()
-        except Exception as e:  # noqa: BLE001  -- shutdown runs on the way out; never raise from here
-            logger.warning(f'sglang engine shutdown error: {e}')
+        # shutdown 仅清理子进程，不操作调用线程的事件循环。
+        self.engine.shutdown()

@@ -3,13 +3,19 @@ import copy
 import json
 import re
 import threading
+import time
 import uuid
-from concurrent.futures import Future
+from collections import OrderedDict
+from concurrent.futures import CancelledError, Future
+from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
+from functools import partial
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 from twinkle.data_format import Trajectory
 from twinkle.data_format.sampling import SampledSequence, SampleResponse, SamplingParams
+from twinkle.data_format.trajectory import (request_identity, trajectory_sticky_affinity,
+                                            trajectory_sticky_fallback, trajectory_sticky_key)
 from twinkle.infra import remote_class, remote_function
 from twinkle.template.base import Template
 from twinkle_agentic.protocol.api_sampler import APIGenerationError, APISampler
@@ -20,6 +26,40 @@ from .ledger import MessageLedger, TurnLedger, last_assistant_text
 from .trace import TraceWriter
 
 ResponseCallback = Callable[..., SampledSequence]
+
+
+class _EpisodePaused(Exception):
+    pass
+
+
+@dataclass
+class _EpisodeAttempt:
+    key: tuple
+    future: Future = field(default_factory=Future)
+    command: Optional[str] = None
+    wake: threading.Event = field(default_factory=threading.Event)
+    result: Optional[dict] = None
+    finished: Optional[float] = None
+    resumed: bool = False
+    revoked: bool = False
+    thread: Any = None
+
+
+@dataclass
+class _EpisodeState:
+    trajectory: dict
+    ctx: dict
+    attempt: _EpisodeAttempt
+    ledger: Any = None
+    harness: Any = None
+    resources: ExitStack = field(default_factory=ExitStack)
+    initialized: bool = False
+    locals: dict = field(default_factory=dict)
+    turn_request: Optional[dict] = None
+    turn_future: Any = None
+    phase: str = 'admission'
+    env_leased: bool = False
+    harness_leased: bool = False
 
 
 @dataclass(frozen=True)
@@ -176,8 +216,8 @@ def trajectory_to_rollout_sample(traj: Dict[str, Any], prompt_id: str, extra: Di
     view); message-only mode (a text-only backend) has no token fields, so only
     ``messages`` / ``decoded`` / ``rollout_infos`` carry anything.
     """
-    input_ids = list(traj.get('input_ids') or [])
-    labels = list(traj.get('labels') or [])
+    input_ids = list(traj['input_ids']) if traj.get('input_ids') is not None else []
+    labels = list(traj['labels']) if traj.get('labels') is not None else []
     messages = copy.deepcopy(traj.get('messages'))
     encoded: Dict[str, Any] = {}
     response_token_ids: List[int] = []
@@ -185,8 +225,10 @@ def trajectory_to_rollout_sample(traj: Dict[str, Any], prompt_id: str, extra: Di
     if input_ids and labels:
         keys = set(_TRAIN_FEATURE_KEYS) | _vision_feature_keys()
         encoded = {key: traj[key] for key in keys if key in traj}
-        response_token_ids = list(traj.get('response_token_ids') or [])
-        rollout_logprobs = list(traj.get('rollout_logprobs') or [])
+        response_token_ids = list(traj['response_token_ids']) if traj.get('response_token_ids') is not None else []
+        rollout_logprobs = list(traj['rollout_logprobs']) if traj.get('rollout_logprobs') is not None else []
+        if rollout_logprobs and len(response_token_ids) != len(rollout_logprobs):
+            raise ValueError('已提供的 rollout_logprobs 必须与 response_token_ids 等长。')
     rollout_infos = {
         key: traj[key]
         for key in ('turns', 'stop_reason', 'truncated', 'stuck_stop', 'tool_stop', 'followups') if key in traj
@@ -362,9 +404,7 @@ class MultiTurnRollout(Rollout):
     cannot be driven this way and belongs in
     :class:`~.external.ExternalRollout`.
 
-    A supplied sampler must declare ``sample`` with ``enable_continous_work``.
-    Without it, ``slice_dp`` spreads each single-request call over every worker
-    and raises on ranks that receive nothing.
+    异步 episode 要求后端提供真实 submit/pause/stop；路由与执行隔离由组装方配置。
 
     Shared state: ``sampler``, API client and ``template`` are read-only during a
     rollout and safe to share.
@@ -398,7 +438,6 @@ class MultiTurnRollout(Rollout):
         response_callback: Optional[ResponseCallback] = None,
         api_appended_as: Literal['demonstration', 'context'] = 'demonstration',
         api_kwargs: Optional[Dict[str, Any]] = None,
-        allow_partial_rollout: bool = False,
         tools_factory: Optional[Callable[[Any], Tuple[Any, List[Any], Any]]] = None,
         tools_config: Any = None,
         remote_group: Optional[str] = None,
@@ -424,18 +463,8 @@ class MultiTurnRollout(Rollout):
                              'message-only mode (template=None) has none.')
         if response_callback is None and sampler is None and api is None:
             raise ValueError('MultiTurnRollout requires a sampler or API when response_callback is omitted')
-        if sampler is not None:
-            sample = getattr(type(sampler), 'sample', None)
-            if sample is None:
-                raise TypeError(f'backend must be an API or sampler, got {type(sampler).__name__}')
-            # A message-only backend is a local text sampler, not a slice_dp GPU
-            # worker, so the one-request-per-call spreading this guards against does
-            # not apply; only the token-level path needs the declaration.
-            if not message_only and not getattr(sample, '_enable_continous_work', False):
-                raise ValueError(f'{type(sampler).__name__}.sample must be declared with '
-                                 'enable_continous_work=True: this rollout samples one trajectory per '
-                                 'call, and a slice_dp sampler raises when a worker gets nothing from '
-                                 'a batch of one.')
+        if sampler is not None and not callable(getattr(sampler, 'sample', None)):
+            raise TypeError(f'backend 必须提供 sample，收到 {type(sampler).__name__}')
         if adapter_path and use_base_model:
             raise ValueError('adapter_path and use_base_model=True ask for opposite '
                              'weights; the sampler would drop the adapter silently.')
@@ -470,9 +499,12 @@ class MultiTurnRollout(Rollout):
         self.env_pool, self.tool_plugins, self._tool_manager_for = (
             (None, [], None) if tools_factory is None else tools_factory(tools_config))
         self._per_episode_tools = self.env_pool is not None and bool(self.tool_plugins)
-        # Every RL entry (generate/admit) threads this into each per-turn sample call: it makes
-        # a turn resumable across an in-place weight republish instead of returning truncated.
-        self._allow_partial_rollout = allow_partial_rollout
+        self._episode_lock = threading.RLock()
+        self._episodes = {}
+        self._episode_attempts = OrderedDict()
+        self._episode_slots = threading.BoundedSemaphore(concurrency or _MAX_CONCURRENT_EPISODES)
+        self._episode_closed = False
+        self._episode_instance_id = uuid.uuid4().hex
         self.tool_manager = tool_manager
         # An optional AgentHarness (a pool exposing ``.lease()``, or a 1:1 list)
         # that shapes messages each turn. The ledger still owns every token id;
@@ -560,8 +592,35 @@ class MultiTurnRollout(Rollout):
 
     @remote_function()
     def __call__(self, trajectories: List[Trajectory], **kwargs) -> List[Trajectory]:
-        """The base implementation; the decorator is what a deployed handle needs."""
-        return super().__call__(trajectories, **kwargs)
+        """同步入口复用 episode 内核；文本 API/callback 保留原阻塞合同。"""
+        if self.sampler is None or kwargs.get('response_callback', self.response_callback) is not _default_response_callback:
+            return super().__call__(trajectories, **kwargs)
+        if not callable(getattr(self.sampler, 'submit', None)):
+            return super().__call__(trajectories, **kwargs)
+        if isinstance(trajectories, dict):
+            raise TypeError('__call__ 需要 List[Trajectory]。')
+        trajectories = copy.deepcopy(list(trajectories))
+        ctx = self._resolve_call(kwargs, len(trajectories))
+        submissions = []
+        try:
+            for index, trajectory in enumerate(trajectories):
+                trajectory.setdefault('request_id', uuid.uuid4().hex)
+                options = dict(kwargs, tool_manager=ctx['tool_managers'][index], harness=ctx['harnesses'][index])
+                submissions.append((trajectory, self.submit(trajectory, **options)))
+            outputs = [future.result() for _, future in submissions]
+        except BaseException:
+            errors = []
+            for trajectory, _ in submissions:
+                try:
+                    self.stop(trajectory)
+                except BaseException as exc:
+                    errors.append(exc)
+            if errors:
+                raise RuntimeError('同步 rollout 失败后存在未清理的 episode。') from errors[0]
+            raise
+        if self.tracer is not None:
+            self.tracer.write(outputs, global_step=kwargs.get('global_step'))
+        return outputs
 
     def stream(self, trajectory: Trajectory, *, sampling_params: Optional[SamplingParams] = None,
                tool_manager: Optional[ToolManager] = None, adapter_path: Optional[str] = None):
@@ -656,8 +715,7 @@ class MultiTurnRollout(Rollout):
                  sampling_params: Optional[dict] = None,
                  prompt_extras: Optional[List[Dict[str, Any]]] = None,
                  force_logprobs: bool = True,
-                 adapter_path: Optional[str] = None,
-                 allow_partial_rollout: Optional[bool] = None) -> List[RolloutSample]:
+                 adapter_path: Optional[str] = None) -> List[RolloutSample]:
         """Run one episode per (prompt, sample) pair and translate each output.
 
         ``num_samples`` completions per prompt, grouped by prompt -- a GRPO group is one
@@ -683,13 +741,8 @@ class MultiTurnRollout(Rollout):
                 metadata.append((str(prompt_index), extra))
         sp = self._rl_sampling_params(sampling_params, force_logprobs)
         # adapter_path threads into every per-turn sampler.sample (a LoRA run must not sample
-        # from the base); allow_partial_rollout rides the same kwargs channel (False reads as
-        # omitted).
-        kwargs: Dict[str, Any] = {
-            'sampling_params': sp,
-            'allow_partial_rollout': (self._allow_partial_rollout if allow_partial_rollout is None
-                                      else allow_partial_rollout),
-        }
+        # from the base).
+        kwargs: Dict[str, Any] = {'sampling_params': sp}
         if adapter_path:
             kwargs['adapter_path'] = adapter_path
         outputs = self(trajectories, **kwargs)
@@ -720,128 +773,262 @@ class MultiTurnRollout(Rollout):
             sp = replace(sp, num_samples=1)
         return sp
 
-    def admit(self,
-              prompt: List[dict],
-              trajectory_idx: int = 0,
-              *,
-              prompt_idx: Any = 0,
-              sampling_params: Optional[dict] = None,
-              prompt_extras: Optional[Dict[str, Any]] = None,
-              adapter_path: Optional[str] = None,
-              policy_version: int = 0) -> SampleHandle:
-        """Admit ONE trajectory without blocking; poll/collect/cancel complete the protocol.
+    @staticmethod
+    def _episode_key(trajectory):
+        namespace, request_id, _ = request_identity(trajectory)
+        state = trajectory.get('episode_state')
+        if state is None:
+            state = {}
+        if not isinstance(state, dict):
+            raise TypeError('episode_state 必须为映射。')
+        attempt = state.get('attempt', 0)
+        if type(attempt) is not int or attempt < 0:
+            raise ValueError('episode attempt 必须为非负整数。')
+        return namespace, request_id, attempt
 
-        ``prompt_idx`` / ``trajectory_idx`` are carried for the collect-side group
-        stamping; ``policy_version`` is the admission pin, stamped onto the sample. A
-        REMOTE deployment parks the lazy generate on the handle's payload; a local one
-        runs the episode on a daemon-thread Future. This method also runs on a Ray
-        proxy whose ``__init__`` never executed, which is why every state it touches
-        is either on the handle or lazy.
-        """
-        handle = SampleHandle(
-            submission_id=uuid.uuid4().hex, prompt_idx=prompt_idx, trajectory_idx=trajectory_idx,
-            prompt_extras=dict(prompt_extras) if prompt_extras else None,
-            policy_version=policy_version, prompt=list(prompt) if prompt is not None else None,
-            adapter_path=adapter_path)
-        if hasattr(self, '_actors'):
-            # The remote episode runs on the actor: the generate call itself returns a
-            # LazyCollect immediately, so admission never blocks the driver thread.
-            handle.payload = self.generate(
-                [prompt], num_samples=1, sampling_params=sampling_params,
-                prompt_extras=[prompt_extras] if prompt_extras else None,
-                force_logprobs=True, adapter_path=adapter_path)
-            return handle
-        futures: Dict[str, Future] = self.__dict__.setdefault('_episode_futures', {})
-        future: Future = Future()
-        futures[handle.submission_id] = future
+    def _expire_episodes(self):
+        now = time.monotonic()
+        for key, attempt in tuple(self._episode_attempts.items()):
+            retained = attempt.result is not None and attempt.result['episode_state']['status'] == 'paused'
+            if attempt.finished is not None and (not retained or attempt.revoked or attempt.resumed):
+                if now - attempt.finished > 300 or len(self._episode_attempts) >= 4096:
+                    self._episode_attempts.pop(key)
 
-        def _work() -> None:
+    @remote_function(dispatch='all', collect='first', lazy_collect=True,
+                     sticky=True, sticky_key=partial(trajectory_sticky_key, state='episode_state'),
+                     sticky_mode='acquire', sticky_affinity=trajectory_sticky_affinity)
+    def submit(self, trajectory: Trajectory, **kwargs) -> Future:
+        """提交一次 episode 尝试；恢复只在签发许可的同一存活实例内成立。"""
+        key = self._episode_key(trajectory)
+        if self.sampler is None or self.response_callback is not _default_response_callback:
+            raise ValueError('该 API/自定义 callback 未声明真实停止合同，不能装配异步 episode。')
+        if any(not callable(getattr(self.sampler, name, None)) for name in ('submit', 'pause', 'stop')):
+            raise TypeError('异步 episode 的 sampler 必须提供 submit/pause/stop。')
+        ctx = self._resolve_call(kwargs, 1) if key[-1] == 0 else None
+        with self._episode_lock:
+            self._expire_episodes()
+            if self._episode_closed:
+                raise RuntimeError('rollout 已关闭。')
+            if key in self._episode_attempts:
+                raise ValueError(f'重复的 episode 尝试：{key!r}')
+            if len(self._episode_attempts) >= 4096:
+                raise RuntimeError('episode 与暂停保留容量已满，调用方必须施加 backpressure。')
+            previous = None
+            if key[-1]:
+                previous = self._episode_attempts.get((*key[:-1], key[-1] - 1))
+                permit = trajectory.get('episode_state', {})
+                if (previous is None or previous.result is None or previous.revoked or previous.resumed
+                        or permit.get('status') != 'paused'
+                        or permit != previous.result['episode_state']):
+                    raise ValueError('未知、过期、跨实例或已撤销的 episode 恢复许可。')
+                if kwargs:
+                    raise ValueError('episode 恢复沿用原工具、harness 与采样配置，不接受重新装配。')
+                state = self._episodes[key[:-1]]
+                previous.resumed = True
+            else:
+                if (trajectory.get('episode_state') or {}).get('status', 'new') != 'new':
+                    raise ValueError('终态 episode 不能作为新尝试重新提交。')
+                state = _EpisodeState(copy.deepcopy(trajectory), ctx, None)
+                self._episodes[key[:-1]] = state
+            attempt = _EpisodeAttempt(key)
+            attempt.future.set_running_or_notify_cancel()
+            state.attempt = attempt
+            self._episode_attempts[key] = attempt
+            attempt.thread = threading.Thread(target=self._drive_episode, args=(state, attempt),
+                                              name=f'episode-{key[1][:8]}-{key[-1]}', daemon=True)
             try:
-                future.set_result(self.generate(
-                    [prompt], num_samples=1, sampling_params=sampling_params,
-                    prompt_extras=[prompt_extras] if prompt_extras else None,
-                    force_logprobs=True, adapter_path=adapter_path))
-            except Exception as exc:  # surfaced at poll/collect; the thread must not die silently
-                future.set_exception(exc)
+                attempt.thread.start()
+            except BaseException:
+                self._episode_attempts.pop(key)
+                if previous is None:
+                    self._episodes.pop(key[:-1])
+                else:
+                    previous.resumed = False
+                    state.attempt = previous
+                raise
+            return attempt.future
 
-        threading.Thread(target=_work, name=f'episode-{handle.submission_id[:8]}', daemon=True).start()
-        return handle
+    def _episode_snapshot(self, state, attempt, paused):
+        fields = {key: state.locals[key] for key in
+                  ('stop_reason', 'truncated', 'stuck_stop', 'tool_stop', 'followups') if key in state.locals}
+        out = (copy.deepcopy(state.trajectory) if state.ledger is None else
+               copy.deepcopy(state.ledger.merge(state.trajectory, turns=state.ledger.turns, **fields)))
+        for key in ('request_id', 'request_namespace', 'session_id'):
+            if key in state.trajectory:
+                out[key] = state.trajectory[key]
+        out['episode_state'] = {
+            'attempt': attempt.key[-1] + int(paused), 'status': 'paused' if paused else 'completed',
+            'instance_id': self._episode_instance_id, 'resume_token': uuid.uuid4().hex if paused else None,
+            'phase': state.phase,
+        }
+        return out
 
-    def poll(self, handles: List[SampleHandle]) -> List[SampleHandle]:
-        """Non-blocking as-completed query; a failed local episode raises here, fail-loudly."""
-        futures: Dict[str, Future] = getattr(self, '_episode_futures', {})
-        completed: List[SampleHandle] = []
-        for handle in handles:
-            if handle.payload is not None:
-                # ready() is a ray.wait(timeout=0) status probe, never a fetch; a FAILED episode
-                # still reports ready and its exception surfaces at collect.
-                if handle.payload.ready():
-                    completed.append(handle)
-                continue
-            future = futures.get(handle.submission_id)
-            if future is None or not future.done():
-                continue
-            error = future.exception()
+    def _episode_checkpoint(self, state):
+        with self._episode_lock:
+            command = state.attempt.command
+        if command == 'stop':
+            raise CancelledError('episode 已停止；不再生成下一轮或提交评分。')
+        if command == 'pause':
+            raise _EpisodePaused()
+
+    def _drive_episode(self, state, attempt):
+        acquired = False
+        paused = False
+        result = None
+        error = None
+        try:
+            while not acquired:
+                self._episode_checkpoint(state)
+                acquired = self._episode_slots.acquire(timeout=0.05)
+            self._episode_checkpoint(state)
+            if not state.initialized:
+                ctx = dict(state.ctx)
+                if self._per_episode_tools and not state.env_leased:
+                    try:
+                        env = state.resources.enter_context(self.env_pool.lease(cancel_event=attempt.wake))
+                    except InterruptedError:
+                        self._episode_checkpoint(state)
+                        raise
+                    ctx['tool_managers'] = [self._tool_manager_for(env, self.tool_plugins)]
+                    state.ctx = ctx
+                    state.env_leased = True
+                if not state.harness_leased:
+                    harness = ctx['harnesses'][0]
+                    if harness is not None and hasattr(harness, 'lease'):
+                        try:
+                            harness = state.resources.enter_context(harness.lease(cancel_event=attempt.wake))
+                        except InterruptedError:
+                            self._episode_checkpoint(state)
+                            raise
+                    state.harness = harness
+                    state.harness_leased = True
+                state.ctx = ctx
+                state.initialized = True
+            self._episode_checkpoint(state)
+            self._run_episode(state.trajectory, 0, state.ctx, state.harness, episode=state)
+            result = self._episode_snapshot(state, attempt, False)
+        except _EpisodePaused:
+            try:
+                result = self._episode_snapshot(state, attempt, True)
+                paused = True
+            except BaseException as exc:
+                error = exc
+        except BaseException as exc:
+            error = exc
+        finally:
+            if not paused:
+                try:
+                    if state.turn_request is not None:
+                        self.sampler.stop(state.turn_request)
+                        if state.turn_future is not None:
+                            try:
+                                state.turn_future.result()
+                            except CancelledError:
+                                pass
+                    state.resources.close()
+                except BaseException as exc:
+                    error = RuntimeError('episode 资源清理未完成，租约不得复用。')
+                    error.__cause__ = exc
+            if acquired:
+                self._episode_slots.release()
+        with self._episode_lock:
+            if attempt.command == 'stop':
+                paused = False
+                result = None
+                if error is None:
+                    error = CancelledError('episode 已真实停止并清理。')
+            attempt.result = result
+            attempt.finished = time.monotonic()
+            if not paused and error is None:
+                self._episodes.pop(attempt.key[:-1], None)
+            elif isinstance(error, CancelledError):
+                self._episodes.pop(attempt.key[:-1], None)
             if error is not None:
-                raise RuntimeError(f'streaming episode {handle.submission_id} failed: {error}') from error
-            completed.append(handle)
-        return completed
+                attempt.future.set_exception(error)
+            else:
+                attempt.future.set_result(copy.deepcopy(result))
 
-    def collect(self, handle: SampleHandle) -> RolloutSample:
-        """Collect ONE completed trajectory, stamped with its group id / pin version / prompt."""
-        if handle.payload is not None:
-            samples = handle.payload()
-        else:
-            future = getattr(self, '_episode_futures', {}).pop(handle.submission_id, None)
-            if future is None:
-                raise RuntimeError(f'collect called for an unknown or already-collected submission '
-                                   f'{handle.submission_id}.')
-            samples = future.result()
-        if len(samples) != 1:
-            raise RuntimeError(f'episode collect expected exactly 1 sample (submission '
-                               f'{handle.submission_id}), got {len(samples)}.')
-        sample = samples[0]
-        sample.prompt_id = str(handle.prompt_idx)
-        sample.policy_version = handle.policy_version
-        sample.prompt = handle.prompt
-        return sample
+    def _control_episode(self, trajectory, command):
+        key = self._episode_key(trajectory)
+        with self._episode_lock:
+            self._expire_episodes()
+            attempt = self._episode_attempts.get(key)
+            if attempt is None:
+                previous = self._episode_attempts.get((*key[:-1], key[-1] - 1))
+                if (previous is not None and not previous.resumed and previous.result is not None
+                        and trajectory.get('episode_state') == previous.result['episode_state']):
+                    attempt = previous
+            if attempt is None:
+                raise KeyError(f'未知或过期的 episode 尝试：{key!r}')
+            state = self._episodes.get(key[:-1])
+            if attempt.finished is None and attempt.command is None:
+                attempt.command = command
+                attempt.wake.set()
+            if command == 'stop' and not attempt.resumed:
+                attempt.revoked = True
+            current = state.turn_request if state is not None and state.attempt is attempt else None
+        # 业务控制不持 episode 锁等待 sampler 或工具结束。
+        if attempt.finished is None and current is not None:
+            if attempt.command == 'stop':
+                self.sampler.stop(current)
+            else:
+                self.sampler.pause(current)
+        return state, attempt
 
-    def cancel(self, handle: Optional[SampleHandle]) -> None:
-        """Drop an admitted-but-uncollected episode: remote drops the ref, local abandons.
+    @remote_function(dispatch='all', collect='first', lazy_collect=False, control=True,
+                     sticky=True, sticky_key=partial(trajectory_sticky_key, state='episode_state'),
+                     sticky_mode='use', sticky_affinity=trajectory_sticky_affinity,
+                     sticky_fallback=partial(trajectory_sticky_fallback, state='episode_state'))
+    def pause(self, trajectory: Trajectory) -> Trajectory:
+        _, attempt = self._control_episode(trajectory, 'pause')
+        result = attempt.future.result()
+        with self._episode_lock:
+            if attempt.revoked:
+                raise CancelledError('episode 暂停许可已撤销。')
+        return copy.deepcopy(result)
 
-        A concurrent.futures.Future silently discards an unretrieved exception, so an
-        abandoned episode that later fails needs no drain here.
-        """
-        if handle is None:
-            return
-        if handle.payload is not None:
-            # The in-actor episode finishes on its own; its result is discarded with the ref.
-            return
-        getattr(self, '_episode_futures', {}).pop(handle.submission_id, None)
+    @remote_function(dispatch='all', collect='first', lazy_collect=False, control=True,
+                     sticky=True, sticky_key=partial(trajectory_sticky_key, state='episode_state'),
+                     sticky_mode='use', sticky_affinity=trajectory_sticky_affinity,
+                     sticky_fallback=partial(trajectory_sticky_fallback, state='episode_state'))
+    def stop(self, trajectory: Trajectory) -> None:
+        state, attempt = self._control_episode(trajectory, 'stop')
+        try:
+            attempt.future.result()
+        except CancelledError:
+            pass
+        finally:
+            if state is not None and not attempt.resumed and attempt.finished is not None:
+                if state.turn_request is not None:
+                    self.sampler.stop(state.turn_request)
+                state.resources.close()
+                with self._episode_lock:
+                    self._episodes.pop(attempt.key[:-1], None)
 
-    # `dispatch` has no 'first' mode (only all / slice / slice_dp); the single-worker
-    # placement already comes from @remote_class(execute='first'), so 'all' reaches it.
-    @remote_function(dispatch='all', collect='none', lazy_collect=False)
-    def abort_all_inflight(self) -> None:
-        """Abort every in-flight sampler generation so an in-place republish can resume them.
-
-        Distinct from cancel (which DROPS a submission): abort keeps it alive and
-        resumable on the fresh weights. Runs where the sampler handle is reachable --
-        on a Ray proxy the driver instance has no sampler attribute, so the decorated
-        dispatch is what carries the call to the worker that holds one.
-        """
-        abort = getattr(getattr(self, 'sampler', None), 'abort_all_inflight', None)
-        if not callable(abort):
-            raise RuntimeError('abort-on-publish needs a sampler with abort_all_inflight (the twinkle '
-                               'partial-rollout capability): the core vLLM/SGLang samplers provide it.')
-        return abort()
-
-    @remote_function(dispatch='all', collect='none', lazy_collect=False)
+    @remote_function(dispatch='all', collect='first', lazy_collect=False, control=True, shutdown=True)
     def close(self) -> None:
-        """Release the sandbox env pool; the sampler's lifecycle is not owned here."""
-        getattr(self, '_episode_futures', {}).clear()
-        if self.env_pool is not None:
-            self.env_pool.close()
+        with self._episode_lock:
+            self._episode_closed = True
+            states = tuple(self._episodes.values())
+            attempts = tuple(self._episode_attempts.values())
+        errors = []
+        for state in states:
+            trajectory = copy.deepcopy(state.trajectory)
+            trajectory['episode_state'] = {'attempt': state.attempt.key[-1]}
+            try:
+                self.stop(trajectory)
+            except BaseException as exc:
+                errors.append(exc)
+        for attempt in attempts:
+            if attempt.thread is not None:
+                attempt.thread.join()
+        if not errors and self.env_pool is not None:
+            try:
+                self.env_pool.close()
+            except BaseException as exc:
+                errors.append(exc)
+        if errors:
+            raise RuntimeError('rollout 关闭时存在未清理的 episode。') from errors[0]
 
     def _resolve_call(self, kwargs: Dict[str, Any], n: int) -> Dict[str, Any]:
         adapter_path = kwargs.get('adapter_path', self.adapter_path)
@@ -850,16 +1037,11 @@ class MultiTurnRollout(Rollout):
         adapter_kwargs = {'adapter_path': adapter_path} if adapter_path else {}
         if kwargs.get('use_base_model', self.use_base_model):
             adapter_kwargs['use_base_model'] = True
-        # ``allow_partial_rollout`` makes each per-turn ``sample()`` resumable across an in-place weight
-        # republish: a publish aborts the turn in flight and, with this set, it continues from its own
-        # tokens on the fresh weights instead of returning truncated -- what lets a MULTI-TURN episode
-        # span versions soundly under the streaming driver's ``in_place`` publication. It is a
-        # local-sampler capability, so it is threaded only when a sampler drives the turns; an API/teacher
-        # backend has no in-place weight sync to resume across (and its callback would not take the kwarg).
-        # Left out entirely when unset, so the default per-turn call is unchanged.
-        if self.sampler is not None and kwargs.get('allow_partial_rollout', False):
-            adapter_kwargs['allow_partial_rollout'] = True
-        sampling_params = kwargs.get('sampling_params', self.sampling_params)
+        if self._episode_closed:
+            raise RuntimeError('rollout 已关闭准入。')
+        if adapter_kwargs.get('adapter_path') and adapter_kwargs.get('use_base_model'):
+            raise ValueError('adapter_path 与 use_base_model=True 互斥。')
+        sampling_params = copy.deepcopy(kwargs.get('sampling_params', self.sampling_params))
         if sampling_params.num_samples != 1:
             raise ValueError(f'MultiTurnRollout supports num_samples=1 only, got '
                              f'{sampling_params.num_samples}')
@@ -921,7 +1103,8 @@ class MultiTurnRollout(Rollout):
                 return self._run_episode(trajectory, index, ctx, leased)
         return self._run_episode(trajectory, index, ctx, harness)
 
-    def _run_episode(self, trajectory: Trajectory, index: int, ctx: Dict[str, Any], harness=None) -> Trajectory:
+    def _run_episode(self, trajectory: Trajectory, index: int, ctx: Dict[str, Any], harness=None,
+                     episode: Optional[_EpisodeState] = None) -> Trajectory:
         tool_manager: ToolManager = ctx['tool_managers'][index]
         followup_fn = ctx['followup_fn']
         adapter_kwargs: Dict[str, Any] = ctx['adapter_kwargs']
@@ -930,17 +1113,24 @@ class MultiTurnRollout(Rollout):
         # The token account for this episode. Every id the trajectory ends up
         # trained on passes through it; what stays in this function is the policy
         # that decides when to add one. See ``ledger.py``.
-        ledger = self._new_ledger(index)
+        ledger = episode.ledger if episode is not None and episode.ledger is not None else self._new_ledger(index)
         # A trajectory that named no tools advertises the manager's, so the prompt
         # lists what can actually be dispatched.
         # A harness may shape the opening (system prompt, tool schema) before
         # the one encode of the episode; after that it is append-only (below).
-        if harness is not None:
-            trajectory = harness.before_generate(trajectory)
-        opening_tools = None
-        if 'tools' not in trajectory and tool_manager is not None:
-            opening_tools = list(tool_manager.tool_infos() or [])
-        ledger.open(trajectory, tools=opening_tools)
+        if episode is None or episode.ledger is None:
+            if harness is not None:
+                trajectory = harness.before_generate(copy.deepcopy(trajectory))
+            opening_tools = None
+            if 'tools' not in trajectory and tool_manager is not None:
+                opening_tools = list(tool_manager.tool_infos() or [])
+            ledger.open(trajectory, tools=opening_tools)
+            if episode is not None:
+                episode.ledger = ledger
+                original_identity = {key: episode.trajectory[key] for key in
+                                     ('request_id', 'request_namespace', 'session_id') if key in episode.trajectory}
+                episode.trajectory = copy.deepcopy(trajectory)
+                episode.trajectory.update(original_identity)
 
         stop_reason: Optional[str] = None
         generation_error: Optional[str] = None
@@ -969,6 +1159,20 @@ class MultiTurnRollout(Rollout):
         # silently gets more tool turns than a long one.
         budget = self.max_turns
         spent = 0
+        if episode is not None and episode.locals:
+            saved = episode.locals
+            stop_reason, generation_error = saved['stop_reason'], saved['generation_error']
+            truncated, params = saved['truncated'], saved['params']
+            stuck_turns, seen_calls, stuck_stop = saved['stuck_turns'], saved['seen_calls'], saved['stuck_stop']
+            malformed_turns, followups = saved['malformed_turns'], saved['followups']
+            tool_stop, budget, spent = saved['tool_stop'], saved['budget'], saved['spent']
+
+        def save():
+            if episode is not None:
+                episode.locals = dict(
+                    stop_reason=stop_reason, generation_error=generation_error, truncated=truncated, params=params,
+                    stuck_turns=stuck_turns, seen_calls=seen_calls, stuck_stop=stuck_stop,
+                    malformed_turns=malformed_turns, followups=followups, tool_stop=tool_stop, budget=budget, spent=spent)
 
         def grant_followup() -> bool:
             """Ask for one more stage; True when the episode carries on.
@@ -996,23 +1200,50 @@ class MultiTurnRollout(Rollout):
                 params = next_params
             return True
 
-        while spent < budget:
-            spent += 1
+        while spent < budget or episode is not None and episode.turn_request is not None:
+            save()
+            if episode is not None:
+                self._episode_checkpoint(episode)
+            if episode is None or episode.turn_request is None:
+                spent += 1
 
-            # 2. One request. The callback chooses the local sampler or the API
-            # adapter, but both paths return exactly one SampledSequence.
+            # 同步 callback 保留原合同；受控 episode 使用同一 sampler 业务生成内核。
             try:
-                seq = response_callback(
-                    self.sampler,
-                    self.api,
-                    params,
-                    input_feature=ledger.input_feature,
-                    adapter_kwargs=adapter_kwargs,
-                    trajectory=trajectory,
-                    trajectory_index=index,
-                    turn=ledger.turns + 1,
-                    followups=followups,
-                )
+                if episode is None:
+                    seq = response_callback(
+                        self.sampler, self.api, params, input_feature=ledger.input_feature,
+                        adapter_kwargs=adapter_kwargs, trajectory=trajectory, trajectory_index=index,
+                        turn=ledger.turns + 1, followups=followups)
+                else:
+                    with self._episode_lock:
+                        self._episode_checkpoint(episode)
+                        if episode.turn_request is None:
+                            request = copy.deepcopy(ledger.input_feature)
+                            request.update(request_id=uuid.uuid4().hex,
+                                           session_id=episode.trajectory.get('session_id') or episode.attempt.key[1],
+                                           request_namespace=episode.attempt.key[0])
+                            episode.turn_request = request
+                        episode.phase = 'generation'
+                        # 续接尝试沿用 sampler 已保存的 adapter 选项，只更新 sampling_params。
+                        turn_state = episode.turn_request.get('sampling_state')
+                        options = {} if turn_state is not None and turn_state.status == 'paused' else adapter_kwargs
+                        episode.turn_future = self.sampler.submit(
+                            episode.turn_request, sampling_params=params, **options)
+                    sampled = episode.turn_future.result()
+                    sampling_state = sampled['sampling_state']
+                    if sampling_state.status == 'paused':
+                        with self._episode_lock:
+                            episode.turn_request = sampled
+                            episode.turn_future = None
+                        save()
+                        raise _EpisodePaused()
+                    if sampling_state.status != 'completed' or len(sampling_state.response.sequences) != 1:
+                        raise RuntimeError('episode 单轮必须返回一条完整采样结果。')
+                    seq = sampling_state.response.sequences[0]
+                    with self._episode_lock:
+                        episode.turn_request = None
+                        episode.turn_future = None
+                        episode.phase = 'response'
             except APIGenerationError as exc:
                 stop_reason = STOP_GENERATION_ERROR
                 generation_error = str(exc)
@@ -1116,7 +1347,14 @@ class MultiTurnRollout(Rollout):
             #    messages the model did not write.
             if tool_manager is None:
                 raise ValueError('the model emitted tool_calls but this trajectory has no ToolManager')
+            if episode is not None:
+                with self._episode_lock:
+                    if episode.attempt.command == 'stop':
+                        raise CancelledError('episode 已停止，工具尚未启动。')
+                    episode.phase = 'tools'
             observations = self._run_tools(tool_manager, tool_calls)
+            if episode is not None:
+                episode.phase = 'observation'
             if self.stop_after_stuck_turns:
                 keys = [_call_key(tc) for tc in tool_calls]
                 all_repeats = bool(keys) and all(k in seen_calls for k in keys)
@@ -1155,6 +1393,9 @@ class MultiTurnRollout(Rollout):
         #    consumers (VLLMSampler with ``'input_ids' in inputs``) see an encoded
         #    InputFeature and skip re-encoding. The ledger audits its own account
         #    on the way out -- one logprob per trainable token, or it raises.
+        save()
+        if episode is not None:
+            episode.phase = 'completed'
         out = ledger.merge(
             trajectory,
             turns=ledger.turns,

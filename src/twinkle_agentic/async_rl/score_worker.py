@@ -12,20 +12,16 @@ from __future__ import annotations
 
 import json
 import os
-from concurrent.futures import ThreadPoolExecutor
+import math
+import threading
+from copy import deepcopy
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from twinkle import remote_class, remote_function
 
 #: The CPU DeviceGroup name the scoring worker actor lives in.
 REF_ONLY_REMOTE_GROUP = 'rl_payload'
-
-
-def _resolve(ref: Any) -> Any:
-    """Resolve a LazyCollect / ObjectRef in THIS actor, never in the driver."""
-    if callable(ref) and getattr(ref, '_is_lazy_collect', False):
-        return ref()
-    return ref
 
 
 def _score_rows(samples: Sequence[Any]) -> List[dict]:
@@ -37,8 +33,9 @@ def _score_rows(samples: Sequence[Any]) -> List[dict]:
     """
     rows = []
     for sample in samples:
+        tokens = getattr(sample, 'response_token_ids', None)
         row = {**(getattr(sample, 'extra', None) or {}),
-               'response_token_ids': list(getattr(sample, 'response_token_ids', None) or [])}
+               'response_token_ids': list(tokens) if tokens is not None else []}
         messages = getattr(sample, 'messages', None)
         if messages is None:
             prompt = list(getattr(sample, 'prompt', None) or [])
@@ -79,20 +76,6 @@ def _run_grouped(tasks: Sequence[Tuple[Any, Callable[[], Any]]]) -> List[Any]:
     return results
 
 
-def _stash(value: Any) -> Any:
-    """Keep a heavy payload out of the caller when this worker runs remote: a ref, else the value.
-
-    The return-path mirror of ``_resolve``: inside a remote worker a per-token vector crosses the
-    boundary as an ObjectRef (Ray derefs it again when the consumer's next remote call carries it);
-    a local worker shares the caller's process, so the value itself is the cheaper hand-off.
-    """
-    if not os.environ.get('WORKER_NAME'):
-        return value
-    import ray
-
-    return ray.put(value)
-
-
 @remote_class(execute='first')
 class ScoreWorker:
     """Score rollout samples where the data lives: one remote boundary for the ORM channel.
@@ -116,6 +99,108 @@ class ScoreWorker:
         self.prm_step_scorer = prm_step_scorer
         self._prm_weights = list(prm_weights) if prm_weights is not None else None
         self._global_step = 0
+        self._submission_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='score-worker')
+        self._group_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='score-group')
+        self._score_lock = threading.RLock()
+        if self._prm_weights is not None:
+            if len(self._prm_weights) != len(self.prm_scorers):
+                raise ValueError('prm_weights 必须与 PRM scorer 等长。')
+            if any(not math.isfinite(float(value)) for value in self._prm_weights):
+                raise ValueError('prm_weights 必须为有限数。')
+
+    @remote_function(dispatch='all', collect='first', lazy_collect=True)
+    def prepare_sample(self, trajectory: dict, *, prompt_id: str, extra: dict, prompt: list,
+                       group_key: str, policy_version: int, version_span: int) -> Any:
+        """转换也由 worker 推进；本地调用不阻塞 driver。"""
+        return self._submission_executor.submit(
+            self._prepare_sample, trajectory, prompt_id, extra, prompt, group_key, policy_version, version_span)
+
+    def _prepare_sample(self, trajectory, prompt_id, extra, prompt, group_key, policy_version, version_span):
+        from twinkle_agentic.rollout.multi_turn import trajectory_to_rollout_sample
+        from twinkle_agentic.rollout.ledger import sampled_token_logprobs
+        from twinkle.data_format.sampling import SamplingState
+        state = trajectory.get('sampling_state')
+        if isinstance(state, SamplingState):
+            if state.status != 'completed' or state.response is None or len(state.response.sequences) != 1:
+                raise ValueError('单样本训练只接受一条已完成采样分支。')
+            sequence = state.response.sequences[0]
+            if sequence.new_input_feature is None:
+                raise ValueError('训练采样必须保留 new_input_feature；不能用 decoded 重编码。')
+            feature = deepcopy(sequence.new_input_feature)
+            logprobs = sequence.logprobs
+            if sequence.tokens and logprobs is None:
+                raise ValueError('训练采样缺少真实旧 logprobs。')
+            if logprobs is not None and len(logprobs) != len(sequence.tokens):
+                raise ValueError('采样 logprobs 与 token 数量不一致。')
+            trajectory = dict(feature, response_token_ids=list(sequence.tokens),
+                              rollout_logprobs=sampled_token_logprobs(sequence.tokens, logprobs),
+                              sampling_mask=sequence.sampling_mask,
+                              truncated=sequence.stop_reason == 'length', stop_reason=sequence.stop_reason)
+            trajectory['messages'] = deepcopy(prompt) + [{'role': 'assistant', 'content': sequence.decoded}]
+        elif trajectory.get('episode_state', {}).get('status') != 'completed':
+            raise ValueError('暂停轨迹不能转换成完整训练 episode。')
+        sample = trajectory_to_rollout_sample(trajectory, prompt_id, deepcopy(extra))
+        sample.prompt = deepcopy(prompt)
+        sample.group_key = group_key
+        sample.policy_version = policy_version
+        sample.version_span = version_span
+        return sample
+
+    @remote_function(dispatch='all', collect='first', lazy_collect=True)
+    def submit(self, samples: List[Any], *, transform: Any = None, with_prm: bool = False) -> Future:
+        """本地与远程均非阻塞；普通 callable 在评分 worker 执行。"""
+        return self._submission_executor.submit(self._score_submission, samples, transform, with_prm)
+
+    def _score_submission(self, samples, transform, with_prm):
+        with self._score_lock:
+            samples = deepcopy(samples)
+            if transform is not None:
+                for index, sample in enumerate(samples):
+                    replacement = transform(sample)
+                    if replacement is not None:
+                        samples[index] = replacement
+            if with_prm:
+                rows, processes = self.score_group_prm(samples)
+                if len(processes) != len(samples):
+                    raise ValueError('PRM 必须按样本返回等长结果。')
+                for sample, process in zip(samples, processes):
+                    if process is not None and len(process) != len(sample.response_token_ids):
+                        raise ValueError('PRM token 向量与 response_token_ids 长度不一致。')
+                    sample.prm_process = process
+            else:
+                rows = self.score_group(samples)
+            if len(rows) != len(samples):
+                raise ValueError('ORM 必须按样本返回等长结果。')
+            for sample, row in zip(samples, rows):
+                sample.orm_reward = row
+            return {'samples': samples, 'orm': rows}
+
+    @remote_function(dispatch='all', collect='first', lazy_collect=True, control=True)
+    def decide_group(self, group_key: str, samples: List[Any], *, regenerate=None,
+                     baseline_fn=None, can_regenerate: bool = False) -> Future:
+        """组钩子在评分结束后至多执行一次，不占用 driver 推进线程。"""
+        return self._group_executor.submit(
+            self._decide_group, group_key, samples, regenerate, baseline_fn, can_regenerate)
+
+    def _decide_group(self, group_key, samples, regenerate, baseline_fn, can_regenerate):
+        retry = bool(regenerate(group_key, samples)) if regenerate is not None else False
+        if retry and can_regenerate:
+            return {'regenerate': True, 'baseline': None}
+        baseline = baseline_fn(group_key, samples) if baseline_fn is not None else None
+        return {'regenerate': False, 'baseline': baseline}
+
+    @remote_function(dispatch='all', collect='first', lazy_collect=False, control=True)
+    def completion_state(self, trajectory: dict) -> str:
+        """仅返回业务终态；不让控制面读取部分 token 载荷。"""
+        if 'episode_state' in trajectory:
+            return trajectory['episode_state']['status']
+        return trajectory['sampling_state'].status
+
+    @remote_function(dispatch='all', collect='first', lazy_collect=False, exclusive=True, shutdown=True)
+    def close(self) -> None:
+        """退出前等全部评分任务真正结束。"""
+        self._group_executor.shutdown(wait=True)
+        self._submission_executor.shutdown(wait=True)
 
     def _one_reward(self, scorer: Any, rows: List[dict]) -> List[float]:
         """One scorer's batch over trajectory rows -- the single call shape every kind shares.
@@ -127,6 +212,9 @@ class ScoreWorker:
         """
         score = getattr(scorer, 'score', None)
         values = score(rows) if callable(score) else scorer(rows)
+        values = list(values)
+        if len(values) != len(rows):
+            raise ValueError(f'评分器返回 {len(values)} 行，预期 {len(rows)} 行。')
         return [None if value is None or value != value else float(value) for value in values]
 
     @remote_function(dispatch='all', collect='first', lazy_collect=True)
@@ -138,28 +226,25 @@ class ScoreWorker:
         all see the same view. The matrix is already transposed sample-major with ``None`` /
         NaN normalized to ``None`` -- the caller writes rows straight onto the samples.
         """
-        resolved = [_resolve(sample) for sample in samples]
-        rows = _score_rows(resolved)
-        matrix = _run_grouped([
-            (getattr(scorer, 'placement_key', None),
-             lambda scorer=scorer: self._one_reward(scorer, rows))
-            for scorer in self.orm_scorers])
-        return [[None if value is None or value != value else float(value) for value in column]
-                for column in zip(*matrix)] if matrix else [[] for _ in samples]
+        with self._score_lock:
+            rows = _score_rows(samples)
+            matrix = _run_grouped([
+                (getattr(scorer, 'placement_key', None),
+                 lambda scorer=scorer: self._one_reward(scorer, rows))
+                for scorer in self.orm_scorers])
+            return [[None if value is None or value != value else float(value) for value in column]
+                    for column in zip(*matrix)] if matrix else [[] for _ in samples]
 
     @remote_function(dispatch='all', collect='first', lazy_collect=True)
     def score_group_prm(self, samples: List[Any]) -> Tuple[List[List[Optional[float]]], List[Any]]:
-        """Both channels for one group in ONE pass: ``(the ORM matrix, per-sample process rewards)``.
+        """ORM 小矩阵与 PRM token 向量共享一个可投影结果。"""
+        with self._score_lock:
+            return self._score_group_prm(samples)
 
-        Samples resolve and rows rebuild once, then each ORM scorer and each PRM sample's step
-        batch is a task keyed by its scorer's placement: the ORM channel's device groups overlap
-        the PRM channel's forwards, each group strictly serial. Each sample's per-token process
-        vector is stashed (:func:`_stash`) so the heavy payloads stay out of the caller; the
-        matrix is the same sample-major, ``None``-normalized form ``score_group`` returns.
-        """
+    def _score_group_prm(self, samples):
         if self.prm_step_scorer is None or not self.prm_scorers:
             raise RuntimeError('score_group_prm was called without a wired PRM channel.')
-        resolved = [_resolve(sample) for sample in samples]
+        resolved = samples
         rows = _score_rows(resolved)
         tasks = [(getattr(scorer, 'placement_key', None),
                   lambda scorer=scorer: self._one_reward(scorer, rows))
@@ -174,7 +259,7 @@ class ScoreWorker:
         matrix = results[:len(self.orm_scorers)]
         rewards = ([[None if value is None or value != value else float(value) for value in column]
                     for column in zip(*matrix)] if matrix else [[] for _ in samples])
-        return rewards, [_stash(value) for value in results[len(self.orm_scorers):]]
+        return rewards, results[len(self.orm_scorers):]
 
     def _weighted_step_score(self, step_rows: List[Dict[str, Any]]) -> List[float]:
         """One weighted process score per PRM step row (nan-aware: a judge miss never poisons it)."""
@@ -206,7 +291,7 @@ class ScoreWorker:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, 'a', encoding='utf-8') as stream:
             for sample, per_func in zip(samples, rewards):
-                resolved = _resolve(sample)
+                resolved = sample
                 stream.write(json.dumps({
                     'step': step,
                     'prompt': getattr(resolved, 'prompt', None),
