@@ -2,6 +2,7 @@
 """Exercise single-node admission with real Ray nodes and logical devices."""
 import asyncio
 import json
+import os
 import ray
 import uuid
 from ray.cluster_utils import Cluster
@@ -13,12 +14,14 @@ from twinkle.server.training.catalog import TrainingCatalog
 
 
 async def main():
+    # Synthetic reservations must not inherit a hidden CUDA-device mask.
+    os.environ.pop('CUDA_VISIBLE_DEVICES', None)
     cluster = Cluster()
     occupied = []
     allocated = None
     pool = None
     try:
-        cluster.add_node(num_cpus=4, num_gpus=4, resources={'left': 1}, include_dashboard=False)
+        cluster.add_node(num_cpus=4, num_gpus=4, resources={'left': 1}, include_dashboard=False, dashboard_port=0)
         cluster.add_node(num_cpus=4, num_gpus=4, resources={'right': 1})
         ray.init(address=cluster.address, namespace='fragmentation_' + uuid.uuid4().hex, log_to_driver=False)
         pool = DevicePool(ray.get_runtime_context().namespace, allocation_timeout=1, shutdown_timeout=10)

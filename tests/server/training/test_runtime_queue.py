@@ -71,6 +71,7 @@ async def test_execution_timeout_keeps_live_thread_and_allocation_quarantined():
         await queue.shutdown_task_queue()
         runtime.fail_shutdown = False
         await controller.sweep()
+        await controller.wait_for_jobs()
     assert not runtime.allocations
 
 

@@ -19,6 +19,7 @@ from twinkle.server.state.models import FutureFailureRecord
 from twinkle.server.state.training_records import (LIVE_INSTANCES, TERMINAL_TRAINING, CreateTraining, InstanceRecord,
                                                    TrainingRecord)
 from twinkle.server.state.training_store import TrainingStore
+from twinkle.server.telemetry.metrics import get_training_metrics
 from .catalog import TrainingCatalog, TrainingSpec
 from .errors import TrainingExpiredError
 
@@ -92,6 +93,53 @@ class TrainingController:
         self._failed_instances: dict[str, FutureFailureRecord] = {}
         self._lock = asyncio.Lock()
         self._ready = False
+        self._metrics = get_training_metrics()
+        self._reported_metric_keys: set[tuple[str, str, str, str]] = set()
+        self._reported_resource_metric_keys: set[tuple[str, str, str]] = set()
+
+    def _instance_metric_tags(self, instance: InstanceRecord) -> dict[str, str]:
+        spec = self.catalog.get(instance.base_model, instance.mode)
+        return {
+            'backend': spec.model.backend,
+            'mode': instance.mode,
+            'state': instance.state,
+            'resident': str(instance.resident).lower(),
+        }
+
+    def _report_instance_metrics(self) -> None:
+        counts: dict[tuple[str, str, str, str], int] = {}
+        resources: dict[tuple[str, str], tuple[int, int]] = {}
+        for instance in self.instances.values():
+            if instance.state == 'STOPPED':
+                continue
+            tags = self._instance_metric_tags(instance)
+            key = tuple(tags[name] for name in ('backend', 'mode', 'state', 'resident'))
+            counts[key] = counts.get(key, 0) + 1
+            resource_key = tags['backend'], tags['mode'], self.catalog.get(instance.base_model,
+                                                                           instance.mode).model.device_type
+            devices, groups = resources.get(resource_key, (0, 0))
+            resources[resource_key] = (devices + len(instance.devices), groups + int(bool(instance.application_name)))
+        for key in self._reported_metric_keys | counts.keys():
+            tags = dict(zip(('backend', 'mode', 'state', 'resident'), key))
+            self._metrics.instances_active.set(counts.get(key, 0), tags=tags)
+        for key in self._reported_resource_metric_keys | resources.keys():
+            tags = dict(zip(('backend', 'mode', 'device_type'), key))
+            devices, groups = resources.get(key, (0, 0))
+            self._metrics.devices_allocated.set(devices, tags=tags)
+            self._metrics.placement_groups_active.set(groups, tags=tags)
+        self._reported_metric_keys = set(counts)
+        self._reported_resource_metric_keys = set(resources)
+
+    @staticmethod
+    def _quarantine_reason(exc: Exception) -> str:
+        message = str(exc).lower()
+        if isinstance(exc, TimeoutError):
+            return 'timeout'
+        if 'worker death' in message:
+            return 'worker_death'
+        if 'placement group' in message:
+            return 'pg_removal'
+        return 'other'
 
     def _spawn(self, coroutine) -> asyncio.Task:
         task = asyncio.create_task(coroutine)
@@ -169,6 +217,7 @@ class TrainingController:
             instance.incarnation = incarnation
             instance.state = 'STARTING'
             await self.store.save_instance(instance)
+            self._report_instance_metrics()
 
     async def mark_dirty(self, instance_id: str, epoch: str) -> None:
         async with self._lock:
@@ -194,11 +243,14 @@ class TrainingController:
             startup_deadline=self.clock() + self.config.startup_timeout_s)
         await self.store.save_instance(instance)
         self.instances[instance.instance_id] = instance
+        self._report_instance_metrics()
         self._startup[instance.instance_id] = self._spawn(self._start_instance(instance))
         return instance
 
     async def _start_instance(self, instance: InstanceRecord) -> None:
         spec = self.catalog.get(instance.base_model, instance.mode)
+        started, status = time.monotonic(), 'error'
+        tags = {'backend': spec.model.backend, 'mode': spec.mode}
         try:
 
             async def startup():
@@ -214,6 +266,7 @@ class TrainingController:
                     await self.store.save_instance(allocated)
                     for name, value in details.items():
                         setattr(instance, name, value)
+                    self._report_instance_metrics()
                 # Ownership is persisted before any worker is constructed; the driver does not write records.
                 await self.driver.deploy(instance.model_copy(deep=True), spec)
 
@@ -227,9 +280,13 @@ class TrainingController:
                 ready = instance.model_copy(update={'state': 'READY'})
                 await self.store.save_instance(ready)
                 instance.state = 'READY'
+                self._report_instance_metrics()
+            status = 'success'
         except Exception as exc:
             await self.fail_instance(instance.instance_id, failure_for(exc))
             raise
+        finally:
+            self._metrics.startup_seconds.observe(time.monotonic() - started, tags={**tags, 'status': status})
 
     def _select(self, spec: TrainingSpec) -> InstanceRecord | None:
         candidates = [
@@ -511,6 +568,8 @@ class TrainingController:
                     updated_instance = instance.model_copy(update={'state': 'DRAINING'})
                     await self.store.save_instance(updated_instance)
                     instance.state = 'DRAINING'
+                if resetting or closing_full:
+                    self._report_instance_metrics()
             if closing_full:
                 await self._close_instance(instance)
                 return
@@ -561,6 +620,7 @@ class TrainingController:
                 training.terminal_at = terminal.terminal_at
                 instance.training_ids = remaining
                 instance.state = updated_instance.state
+                self._report_instance_metrics()
             if close:
                 await self._close_instance(instance)
         finally:
@@ -581,6 +641,9 @@ class TrainingController:
         await asyncio.shield(close_task)
 
     async def _close_instance_once(self, instance: InstanceRecord) -> None:
+        started = time.monotonic()
+        tags = self._instance_metric_tags(instance)
+        timing_tags = {'backend': tags['backend'], 'mode': tags['mode']}
         try:
             await asyncio.wait_for(self.driver.shutdown(instance), self.config.shutdown_timeout_s)
         except Exception as exc:
@@ -589,7 +652,16 @@ class TrainingController:
                 await self.store.save_instance(quarantined)
                 instance.state = 'QUARANTINED'
                 instance.failure = str(exc)
+                self._report_instance_metrics()
+                tags = self._instance_metric_tags(instance)
+                self._metrics.quarantined_total.inc(tags={
+                    'backend': tags['backend'],
+                    'mode': tags['mode'],
+                    'reason': self._quarantine_reason(exc),
+                })
+            self._metrics.shutdown_seconds.observe(time.monotonic() - started, tags={**timing_tags, 'status': 'error'})
             return
+        self._metrics.shutdown_seconds.observe(time.monotonic() - started, tags={**timing_tags, 'status': 'success'})
         async with self._lock:
             terminal_records = []
             terminal_at = time.time()
@@ -627,6 +699,7 @@ class TrainingController:
             instance.stopped_at = terminal_at
             instance.training_ids.clear()
             self._failed_instances.pop(instance.instance_id, None)
+            self._report_instance_metrics()
 
     async def fail_instance(self, instance_id: str, failure: FutureFailureRecord) -> None:
         async with self._lock:
@@ -641,6 +714,7 @@ class TrainingController:
                 await self.store.save_instance(draining)
                 instance.state = 'DRAINING'
                 instance.failure = failure.message
+                self._report_instance_metrics()
         try:
             async with self._lock:
                 for training_id in instance.training_ids:
@@ -724,6 +798,7 @@ class TrainingController:
                         and not instance.training_ids):
                     self.instances.pop(identity)
                     self._startup.pop(identity, None)
+            self._report_instance_metrics()
 
     async def _reconcile_operation(self, training: TrainingRecord, request_id: str) -> None:
         try:

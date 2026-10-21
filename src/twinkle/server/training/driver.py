@@ -5,11 +5,14 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import time
 
 from twinkle.server.env_propagation import build_propagated_env_vars
 from twinkle.server.resources.allocation import DevicePool
 from twinkle.server.state.training_records import InstanceRecord
+from twinkle.server.telemetry.metrics import get_training_metrics
 from twinkle.utils.logger import get_logger
+from .catalog import TrainingCatalog
 
 logger = get_logger()
 
@@ -20,6 +23,8 @@ class RayInstanceDriver:
         self.config, self.store = config, store
         self.namespace, self.controller_name = namespace, controller_name
         self._cleanup_tasks: set[asyncio.Task] = set()
+        self._metrics = get_training_metrics()
+        self._catalog = TrainingCatalog(config)
         self.pool = DevicePool(
             namespace, allocation_timeout=config.allocation_timeout_s, shutdown_timeout=config.shutdown_timeout_s)
 
@@ -27,14 +32,20 @@ class RayInstanceDriver:
         return self.pool.name(instance.controller_epoch, instance.instance_id)
 
     async def allocate(self, instance, spec):
-        allocation = await self.pool.allocate(spec.config.num_devices, spec.model.device_type,
-                                              instance.controller_epoch, instance.instance_id)
-        return {
-            'application_name': allocation.name,
-            'placement_group_id': allocation.placement_group_id,
-            'node_id': allocation.node_id,
-            'devices': list(allocation.devices)
-        }
+        started, status = time.monotonic(), 'error'
+        tags = {'backend': spec.model.backend, 'mode': spec.mode, 'device_type': spec.model.device_type}
+        try:
+            allocation = await self.pool.allocate(spec.config.num_devices, spec.model.device_type,
+                                                  instance.controller_epoch, instance.instance_id)
+            status = 'success'
+            return {
+                'application_name': allocation.name,
+                'placement_group_id': allocation.placement_group_id,
+                'node_id': allocation.node_id,
+                'devices': list(allocation.devices)
+            }
+        finally:
+            self._metrics.allocation_seconds.observe(time.monotonic() - started, tags={**tags, 'status': status})
 
     async def deploy(self, instance, spec):
         from ray import serve
@@ -149,7 +160,21 @@ class RayInstanceDriver:
             actors.append(handle)
             ray.kill(handle, no_restart=True)
         await asyncio.to_thread(serve.delete, instance.application_name or name)
-        await self.pool.remove(name)
+        removal_started, removal_status = time.monotonic(), 'error'
+        try:
+            await self.pool.remove(name)
+            removal_status = 'success'
+        finally:
+            try:
+                spec = self._catalog.get(instance.base_model, instance.mode)
+            except Exception:
+                tags = {'backend': 'unknown', 'mode': instance.mode, 'device_type': 'unknown'}
+            else:
+                tags = {'backend': spec.model.backend, 'mode': spec.mode, 'device_type': spec.model.device_type}
+            self._metrics.removal_seconds.observe(
+                time.monotonic() - removal_started, tags={
+                    **tags, 'status': removal_status
+                })
         # The PG kills even unnamed remaining children. Named workers must also
         # have failed readiness RPCs before the controller retires quota/tickets.
         for handle in actors:

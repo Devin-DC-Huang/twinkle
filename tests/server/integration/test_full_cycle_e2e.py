@@ -6,8 +6,7 @@ Ray Serve cluster (server + model + sampler + processor) with Qwen3.5-4B.
 
 Backend selection via env var TWINKLE_TEST_BACKEND:
   - "transformers" (default): all 6 phases run strictly
-  - "megatron": Phase C/D skipped (known multi-LoRA strict-load bug),
-    Phase E/F best-effort (GPU OOM possible)
+  - "megatron": all 6 phases run strictly (requires a working optimizer-resume backend)
 
 Phase A — initial training (STEPS_PHASE_A steps)
 Phase B — keep training STEPS_PHASE_B more steps, save again
@@ -58,9 +57,9 @@ BACKEND = os.environ.get('TWINKLE_TEST_BACKEND', 'transformers').lower()
 assert BACKEND in ('transformers', 'megatron'), f'Invalid TWINKLE_TEST_BACKEND={BACKEND!r}'
 
 BASE_MODEL = 'Qwen/Qwen3.5-4B'
-BASE_URL = 'http://localhost:9000'
+BASE_URL = os.environ.get('TWINKLE_SERVER_URL', 'http://localhost:9000')
 API_KEY = 'EMPTY_API_KEY'
-SAVE_DIR = '/mnt/nas2/yunlin.myl/twinkle/output/twinkle_e2e_full_cycle'
+SAVE_DIR = os.environ.get('TWINKLE_DEFAULT_SAVE_DIR', 'output/twinkle_e2e_full_cycle')
 STEPS_PHASE_A = 60
 STEPS_PHASE_B = 4
 STEPS_PHASE_D = 4

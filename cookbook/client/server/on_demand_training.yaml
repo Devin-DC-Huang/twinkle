@@ -2,7 +2,8 @@
 training:
   allocation_timeout_s: 3
   startup_timeout_s: 1800
-  shutdown_timeout_s: 60
+  # PPU actor/PlacementGroup death confirmation can exceed the 60s framework default.
+  shutdown_timeout_s: 180
   sweep_interval_s: 5
 applications:
   - name: model-qwen

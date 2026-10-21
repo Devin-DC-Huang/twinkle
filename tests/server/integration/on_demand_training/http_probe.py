@@ -29,7 +29,13 @@ def main():
     os.environ['TWINKLE_LONG_POLL_TIMEOUT'] = '2'
     os.environ['TWINKLE_PERSISTENCE_MODE'] = 'memory'
     os.environ['PYTHONPATH'] = str(__import__('pathlib').Path.cwd() / 'src')
-    ray.init(address='local', namespace=namespace, num_cpus=16, include_dashboard=False, log_to_driver=False)
+    ray.init(
+        address='local',
+        namespace=namespace,
+        num_cpus=8,
+        _temp_dir='/tmp/twh-' + namespace[-8:],
+        include_dashboard=False,
+        log_to_driver=False)
     config = ServerConfig.model_validate({
         'ray_namespace':
         namespace,
@@ -38,8 +44,8 @@ def main():
             'port': port
         },
         'training': {
-            'startup_timeout_s': 120,
-            'shutdown_timeout_s': 30
+            'startup_timeout_s': 600,
+            'shutdown_timeout_s': 180
         },
         'applications': [{
             'name': 'small',
@@ -236,7 +242,7 @@ def main():
         transport.close()
     finally:
         if getattr(launcher, '_training_controller', None) is not None:
-            ray.get(launcher._training_controller.shutdown.remote(), timeout=60)
+            ray.get(launcher._training_controller.shutdown.remote(), timeout=180)
             ray.kill(launcher._training_controller, no_restart=True)
         serve.shutdown()
         ray.shutdown()

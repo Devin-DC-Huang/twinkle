@@ -10,6 +10,8 @@ from twinkle.server.config.training import TrainingConfig
 from twinkle.server.state import get_server_state
 from twinkle.server.state.models import FutureFailureRecord
 from twinkle.server.state.training_records import CreateTraining
+from twinkle.server.telemetry.metrics import get_training_metrics
+from twinkle.server.telemetry.worker_init import ensure_telemetry_initialized
 from twinkle.utils.logger import get_logger
 from .controller import TrainingController
 from .driver import RayInstanceDriver
@@ -25,11 +27,13 @@ def controller_name(namespace):
 class TrainingControllerActor:
 
     def __init__(self, config, namespace):
+        ensure_telemetry_initialized()
         self.config = TrainingConfig.model_validate(config)
         self.namespace = namespace
         self.store = get_server_state().create_training_store(namespace)
         self.driver = RayInstanceDriver(self.config, self.store, namespace, controller_name(namespace))
         self.core = TrainingController(self.config, self.store, self.driver)
+        self._metrics = get_training_metrics()
         self._monitors = []
         self._unreachable_since = {}
         self._initialization = asyncio.get_event_loop().create_task(self._initialize())
@@ -91,10 +95,15 @@ class TrainingControllerActor:
 
     async def _sweep(self):
         while True:
+            started, status = time.monotonic(), 'success'
             try:
                 await self.core.sweep()
             except Exception:
+                status = 'error'
                 logger.exception('Training lifecycle sweep failed; resources remain owned')
+            finally:
+                self._metrics.sweep_total.inc(tags={'status': status})
+                self._metrics.sweep_seconds.observe(time.monotonic() - started, tags={'status': status})
             await asyncio.sleep(self.config.sweep_interval_s)
 
     async def _recover_lost_state(self):

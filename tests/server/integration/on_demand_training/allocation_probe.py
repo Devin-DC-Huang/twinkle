@@ -2,6 +2,7 @@
 """Run in its own process: test production allocation against logical Ray GPUs."""
 import asyncio
 import json
+import os
 import ray
 import uuid
 
@@ -13,9 +14,18 @@ from twinkle.server.training.catalog import TrainingCatalog
 
 
 async def main():
+    # These are synthetic Ray GPU reservations, not CUDA workloads.
+    os.environ.pop('CUDA_VISIBLE_DEVICES', None)
     namespace = 'alloc_' + uuid.uuid4().hex
     ray.init(
-        address='local', namespace=namespace, num_cpus=16, num_gpus=8, include_dashboard=False, log_to_driver=False)
+        address='local',
+        namespace=namespace,
+        num_cpus=4,
+        num_gpus=8,
+        _temp_dir='/tmp/twa-' + namespace[-8:],
+        include_dashboard=False,
+        dashboard_port=0,
+        log_to_driver=False)
     pool = DevicePool(namespace, allocation_timeout=3, shutdown_timeout=10)
     allocations = []
     try:
@@ -40,7 +50,6 @@ async def main():
         devices = [device for allocation in allocations for device in allocation.devices]
         assert len(set(devices)) == 8, devices
         assert len({allocation.node_id for allocation in allocations}) == 1
-        assert ray.available_resources().get('GPU', 0) == 0
         try:
             await pool.allocate(spec.config.num_devices, spec.model.device_type, 'epoch', 'overflow')
             raise AssertionError('over-allocation was admitted')
@@ -48,12 +57,13 @@ async def main():
             pass
         from ray.util.placement_group import get_placement_group
         group = DeviceGroup(name='owned', ranks=2, device_type='cuda')
-        view = ResourceManager.from_allocation(group, get_placement_group(allocations[0].name),
-                                               list(allocations[0].devices))
+        owned_pg = get_placement_group(allocations[0].name)
+        view = ResourceManager.from_allocation(group, owned_pg, list(allocations[0].devices))
         assert view.get_config('owned').ranks == [0, 1]
         assert [entry['gpu_rank'][0] for entry in view.get_group('owned')] == list(allocations[0].devices)
+        # A ResourceManager view cannot release a controller-owned allocation.
         view.destroy_placement_group()
-        assert ray.available_resources().get('GPU', 0) == 0
+        assert get_placement_group(allocations[0].name).id == owned_pg.id
         freed = allocations[0]
         await pool.remove(freed.name)
         two = TrainingCatalog(

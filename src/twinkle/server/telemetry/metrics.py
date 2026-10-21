@@ -111,6 +111,33 @@ class TaskMetrics(BaseModel):
     rate_limiter_active_tokens: _Gauge
 
 
+class TrainingMetrics(BaseModel):
+    """Low-cardinality metrics for the managed training lifecycle."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    instances_active: _Gauge
+    startup_seconds: _Histogram
+    shutdown_seconds: _Histogram
+    allocation_seconds: _Histogram
+    removal_seconds: _Histogram
+    quarantined_total: _Counter
+    sweep_total: _Counter
+    sweep_seconds: _Histogram
+    devices_allocated: _Gauge
+    placement_groups_active: _Gauge
+
+
+class StateBackendMetrics(BaseModel):
+    """Metrics for persistent state backend availability and contention."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    redis_health: _Gauge
+    update_atomic_conflicts: _Counter
+    update_atomic_retries: _Histogram
+
+
 class _RequestMetrics(BaseModel):
     """HTTP request metrics container (internal)."""
 
@@ -177,6 +204,45 @@ class MetricsRegistry:
             description='Number of tokens currently tracked by the rate limiter',
         )
 
+        # === Managed training ===
+        self.training_instances_active = meter.create_up_down_counter(
+            'twinkle.training.instances.active', description='Active managed training instances by lifecycle state')
+        self.training_startup_seconds = meter.create_histogram(
+            'twinkle.training.instance.startup.duration_seconds',
+            description='Training runtime startup duration',
+            unit='s')
+        self.training_shutdown_seconds = meter.create_histogram(
+            'twinkle.training.instance.shutdown.duration_seconds',
+            description='Training runtime shutdown duration',
+            unit='s')
+        self.training_allocation_seconds = meter.create_histogram(
+            'twinkle.training.placement_group.allocation.duration_seconds',
+            description='Placement group allocation duration',
+            unit='s')
+        self.training_removal_seconds = meter.create_histogram(
+            'twinkle.training.placement_group.removal.duration_seconds',
+            description='Placement group removal duration',
+            unit='s')
+        self.training_quarantined_total = meter.create_counter(
+            'twinkle.training.quarantined.total', description='Training instances quarantined during cleanup')
+        self.training_sweep_total = meter.create_counter(
+            'twinkle.training.sweep.total', description='Training lifecycle sweep runs by status')
+        self.training_sweep_seconds = meter.create_histogram(
+            'twinkle.training.sweep.duration_seconds', description='Training lifecycle sweep duration', unit='s')
+        self.training_devices_allocated = meter.create_up_down_counter(
+            'twinkle.training.devices.allocated', description='Logical devices owned by managed training instances')
+        self.training_placement_groups_active = meter.create_up_down_counter(
+            'twinkle.training.placement_groups.active',
+            description='Placement groups owned by managed training instances')
+
+        # === Redis state backend ===
+        self.redis_health = meter.create_up_down_counter(
+            'twinkle.state.redis.health', description='Last observed Redis health (1 healthy, 0 unhealthy)')
+        self.redis_update_atomic_conflicts = meter.create_counter(
+            'twinkle.state.redis.update_atomic.conflicts.total', description='Redis WATCH conflicts')
+        self.redis_update_atomic_retries = meter.create_histogram(
+            'twinkle.state.redis.update_atomic.retries', description='Retries used by Redis atomic updates')
+
         # === Resources (ObservableGauge backed by the push cache) ===
         # OTEL holds its own references to the gauges via the meter, so we
         # only need to keep the cache the callbacks read from.
@@ -192,6 +258,8 @@ class MetricsRegistry:
         # swaps this singleton to rebind instruments) invalidates them.
         self._task_metrics: dict[str, TaskMetrics] = {}
         self._request_metrics: dict[str, _RequestMetrics] = {}
+        self._training_metrics: TrainingMetrics | None = None
+        self._state_backend_metrics: StateBackendMetrics | None = None
 
     def _make_gauge_callback(self, name: str):
         """Build the sync OTEL callback that reads ``_resource_cache[name]``."""
@@ -226,6 +294,33 @@ class MetricsRegistry:
                 request_duration_seconds=_Histogram(self.request_duration_seconds),
             )
         return cached
+
+    def training_metrics(self) -> TrainingMetrics:
+        """Return process-local managed training metric adapters."""
+        if self._training_metrics is None:
+            self._training_metrics = TrainingMetrics(
+                instances_active=_Gauge(self.training_instances_active),
+                startup_seconds=_Histogram(self.training_startup_seconds),
+                shutdown_seconds=_Histogram(self.training_shutdown_seconds),
+                allocation_seconds=_Histogram(self.training_allocation_seconds),
+                removal_seconds=_Histogram(self.training_removal_seconds),
+                quarantined_total=_Counter(self.training_quarantined_total),
+                sweep_total=_Counter(self.training_sweep_total),
+                sweep_seconds=_Histogram(self.training_sweep_seconds),
+                devices_allocated=_Gauge(self.training_devices_allocated),
+                placement_groups_active=_Gauge(self.training_placement_groups_active),
+            )
+        return self._training_metrics
+
+    def state_backend_metrics(self) -> StateBackendMetrics:
+        """Return process-local state backend metric adapters."""
+        if self._state_backend_metrics is None:
+            self._state_backend_metrics = StateBackendMetrics(
+                redis_health=_Gauge(self.redis_health),
+                update_atomic_conflicts=_Counter(self.redis_update_atomic_conflicts),
+                update_atomic_retries=_Histogram(self.redis_update_atomic_retries),
+            )
+        return self._state_backend_metrics
 
     # ----- Push API for the cleanup leader -----
 
@@ -268,3 +363,13 @@ def get_task_metrics(deployment: str) -> TaskMetrics:
 def get_request_metrics(deployment: str) -> _RequestMetrics:
     """Return the per-deployment HTTP request metric adapters."""
     return MetricsRegistry.get().request_metrics(deployment)
+
+
+def get_training_metrics() -> TrainingMetrics:
+    """Return managed training metric adapters."""
+    return MetricsRegistry.get().training_metrics()
+
+
+def get_state_backend_metrics() -> StateBackendMetrics:
+    """Return persistent state backend metric adapters."""
+    return MetricsRegistry.get().state_backend_metrics()
