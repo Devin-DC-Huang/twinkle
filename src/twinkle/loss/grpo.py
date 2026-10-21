@@ -152,10 +152,10 @@ class GRPOLoss(Loss):
           * Response-only form (e.g. ``old_logps`` from vLLM): length equals
             the number of trainable positions in ``mask[i]`` and is scattered
             directly onto those positions.
-          * Full-sequence form (e.g. ``ref_logps`` from a ref-model forward,
-            right-padded to ``mask.shape[1]``): length ``>= mask.shape[1]``;
-            we slice to ``seq_len`` and index by ``mask[i]`` to extract the
-            trainable positions, then scatter.
+          * Full-sequence form (e.g. ``ref_logps`` from a ref-model forward):
+            every trainable mask position must exist in the per-sample row.
+            Rows need not include the batch's right-padding; we index by
+            ``mask[i]`` to extract the trainable positions, then scatter.
 
         Any other length is a real bug and triggers a hard assert — never
         silently truncate, since that misaligns IS ratios to the wrong tokens.
@@ -196,19 +196,20 @@ class GRPOLoss(Loss):
             pos = mask[i].nonzero(as_tuple=True)[0]
             n_pos = len(pos)
             n_sample = sample.numel()
+            last_pos = int(pos[-1].item()) if n_pos else -1
+            if not self._alignment_supported(n_pos, n_sample, last_pos):
+                self._raise_alignment_mismatch(i, n_pos, n_sample, seq_len)
 
             if n_sample == 1:
                 result[i, pos] = sample.item()
             elif n_sample == n_pos:
                 # Response-only form (e.g. old_logps from vLLM).
                 result[i, pos] = sample
-            elif n_pos == 0 or (n_sample > 0 and pos[-1].item() < n_sample):
+            else:
                 # Variable-length full-sequence form. The processor right-pads the
                 # batch, but per-sample RL fields from Tinker remain unpadded. They
                 # are valid when every selected mask position exists in this row.
                 result[i, pos] = sample[pos]
-            else:
-                self._raise_alignment_mismatch(i, n_pos, n_sample, seq_len)
 
         return result
 

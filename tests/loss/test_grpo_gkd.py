@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Tests for GRPO family losses and GKD loss."""
+import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
@@ -316,3 +317,43 @@ class TestGRPOValidateInputs:
         inputs = self._batch()
         with pytest.raises(AssertionError, match='data/mask length mismatch'):
             loss_fn.validate_inputs(inputs, advantages=[1.0, [1.0, 2.0, 3.0]])
+
+    @pytest.mark.parametrize('field', ['old_logps', 'ref_logps', 'advantages'])
+    @pytest.mark.parametrize('representation', ['list', 'tuple', 'tensor', 'numpy'])
+    @pytest.mark.parametrize('labels,n_sample,supported', [
+        ([-100, -100, 0, 0, -100], 0, False),
+        ([-100, -100, 0, 0, -100], 1, True),
+        ([-100, -100, 0, 0, -100], 2, True),
+        ([-100, -100, 0, 0, -100], 3, False),
+        ([-100, -100, 0, 0, -100], 4, True),
+        ([-100, -100, 0, 0, -100], 5, True),
+        ([-100, -100, 0, 0, -100], 6, True),
+        ([-100, -100, -100], 0, True),
+        ([-100, -100, -100], 1, True),
+        ([-100, -100, -100], 2, True),
+    ])
+    def test_preflight_and_loss_agree_on_alignment(self, labels, n_sample, supported, representation, field):
+        loss_fn = GRPOLoss(beta=0.1)
+        inputs = {'labels': torch.tensor(labels)}
+        outputs = {'logps': torch.zeros(1, len(labels), requires_grad=True)}
+        data = [[0.1] * n_sample]
+        if representation == 'tuple':
+            data = tuple(tuple(row) for row in data)
+        elif representation == 'tensor':
+            data = torch.tensor(data)
+        elif representation == 'numpy':
+            data = np.asarray(data, dtype=np.float32)
+        kwargs = {'advantages': [1.0], field: data}
+
+        if not supported:
+            with pytest.raises(AssertionError, match='data/mask length mismatch at sample 0'):
+                loss_fn.validate_inputs([inputs], **kwargs)
+            with pytest.raises(AssertionError, match='data/mask length mismatch at sample 0'):
+                loss_fn(inputs, outputs, **kwargs)
+            return
+
+        loss_fn.validate_inputs([inputs], **kwargs)
+        result = loss_fn(inputs, outputs, **kwargs)
+        assert torch.isfinite(result['loss'])
+        result['loss'].backward()
+        assert torch.isfinite(outputs['logps'].grad).all()

@@ -6,9 +6,11 @@ Uses a minimal FastAPI app with the OpenAI routes directly registered
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import httpx
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 from unittest.mock import AsyncMock, MagicMock
 
@@ -314,6 +316,109 @@ class TestChatCompletions:
         assert resp.status_code == 504
         assert resp.json()['error']['type'] == 'timeout'
         assert 'did not finish' in resp.json()['error']['message']
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('blocked_step', ['disconnect_check', 'initial_read', 'long_poll'])
+    async def test_non_stream_timeout_covers_each_wait_step(self, mock_gateway, monkeypatch, blocked_step):
+        from twinkle.server.gateway import openai_handlers
+
+        monkeypatch.setenv('TWINKLE_OPENAI_SAMPLE_TIMEOUT', '0.01')
+        mock_self, app = mock_gateway
+        mock_self.proxy.proxy_request.return_value = self._make_sample_response(status='running')
+        mock_self.state.get_future = AsyncMock(return_value={'status': 'running'})
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def blocked(*args, **kwargs):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        if blocked_step == 'disconnect_check':
+            monkeypatch.setattr(Request, 'is_disconnected', blocked)
+        elif blocked_step == 'initial_read':
+            mock_self.state.get_future.side_effect = blocked
+        else:
+            monkeypatch.setattr(openai_handlers, 'poll_future', blocked)
+
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+            resp = await asyncio.wait_for(
+                client.post('/chat/completions', json={
+                    'model': 'Qwen/Qwen3.5-4B',
+                    'messages': [{'role': 'user', 'content': 'Hello'}],
+                }), timeout=1.0)
+
+        assert started.is_set()
+        assert cancelled.is_set()
+        assert resp.status_code == 504
+        assert resp.json()['error']['type'] == 'timeout'
+        assert 'did not finish' in resp.json()['error']['message']
+
+    @pytest.mark.asyncio
+    async def test_non_stream_polls_share_one_total_budget(self, mock_gateway, monkeypatch):
+        from twinkle.server.gateway import openai_handlers
+        from twinkle.server.gateway.use_cases import FuturePollResult
+
+        monkeypatch.setenv('TWINKLE_OPENAI_SAMPLE_TIMEOUT', '0.05')
+        mock_self, app = mock_gateway
+        mock_self.proxy.proxy_request.return_value = self._make_sample_response(status='running')
+        mock_self.state.get_future = AsyncMock(return_value={'status': 'running'})
+        calls = 0
+
+        async def slow_poll(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            await asyncio.sleep(0.02)
+            status = 'completed' if calls == 10 else 'running'
+            return FuturePollResult(record={
+                'status': status,
+                'result': self._samples_result('Late!') if status == 'completed' else None,
+            }, timed_out=status != 'completed')
+
+        monkeypatch.setattr(openai_handlers, 'poll_future', slow_poll)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+            resp = await asyncio.wait_for(
+                client.post('/chat/completions', json={
+                    'model': 'Qwen/Qwen3.5-4B',
+                    'messages': [{'role': 'user', 'content': 'Hello'}],
+                }), timeout=1.0)
+
+        assert resp.status_code == 504
+        assert resp.json()['error']['type'] == 'timeout'
+        assert calls < 10
+
+    @pytest.mark.asyncio
+    async def test_non_stream_disconnect_stops_before_state_reads(self, mock_gateway, monkeypatch):
+        monkeypatch.setattr(Request, 'is_disconnected', AsyncMock(return_value=True))
+        mock_self, app = mock_gateway
+        mock_self.proxy.proxy_request.return_value = self._make_sample_response(status='running')
+
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+            resp = await client.post('/chat/completions', json={
+                'model': 'Qwen/Qwen3.5-4B',
+                'messages': [{'role': 'user', 'content': 'Hello'}],
+            })
+
+        assert resp.status_code == 504
+        assert 'disconnected' in resp.json()['error']['message']
+        mock_self.state.get_future.assert_not_awaited()
+
+    def test_non_stream_completed_task_needs_no_wait_budget(self, mock_gateway, monkeypatch):
+        monkeypatch.setenv('TWINKLE_OPENAI_SAMPLE_TIMEOUT', '0')
+        mock_self, app = mock_gateway
+        mock_self.proxy.proxy_request.return_value = self._make_sample_response('Done!')
+
+        with TestClient(app) as client:
+            resp = client.post('/chat/completions', json={
+                'model': 'Qwen/Qwen3.5-4B',
+                'messages': [{'role': 'user', 'content': 'Hello'}],
+            })
+
+        assert resp.status_code == 200
+        assert resp.json()['choices'][0]['message']['content'] == 'Done!'
+        mock_self.state.get_future.assert_not_awaited()
 
     def test_non_stream_lost_record_is_a_server_error(self, mock_gateway):
         """A vanished future record is the server's loss, not a client 404."""

@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import time
 import uuid
 from collections.abc import Callable
 from fastapi import Depends, FastAPI, Request
@@ -56,33 +55,36 @@ async def _resolve_sampler_envelope(gateway: GatewayServer, sampler_data: dict[s
     state backend is the only way to obtain its result without changing the
     upstream wire contract. Returns ``None`` when the future record was lost.
 
-    The wait is bounded by ``TWINKLE_OPENAI_SAMPLE_TIMEOUT`` and stops as soon
-    as the client disconnects: a stuck task must not keep this coroutine (and
-    its reads of the shared state) alive for the future's whole retention
-    window, long after the caller gave up.
+    ``TWINKLE_OPENAI_SAMPLE_TIMEOUT`` bounds the entire terminal-state wait,
+    including state reads. Client disconnection is checked between long polls.
     """
     envelope = types.TaskEnvelope.model_validate(sampler_data)
-    deadline = time.monotonic() + _sample_wait_timeout()
-    while envelope.status not in types.TERMINAL_STATUSES:
-        if await request.is_disconnected():
-            raise SamplerWaitTimeoutError('Client disconnected while waiting for the sampling task.')
-        # ``poll_future`` waits out its whole window before reporting a missing
-        # record, so check once here: a lost record is a terminal answer, not a
-        # reason to keep the coroutine alive.
-        if await gateway.state.get_future(envelope.request_id) is None:
-            return None
-        try:
-            # Bound each long poll by the remaining budget, otherwise one 30s
-            # window could overshoot a shorter configured deadline.
-            outcome = await asyncio.wait_for(
-                poll_future(gateway.state, envelope.request_id), timeout=deadline - time.monotonic())
-        except TimeoutError:
-            raise SamplerWaitTimeoutError(
-                f'Sampling task {envelope.request_id} did not finish within {_sample_wait_timeout():.0f}s.') from None
-        if outcome.record is None:
-            return None
-        envelope = envelope_from_record(envelope.request_id, outcome.record)
-    return envelope
+    if envelope.status in types.TERMINAL_STATUSES:
+        return envelope
+
+    async def wait_for_terminal(envelope: types.TaskEnvelope) -> types.TaskEnvelope | None:
+        while envelope.status not in types.TERMINAL_STATUSES:
+            if await request.is_disconnected():
+                raise SamplerWaitTimeoutError('Client disconnected while waiting for the sampling task.')
+            # ``poll_future`` waits out its whole window before reporting a missing
+            # record, so check once here: a lost record is a terminal answer, not a
+            # reason to keep the coroutine alive.
+            if await gateway.state.get_future(envelope.request_id) is None:
+                return None
+            outcome = await poll_future(gateway.state, envelope.request_id)
+            if outcome.record is None:
+                return None
+            envelope = envelope_from_record(envelope.request_id, outcome.record)
+        return envelope
+
+    timeout = _sample_wait_timeout()
+    try:
+        return await asyncio.wait_for(wait_for_terminal(envelope), timeout=timeout)
+    except SamplerWaitTimeoutError:
+        raise
+    except asyncio.TimeoutError:
+        raise SamplerWaitTimeoutError(
+            f'Sampling task {envelope.request_id} did not finish within {timeout:g}s.') from None
 
 
 def _register_openai_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) -> None:
