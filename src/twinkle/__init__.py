@@ -28,7 +28,7 @@ def init_twinkle_client(
 
 if TYPE_CHECKING:
     from twinkle_client import init_tinker_client, init_twinkle_client
-    from .infra import get_device_placement, get_mode, initialize, is_master, remote_class, remote_function
+    from .infra import get_device_placement, get_mode, initialize, remote_class, remote_function
     from .infra import remote_map as _remote_map
 
     def remote_map(*args, **kwargs):
@@ -44,7 +44,7 @@ else:
             'framework_util', 'torch_util', 'exists', 'requires', 'Platform', 'GPU', 'NPU', 'find_node_ip',
             'find_free_port', 'trust_remote_code', 'check_unsafe', 'DeviceMesh', 'Plugin', 'DeviceGroup', 'get_logger'
         ],
-        'infra': ['initialize', 'remote_class', 'remote_function', 'remote_map', 'get_device_placement', 'get_mode', 'is_master'],
+        'infra': ['initialize', 'remote_class', 'remote_function', 'remote_map', 'get_device_placement', 'get_mode'],
     }
 
     import sys

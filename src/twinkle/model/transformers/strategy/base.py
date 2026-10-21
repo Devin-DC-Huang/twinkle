@@ -30,8 +30,39 @@ would take ``MegatronStrategy`` itself as the reference face.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+import os
 from typing import Any, Dict, Optional
+
+# Env flags transformers/accelerate read to pick their FSDP-aware loading path (rank0 load,
+# meta-device placement, no full CPU materialization per rank).
+_FSDP_EFFICIENT_LOADING_ENV = {
+    'ACCELERATE_USE_FSDP': 'true',
+    'FSDP_CPU_RAM_EFFICIENT_LOADING': 'true',
+}
+
+
+@contextmanager
+def fsdp_pretrained_load_context(enabled: bool):
+    """Enable the env flags required for transformers FSDP-aware loading when needed.
+
+    A load-scoped transaction: the flags are restored (or popped) even when loading raises,
+    so later imports in the same process never mistake themselves for FSDP-aware loaders.
+    """
+    if not enabled:
+        yield
+        return
+
+    saved_env = {key: os.environ.get(key) for key in _FSDP_EFFICIENT_LOADING_ENV}
+    os.environ.update(_FSDP_EFFICIENT_LOADING_ENV)
+    try:
+        yield
+    finally:
+        for key, old_val in saved_env.items():
+            if old_val is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old_val
 
 
 class TransformerStrategyBase(ABC):

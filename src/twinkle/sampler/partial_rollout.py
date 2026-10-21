@@ -195,14 +195,14 @@ class PartialRolloutMixin:
         self._generation_paused = False
         self._generation_resume_gate.set()
 
-    @remote_function(dispatch='all', collect='none', lazy_collect=False)
+    @remote_function(dispatch='all', collect='none', lazy_collect=False, exclusive=True)
     @timed
     def pause_generation(self) -> dict[str, int]:
         """Stop decode at a resumable barrier before a shared sampler releases its GPUs."""
         future = asyncio.run_coroutine_threadsafe(self._pause_generation(), self._async_loop)
         return {'aborted': future.result()}
 
-    @remote_function(dispatch='all', collect='none', lazy_collect=False)
+    @remote_function(dispatch='all', collect='none', lazy_collect=False, exclusive=True)
     def resume_generation(self) -> None:
         """Release requests paused by :meth:`pause_generation`; idempotent."""
         future = asyncio.run_coroutine_threadsafe(self._resume_generation(), self._async_loop)

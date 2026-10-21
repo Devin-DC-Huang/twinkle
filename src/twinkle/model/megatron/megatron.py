@@ -372,9 +372,10 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
         return self._mtp.pop(loss_scale)
 
 
-    # lazy_collect=False: forward_only must hand its outputs back to the caller as a materialized
-    # dict; sync=True orders the workers but does not materialize the result.
-    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict, sync=True, lazy_collect=False)
+    # sync=True orders the workers for PP's NCCL collectives; lazy_collect follows the global default
+    # (True) so the return keeps the Future protocol. Note the sync collect itself still materializes
+    # on the calling side -- the handle is a value wrapper there, resolved like any other.
+    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict, sync=True)
     @timed
     def forward_only(self,
                      *,

@@ -137,7 +137,7 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, P
         """Create the engine on the background loop, which sglang then binds its handle loop to."""
         return engine_cls(model_id=model_id, **engine_kwargs)
 
-    @remote_function(dispatch='all', collect='first', lazy_collect=False)
+    @remote_function(dispatch='all', collect='first', lazy_collect=False, exclusive=True, replay=True)
     def apply_patch(self, patch_cls: Union[Patch, Type[Patch], str], **kwargs) -> None:
         apply_patch(self, patch_cls, **kwargs)
 
@@ -362,7 +362,12 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, P
             registered = await self._aregister_lora(adapter_path, adapter_name)
             lora_names = [registered or (adapter_name or None)] * len(encoded_inputs)
 
-        async def _generate_one(feat, image_data, lora_name):
+        # ``request_id`` is the caller-side handle for async control (submit/pause/stop): taken from
+        # the raw inputs before encoding (the encoder does not carry it) and handed to the engine as
+        # the request id, so an abort can address this exact generation.
+        request_ids = [input.get('request_id') for input in inputs_list]
+
+        async def _generate_one(feat, image_data, lora_name, request_id):
             if not allow_partial_rollout:
                 return await self._sample_single(
                     feat,
@@ -370,6 +375,7 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, P
                     image_data=image_data,
                     lora_name=lora_name,
                     logprobs_only=logprobs_only,
+                    request_id=request_id,
                 )
 
             # Partial rollout: one generation attempt is a plain _sample_single; the resume/merge loop
@@ -382,6 +388,7 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, P
                     image_data=image_data,
                     lora_name=lora_name,
                     logprobs_only=logprobs_only,
+                    request_id=request_id,
                 )
                 return response, None
 
@@ -396,8 +403,9 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, P
             return outcome.response
 
         return await self._gather_generation_tasks(
-            _generate_one(feat, image_data, lora_name)
-            for feat, image_data, lora_name in zip(encoded_inputs, image_data_list, lora_names))
+            _generate_one(feat, image_data, lora_name, request_id)
+            for feat, image_data, lora_name, request_id in
+            zip(encoded_inputs, image_data_list, lora_names, request_ids))
 
     async def _encode_single(
         self,
@@ -595,7 +603,7 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, P
     def reset_prefix_cache(self):
         self._run_in_loop(self.engine.reset_prefix_cache())
 
-    @remote_function(dispatch='all', lazy_collect=True)
+    @remote_function(dispatch='all', lazy_collect=True, exclusive=True)
     @timed
     def receive_weights(
         self,

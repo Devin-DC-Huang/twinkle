@@ -82,10 +82,6 @@ def _merge_config(config: dict[str, Any] | None) -> ExpertParallelConfig:
     return cfg
 
 
-def find_moe_blocks(model: nn.Module) -> Iterable[nn.Module]:
-    return [block for _, block in find_moe_blocks_with_names(model)]
-
-
 def find_moe_blocks_with_names(model: nn.Module) -> Iterable[tuple[str, nn.Module]]:
     blocks = []
     for name, module in model.named_modules():

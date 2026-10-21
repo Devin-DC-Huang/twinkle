@@ -34,8 +34,9 @@ Control-plane mapping (the load-bearing design decision):
   driver could deadlock with a buffer too shallow to assemble a batch while admission is capped.
 
 Injected seams (the external contract a consumer wires up; the driver knows no algorithm). The four
-engine seams (submit/poll/collect/cancel) may instead be omitted together with a ``rollout`` object
-exposing ``admit``/``poll``/``collect``/``cancel``, which default-binds them (an explicit seam wins):
+engine seams (submit/poll/collect) may instead be omitted together with a ``rollout`` object
+exposing ``admit``/``poll``/``collect``, which default-binds them (an explicit seam wins); teardown
+ending is not a seam and always goes through the rollout's ``stop``:
 
 * ``submit(prompt, trajectory_idx, policy) -> handle``: admit ONE trajectory without blocking, pinned to
   ``policy`` (its ``adapter_path`` travels with the submission under snapshot publication; ``None`` under
@@ -86,7 +87,8 @@ exposing ``admit``/``poll``/``collect``/``cancel``, which default-binds them (an
 * ``baseline_fn(group_key, samples) -> Optional[float]`` (optional): the remax-style group baseline --
   its return value is written onto every sample in the group (``sample.baseline``). ``None`` (default):
   no baseline is written.
-* ``cancel(handle)``: drop an in-flight generation (budget hit, drain, or error).
+* ``stop(request_id)``: end an in-flight generation (budget hit, drain, or error) -- abort and
+  settle, so the engine work actually stops rather than burning on unreferenced.
 * ``score_worker`` (OPTIONAL collaborator, not a callable): when given, the kernel runs BOTH scoring
   channels itself at the group barrier -- ``score_group(samples)`` whose sample-major rows are written
   onto the samples (and timed into ``stats.score_time``), or the single ``score_group_prm(samples)``
@@ -129,7 +131,7 @@ Drain: when the prompt stream is exhausted, admission stops, in-flight generatio
 completion (blocking via ``sleep`` between polls), the consumer keeps training the ready buffer until
 ``assembly_ready`` declines, and then whatever remains (an incomplete group, or a remainder below one
 full batch) is dropped and counted -- there is no future batch to carry it into. Every window still
-live is cleared. A budget hit (``reached_max``) or an error instead cancels every STILL-in-flight
+live is cleared. A budget hit (``reached_max``) or an error instead ends every STILL-in-flight
 submission (releasing its pin), and clears every window in the ``finally``, leaking nothing.
 """
 
@@ -420,7 +422,6 @@ class StreamingDriver:
                  poll: Optional[Callable[[Sequence[Any]], Sequence[Any]]] = None,
                  collect: Optional[Callable[[Any], Any]] = None,
                  assembly_ready: Optional[Callable[[List[BufferRecord]], Optional[List[BufferRecord]]]] = None,
-                 cancel: Optional[Callable[[Any], None]] = None,
                  rollout: Optional[Any] = None,
                  pull_rule: Optional[Literal['group', 'prefix']] = None,
                  need_rows: Optional[int] = None,
@@ -462,8 +463,10 @@ class StreamingDriver:
             if fn is not None and not callable(fn):
                 raise TypeError(f'StreamingDriver optional seam {name!r} must be callable or None, '
                                 f'got {type(fn).__name__}')
-        # The four engine seams default-bind to ``rollout`` (admit/poll/collect/cancel) when omitted;
+        # The four engine seams default-bind to ``rollout`` (admit/poll/collect) when omitted;
         # an explicitly injected seam overrides its default, so dev's hand-wired builders keep working.
+        # Teardown ending is NOT a seam: it always goes through the rollout's stop (abort + settle),
+        # so the engine work behind an uncollected handle is actually ended, not just dereferenced.
         self._rollout = rollout
         if submit is None and rollout is not None:
             submit = self._default_submit
@@ -471,8 +474,6 @@ class StreamingDriver:
             poll = rollout.poll
         if collect is None and rollout is not None:
             collect = self._default_collect
-        if cancel is None and rollout is not None:
-            cancel = rollout.cancel
         # The pull rule is the same kind of defaulted knob: 'group' waits for whole num_generations
         # groups and re-emits them contiguous, 'prefix' takes a whole-unit multiple of the buffer front.
         # An explicit assembly_ready callable overrides either built-in.
@@ -506,7 +507,7 @@ class StreamingDriver:
                 raise TypeError(f'StreamingDriver resource_adapter needs observe/decide/register_decision '
                                 f'methods, {type(resource_adapter).__name__} lacks {missing}')
         for name, fn in (('submit', submit), ('poll', poll), ('collect', collect),
-                         ('assembly_ready', assembly_ready), ('cancel', cancel)):
+                         ('assembly_ready', assembly_ready)):
             if not callable(fn):
                 raise TypeError(f'StreamingDriver seam {name!r} must be callable, got {type(fn).__name__} '
                                 f'-- inject it explicitly or pass a rollout to default-bind it')
@@ -581,7 +582,6 @@ class StreamingDriver:
         self._collect = collect
         self._assembly_ready = assembly_ready
         self._consume = consume
-        self._cancel = cancel
         self._score = score
         self._assemble = assemble
         self._group_complete = group_complete
@@ -767,7 +767,7 @@ class StreamingDriver:
         Exits when the budget (``reached_max``) is hit, or one pass after the prompt stream is
         exhausted, the in-flight set has drained and ``assembly_ready`` declines the remaining buffer
         (the leftover -- an incomplete group or a sub-batch remainder -- is dropped in the ``finally``,
-        counted as ``stats.dropped_incomplete``). The ``finally`` also cancels and unpins whatever is
+        counted as ``stats.dropped_incomplete``). The ``finally`` also ends (stop) and unpins whatever is
         still generating and clears every live window, so a budget hit or an error leaks neither a pin
         nor a sampler submission nor a partition.
         """
@@ -1023,11 +1023,14 @@ class StreamingDriver:
                     self._sleep(0.01)
                     self.stats.idle_time += time.perf_counter() - _t
         finally:
-            # Budget hit, drained, or an error: cancel and unpin everything STILL generating (uncollected
+            # Budget hit, drained, or an error: end and unpin everything STILL generating (uncollected
             # handles -- a collected one already released its pin at collect), drop the unusable buffer
-            # remainder, and clear every live window so the control plane ends empty.
+            # remainder, and clear every live window so the control plane ends empty. stop (abort +
+            # settle) actually ends the engine work instead of merely dropping the reference, so no
+            # generation keeps burning sampler GPU past the driver's lifetime.
             for handle, (_, policy, _) in list(handles.items()):
-                self._cancel(handle)
+                if self._rollout is not None:
+                    self._rollout.stop(handle.submission_id)
                 self._ledger.release(policy)
             handles.clear()
             # Buffered records were collected, so their pins are already released; only count the drop.

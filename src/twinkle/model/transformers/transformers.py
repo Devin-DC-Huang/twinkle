@@ -38,7 +38,6 @@ from twinkle.model.base import ModelLoaderProtocol, TrainableModel, copy_checkpo
 from twinkle.model.state_dict_utils import normalize_adapter_keys
 from twinkle.model.micro_batch import MicroBatchConfig, plan_micro_batches, select_batch
 from twinkle.model.optimizer_group import BaseOptimizerGroup, TrainStatus
-from twinkle.model.transformers import feature_hooks
 from twinkle.model.transformers.moe import apply_expert_parallel
 from twinkle.model.transformers.strategy import AccelerateStrategy, DeepSpeedStrategy, NativeFSDPStrategy
 from twinkle.module.optimizer import (GaLoreConfig, MuonConfig, apply_param_groups_spec, create_galore_param_groups,
@@ -380,7 +379,9 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         if model_id is not None:
             model_id = HubOperation.download_model(model_id, revision=kwargs.get('revision'))
         self.model_id = model_id
-        self.tokenizer_id = kwargs.get('tokenizer_id', self.model_id)
+        # pop: tokenizer_id is not a from_pretrained argument, so it must not leak into the model
+        # construction kwargs below.
+        self.tokenizer_id = kwargs.pop('tokenizer_id', self.model_id)
         if config is not None:
             self.hf_config = config
         elif model_loader is not None and model_id is not None:
@@ -468,21 +469,61 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         self.optimizer_group[_default_adapter_name].adapter_name = _default_adapter_name
         self.active_group = _default_adapter_name
 
-    # Optional-feature thin shells over twinkle.model.transformers.feature_hooks; the
+    # Optional training features (NEFTune noise, Liger kernels) applied to the constructed model;
     # same-named methods stay so subclasses can override them.
 
     def _activate_neftune(self, neftune_noise_alpha: float) -> None:
-        """See :func:`feature_hooks.activate_neftune`."""
-        feature_hooks.activate_neftune(self.model, neftune_noise_alpha)
+        """Add NEFTune uniform noise to the embedding output during training only.
+
+        Mirrors ``transformers.integrations.neftune.neftune_post_forward_hook``: scale is
+        ``alpha / sqrt(seq_len * hidden)`` and the hook is a no-op in eval mode, so
+        validation and generation see clean embeddings. Registered on the input-embedding
+        module object, which a later LoRA/DDP wrap preserves.
+        """
+        embeddings = self.model.get_input_embeddings()
+        if embeddings is None:
+            logger.warning('neftune_noise_alpha is set but the model exposes no input embeddings; '
+                           'skipping NEFTune.')
+            return
+
+        def neftune_post_forward_hook(module, input, output):
+            if not module.training:
+                return output
+            dims = torch.tensor(output.size(1) * output.size(2))
+            mag_norm = neftune_noise_alpha / torch.sqrt(dims)
+            return output + torch.zeros_like(output).uniform_(-mag_norm, mag_norm)
+
+        embeddings.register_forward_hook(neftune_post_forward_hook)
 
     def _apply_liger_kernel(self, liger_kernel_config: Optional[Dict[str, Any]] = None) -> None:
-        """See :func:`feature_hooks.apply_liger_kernel`."""
-        feature_hooks.apply_liger_kernel(self.model, liger_kernel_config)
+        """Patch the HF module's per-layer ops with Liger kernels via the mapping-driven ``kernelize``.
+
+        ``liger_kernel_config`` (an ``{op: bool}`` dict) switches individual ops off on top of
+        Liger's default set; None keeps the default. ``kernelize`` mutates the module in place
+        (class / forward replacement), which is why it belongs at the end of construction,
+        before the optimizer is built.
+        """
+        from twinkle.kernel import kernelize
+        kernelize(self.model, self._liger_kernel_mapping(liger_kernel_config))
 
     @staticmethod
     def _liger_kernel_mapping(liger_kernel_config: Optional[Dict[str, Any]]) -> Optional[dict]:
-        """See :func:`feature_hooks.liger_kernel_mapping`."""
-        return feature_hooks.liger_kernel_mapping(liger_kernel_config)
+        """DEFAULT_KERNEL_CONFIG minus any op the config switches off; None keeps the built-in default.
+
+        Returning None rather than a copy of the default matters: ``kernelize`` logs
+        family-skips at DEBUG on the default path but raises them to WARNING for any explicit
+        mapping. 'fused_linear_cross_entropy' is not a kernelize op, so it matches no
+        DEFAULT_KERNEL_CONFIG entry and is ignored here (the loss side consumes it instead).
+        """
+        if not liger_kernel_config:
+            return None
+        from twinkle.kernel.config import DEFAULT_KERNEL_CONFIG
+        disabled = {op for op, enabled in liger_kernel_config.items() if not enabled}
+        return {
+            target: choice
+            for target, choice in DEFAULT_KERNEL_CONFIG.items()
+            if getattr(choice, 'op', None) not in disabled
+        }
 
     def _apply_new_special_tokens(self, new_special_tokens: List[str]) -> None:
         """Grow the tokenizer's vocabulary with ``new_special_tokens`` and resize the embeddings to match.
@@ -778,6 +819,74 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             acc_strategy=self._acc_strategy,
         )
 
+    def _restore_loss_inputs(self, inputs, labels, loss_scale=None, channel=None, completion_mask=None):
+        """Put the loss-related tensors popped before the model call back onto ``inputs``."""
+        inputs['labels'] = labels
+        if loss_scale is not None:
+            inputs['loss_scale'] = loss_scale
+        if channel is not None:
+            inputs['channel'] = channel
+        if completion_mask is not None:
+            inputs['completion_mask'] = completion_mask
+
+    def _postprocess_forward_outputs(self, outputs, *, labels, task, temperature, sampling_masks, return_logits,
+                                     loss_instance, replay=None):
+        """Shared forward/forward_only tail: derive logps/entropy/values, then reclaim logits memory.
+
+        ``replay`` is the ``(loss_mask, masked_labels, metadata)`` tuple from ``_prepare_sampling_replay``
+        when sampling replay is enabled.
+        """
+        loss_require_logits = getattr(loss_instance, 'require_logits', False)
+        loss_require_entropy = getattr(loss_instance, 'require_entropy', False)
+        loss_require_logps = getattr(loss_instance, 'require_logps', True)
+        if task not in _NON_LOGPS_TASKS and labels is not None and loss_require_logps:
+            if replay is not None:
+                loss_mask, masked_labels, replay_metadata = replay
+                outputs['logps'] = replayed_selective_log_softmax(
+                    logits=outputs['logits'],
+                    labels=masked_labels,
+                    loss_mask=loss_mask,
+                    sampling_masks=sampling_masks,
+                    temperature=temperature,
+                    metadata=replay_metadata,
+                )
+            else:
+                loss_mask = (labels != -100).bool()
+                masked_labels = labels.masked_fill(~loss_mask, 0)
+                logits = outputs['logits']
+                logits.div_(temperature)
+                if loss_require_entropy:
+                    outputs['logps'], outputs['entropies'] = selective_log_softmax(
+                        logits, masked_labels, return_entropy=True)
+                else:
+                    outputs['logps'] = selective_log_softmax(logits, masked_labels)
+                del logits
+        if getattr(loss_instance, 'require_values', False):
+            values = outputs['logits']
+            outputs['values'] = values.squeeze(-1) if values.shape[-1] == 1 else values
+        outputs['past_key_values'] = None
+        if not (return_logits or loss_require_logits):
+            outputs['logits'] = None
+
+    def _finalize_forward_outputs(self, inputs, outputs, *, processor, task, optimizer_config, is_training,
+                                  forward_kwargs, loss_instance, return_logits, recorded_routing):
+        """Shared forward/forward_only tail: SP postprocess, unpack, status recording, and the return copy."""
+        inputs, outputs = processor.postprocess_tensor_sp(inputs, outputs, sp_strategy=self.sp_strategy, task=task)
+        inputs, outputs = processor.unpack_packed_sequences(inputs, outputs, task=task)
+        status = optimizer_config.train_status if is_training else optimizer_config.eval_status
+        status.inputs = inputs
+        status.outputs = outputs
+        status.forward_kwargs = forward_kwargs
+        if is_training:
+            status.loss_reduction = getattr(loss_instance, 'reduction', 'mean')
+        status.loss_value = outputs.get('aux_loss', 0)
+        return_outputs = copy(outputs)
+        if not return_logits:
+            return_outputs['logits'] = None
+        if recorded_routing is not None:
+            return_outputs['routed_experts'] = recorded_routing
+        return return_outputs
+
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
     def forward(self, *, inputs: Union[InputFeature, List[InputFeature], List[Trajectory]], **kwargs):
         """Call forward function and record the inputs and outputs.
@@ -810,9 +919,6 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             inputs = optimizer_config.template.batch_encode(inputs)  # noqa
         processor: InputProcessor = optimizer_config.processor
         loss_instance = optimizer_config.get_loss(loss_key)
-        loss_require_logits = getattr(loss_instance, 'require_logits', False)
-        loss_require_entropy = getattr(loss_instance, 'require_entropy', False)
-        loss_require_logps = getattr(loss_instance, 'require_logps', True)
         enable_sampling_replay = getattr(loss_instance, 'enable_sampling_replay', False)
         if enable_sampling_replay:
             if sampling_masks is None:
@@ -820,7 +926,6 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             cp_world_size = self.device_mesh.cp_world_size if self.device_mesh is not None else 1
             if getattr(self, '_enable_sp', False) or cp_world_size > 1:
                 raise ValueError('sampling replay does not support sequence or context parallelism')
-        loss_require_values = getattr(loss_instance, 'require_values', False)
         assert isinstance(processor, InputProcessor), 'Set a correct `InputProcessor` before forwarding'
         inputs: Dict[str, Any] = processor(
             inputs,
@@ -871,59 +976,34 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
 
         recorded_routing = rr.finish()
 
-        inputs['labels'] = labels
-        if loss_scale is not None:
-            inputs['loss_scale'] = loss_scale
-        if channel is not None:
-            inputs['channel'] = channel
-        if completion_mask is not None:
-            inputs['completion_mask'] = completion_mask
-        if task not in _NON_LOGPS_TASKS and labels is not None and loss_require_logps:
-            loss_mask = replay_loss_mask if enable_sampling_replay else (labels != -100).bool()
-            masked_labels = replay_masked_labels if enable_sampling_replay else labels.masked_fill(~loss_mask, 0)
-            logits = outputs['logits']
-            if enable_sampling_replay:
-                outputs['logps'] = replayed_selective_log_softmax(
-                    logits=logits,
-                    labels=masked_labels,
-                    loss_mask=loss_mask,
-                    sampling_masks=sampling_masks,
-                    temperature=temperature,
-                    metadata=replay_metadata,
-                )
-            elif loss_require_entropy:
-                logits.div_(temperature)
-                outputs['logps'], outputs['entropies'] = selective_log_softmax(
-                    logits, masked_labels, return_entropy=True)
-            else:
-                logits.div_(temperature)
-                outputs['logps'] = selective_log_softmax(logits, masked_labels)
-            del logits
-        if loss_require_values:
-            values = outputs['logits']
-            outputs['values'] = values.squeeze(-1) if values.shape[-1] == 1 else values
-        outputs['past_key_values'] = None
-        if not (return_logits or loss_require_logits):
-            outputs['logits'] = None
-        inputs, outputs = processor.postprocess_tensor_sp(inputs, outputs, sp_strategy=self.sp_strategy, task=task)
-        inputs, outputs = processor.unpack_packed_sequences(inputs, outputs, task=task)
-        optimizer_config.train_status.inputs = inputs
-        optimizer_config.train_status.outputs = outputs
-        optimizer_config.train_status.forward_kwargs = {**kwargs, '_metric_loss_key': loss_key}
-        optimizer_config.train_status.loss_reduction = getattr(loss_instance, 'reduction', 'mean')
-        optimizer_config.train_status.loss_value = outputs.get('aux_loss', 0)
-        return_outputs = copy(outputs)
-        if not return_logits:
-            return_outputs['logits'] = None
-        if recorded_routing is not None:
-            return_outputs['routed_experts'] = recorded_routing
-        return return_outputs
+        self._restore_loss_inputs(inputs, labels, loss_scale, channel, completion_mask)
+        self._postprocess_forward_outputs(
+            outputs,
+            labels=labels,
+            task=task,
+            temperature=temperature,
+            sampling_masks=sampling_masks,
+            return_logits=return_logits,
+            loss_instance=loss_instance,
+            replay=(replay_loss_mask, replay_masked_labels, replay_metadata) if enable_sampling_replay else None,
+        )
+        return self._finalize_forward_outputs(
+            inputs,
+            outputs,
+            processor=processor,
+            task=task,
+            optimizer_config=optimizer_config,
+            is_training=True,
+            forward_kwargs={**kwargs, '_metric_loss_key': loss_key},
+            loss_instance=loss_instance,
+            return_logits=return_logits,
+            recorded_routing=recorded_routing,
+        )
 
-    # lazy_collect=False: forward_only exists to hand its outputs back to the caller, so the driver must
-    # receive the materialized dict. The lazy default returns an un-collected callable instead, which a
-    # driver reading ``out['logps']``/``out['logits']`` (reference/teacher/reward/critic scoring) would
-    # silently mis-read as "no such key". Mirrors calculate_metric, the other return-value method.
-    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict, lazy_collect=False)
+    # lazy_collect follows the global default (True): a caller that reads the output itself calls
+    # ``.result()`` first, while a ref-only pipeline hands the handle straight to a downstream remote
+    # call, which resolves and collects it where the data is consumed (see ``LazyCollect``).
+    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
     @timed
     def forward_only(self, *, inputs: Union[InputFeature, List[InputFeature], List[Trajectory]], **kwargs):
         """Call forward function without grad and record the inputs and outputs.
@@ -943,6 +1023,13 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         return_logits = kwargs.pop('return_logits', False)
         task = kwargs.pop('task', 'causal_lm')
         loss_key = kwargs.pop('loss_key', None)
+        # Megatron's forward_only schedules by a fixed ``micro_batch_size`` (its 1F1B pipeline); this
+        # backend's no-grad forward runs the whole batch at once, so the knob has no effect here --
+        # say so instead of silently dropping it.
+        micro_batch_size = kwargs.pop('micro_batch_size', None)
+        if micro_batch_size is not None:
+            logger.warning('micro_batch_size is a Megatron-only forward_only knob; the transformers '
+                           'backend runs the whole batch and ignores it.')
         # Accepted for backend parity with Megatron's empty-loss probe entry (``compute_loss=False``). This
         # forward_only derives logps via selective_log_softmax and never calls the loss, so there is nothing
         # to skip here; popped so it does not linger in eval_status.forward_kwargs.
@@ -964,9 +1051,6 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             processor: InputProcessor = optimizer_config.processor
             assert isinstance(processor, InputProcessor), 'Set InputProcessor correctly before forwarding'
             loss_instance = optimizer_config.get_loss(loss_key)
-            loss_require_logits = getattr(loss_instance, 'require_logits', False)
-            loss_require_entropy = getattr(loss_instance, 'require_entropy', False)
-            loss_require_logps = getattr(loss_instance, 'require_logps', True)
             enable_sampling_replay = getattr(loss_instance, 'enable_sampling_replay', False)
             if enable_sampling_replay:
                 if sampling_masks is None:
@@ -974,7 +1058,6 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
                 cp_world_size = self.device_mesh.cp_world_size if self.device_mesh is not None else 1
                 if getattr(self, '_enable_sp', False) or cp_world_size > 1:
                     raise ValueError('sampling replay does not support sequence or context parallelism')
-            loss_require_values = getattr(loss_instance, 'require_values', False)
             inputs: Dict[str, Any] = processor(
                 inputs,
                 sp_strategy=self.sp_strategy,
@@ -1023,52 +1106,29 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
 
             recorded_routing = rr.finish()
 
-            inputs['labels'] = labels
-            if loss_scale is not None:
-                inputs['loss_scale'] = loss_scale
-            if channel is not None:
-                inputs['channel'] = channel
-            if completion_mask is not None:
-                inputs['completion_mask'] = completion_mask
-            if task not in _NON_LOGPS_TASKS and labels is not None and loss_require_logps:
-                loss_mask = replay_loss_mask if enable_sampling_replay else (labels != -100).bool()
-                masked_labels = replay_masked_labels if enable_sampling_replay else labels.masked_fill(~loss_mask, 0)
-                logits = outputs['logits']
-                if enable_sampling_replay:
-                    outputs['logps'] = replayed_selective_log_softmax(
-                        logits=logits,
-                        labels=masked_labels,
-                        loss_mask=loss_mask,
-                        sampling_masks=sampling_masks,
-                        temperature=temperature,
-                        metadata=replay_metadata,
-                    )
-                elif loss_require_entropy:
-                    logits.div_(temperature)
-                    outputs['logps'], outputs['entropies'] = selective_log_softmax(
-                        logits, masked_labels, return_entropy=True)
-                else:
-                    logits.div_(temperature)
-                    outputs['logps'] = selective_log_softmax(logits, masked_labels)
-                del logits
-            if loss_require_values:
-                values = outputs['logits']
-                outputs['values'] = values.squeeze(-1) if values.shape[-1] == 1 else values
-            outputs['past_key_values'] = None
-            if not (return_logits or loss_require_logits):
-                outputs['logits'] = None
-            inputs, outputs = processor.postprocess_tensor_sp(inputs, outputs, sp_strategy=self.sp_strategy, task=task)
-            inputs, outputs = processor.unpack_packed_sequences(inputs, outputs, task=task)
-            optimizer_config.eval_status.inputs = inputs
-            optimizer_config.eval_status.outputs = outputs
-            optimizer_config.eval_status.forward_kwargs = {**kwargs, '_metric_loss_key': loss_key}
-            optimizer_config.eval_status.loss_value = outputs.get('aux_loss', 0)
-            return_outputs = copy(outputs)
-            if not return_logits:
-                return_outputs['logits'] = None
-            if recorded_routing is not None:
-                return_outputs['routed_experts'] = recorded_routing
-            return return_outputs
+            self._restore_loss_inputs(inputs, labels, loss_scale, channel, completion_mask)
+            self._postprocess_forward_outputs(
+                outputs,
+                labels=labels,
+                task=task,
+                temperature=temperature,
+                sampling_masks=sampling_masks,
+                return_logits=return_logits,
+                loss_instance=loss_instance,
+                replay=(replay_loss_mask, replay_masked_labels, replay_metadata) if enable_sampling_replay else None,
+            )
+            return self._finalize_forward_outputs(
+                inputs,
+                outputs,
+                processor=processor,
+                task=task,
+                optimizer_config=optimizer_config,
+                is_training=False,
+                forward_kwargs={**kwargs, '_metric_loss_key': loss_key},
+                loss_instance=loss_instance,
+                return_logits=return_logits,
+                recorded_routing=recorded_routing,
+            )
 
     @remote_function(dispatch='slice_dp', collect=collect_dp_and_flatten, lazy_collect=False)
     def generate(
@@ -1463,25 +1523,19 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
                 **kwargs,
             )
 
-        outputs = self.forward(
+        # loss_scale=1.0 makes the num_tokens/loss_value rescaling in the micro-batch body an identity,
+        # so it is exactly the old inline forward -> calculate_loss -> backward chain.
+        return self._forward_backward_micro_batch(
             inputs=inputs,
-            loss_key=loss_key,
-            router_replay_manual_cleanup=True,
-            **kwargs,
-        )
-        loss = self.calculate_loss(
+            optimizer_config=optimizer_config,
             loss_key=loss_key,
             loss_weight=loss_weight,
             global_normalizer=global_normalizer,
-            **kwargs,
-        )
-        outputs['loss'] = loss
-        self.backward(
-            increment_step=increment_step,
+            loss_scale=1.0,
             sync_gradients=sync_gradients,
+            increment_step=increment_step,
             **kwargs,
         )
-        return outputs
 
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
     @timed
@@ -1863,9 +1917,8 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
 
     def __del__(self):
         HubOperation.wait_for()
-        # Chain to AsyncSaveMixin.__del__: an unjoined in-flight async write at teardown
-        # would silently lose the checkpoint. TrainableModel defines no __del__, so this
-        # call lands on the mixin.
+        # Chain to TrainableModel.__del__: an unjoined in-flight async write at teardown
+        # would silently lose the checkpoint.
         super().__del__()
 
     # lazy_collect=False: save is a persistence side-effect the caller acts on immediately (it rotates
@@ -2366,7 +2419,10 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             else:
                 # post check: unwrapped_model must be already a peft model before wrapping ddp
                 assert isinstance(unwrapped_model, PeftModel)
-            config = _adapted_model.peft_config
+            # ``peft_config`` is a {adapter_name: PeftConfig} mapping; keep only this adapter's entry so
+            # ``OptimizerGroup.adapter_config`` is always a single PeftConfig.
+            peft_configs = _adapted_model.peft_config
+            config = peft_configs.get(adapter_name, None) or next(iter(peft_configs.values()))
         else:
             config = config_or_dir
             self._expand_multimodal_lora_target(
@@ -2595,8 +2651,11 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         expr = ''
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
+        # adapter_config is always a single PeftConfig (see _patch_adapter); to_dict covers both
+        # the from-scratch and the from-checkpoint load paths.
         if optimizer_config.adapter_config is not None:
-            config = optimizer_config.adapter_config.__dict__
+            config = optimizer_config.adapter_config
+            config = config.to_dict() if hasattr(config, 'to_dict') else dict(config)
         else:
             config = {}
         config = {key: str(value) for key, value in config.items() if value is not None}
@@ -2710,13 +2769,13 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         Used by paired EMA: the receiver holds the SAME shard layout (identical
         parallel_spec), so names and shapes match one-to-one without HF conversion.
         """
-        from twinkle.utils.torch_util import Torch
+        from twinkle.utils.framework import Torch
         model = self.strategy.unwrap_model(self.model)
         for name, tensor in model.state_dict().items():
             yield name, Torch.to_local_tensor(tensor)
 
     def _get_local_state_dict(self):
         """Return {name: param} for this rank's local shard (used by EMA receiver and naive sync)."""
-        from twinkle.utils.torch_util import Torch
+        from twinkle.utils.framework import Torch
         model = self.strategy.unwrap_model(self.model)
         return {name: Torch.to_local_tensor(tensor) for name, tensor in model.state_dict().items()}

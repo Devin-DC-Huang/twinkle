@@ -27,7 +27,7 @@ import asyncio
 import time
 import zlib
 from dataclasses import dataclass
-from concurrent.futures import CancelledError, Future, InvalidStateError
+from concurrent.futures import CancelledError, Future
 from typing import Any
 
 from twinkle import remote_function
@@ -97,82 +97,6 @@ class GenerationSubmissionMixin:
     ``_generate_inputs`` coroutine is the same ``Future`` bookkeeping regardless of the engine, so it is
     defined once here.
     """
-
-    def _submit_in_loop(self, coro, *, submission_id=None) -> Future:
-        if submission_id is None:
-            return asyncio.run_coroutine_threadsafe(coro, self._async_loop)
-
-        future = Future()
-
-        def completed(task):
-            self._running_generation_submissions.discard(submission_id)
-            if task.cancelled():
-                future.cancel()
-                return
-            error = task.exception()
-            try:
-                if error is None:
-                    future.set_result(task.result())
-                else:
-                    future.set_exception(error)
-            except InvalidStateError:
-                # Future 的取消可先于 Task 的清理完成；仍须取出 Task 的异常。
-                pass
-
-        async def schedule():
-            try:
-                task = self._async_loop.create_task(coro)
-            except BaseException:
-                coro.close()
-                raise
-            self._running_generation_submissions.add(submission_id)
-            task.add_done_callback(completed)
-
-            def cancel_task():
-                if not task.done() and not task.cancelling():
-                    task.cancel()
-
-            def cancellation_requested(result):
-                if result.cancelled() and not task.done():
-                    self._async_loop.call_soon_threadsafe(cancel_task)
-
-            future.add_done_callback(cancellation_requested)
-
-        scheduling = schedule()
-        try:
-            scheduled = asyncio.run_coroutine_threadsafe(scheduling, self._async_loop)
-        except BaseException:
-            scheduling.close()
-            coro.close()
-            raise
-        try:
-            scheduled.result()
-        except BaseException:
-            future.cancel()
-            raise
-        return future
-
-    @staticmethod
-    async def _gather_generation_tasks(coroutines):
-        """一个输入失败或取消后，等同批次的全部生成协程结束再释放 submission。"""
-        tasks = []
-        try:
-            for coroutine in coroutines:
-                tasks.append(asyncio.create_task(coroutine))
-            # 父任务取消不自动再次取消正在执行清理的子任务。
-            return await asyncio.shield(asyncio.gather(*tasks))
-        except BaseException:
-            for task in tasks:
-                if not task.done() and not task.cancelling():
-                    task.cancel()
-            cleanup = asyncio.gather(*tasks, return_exceptions=True)
-            while not cleanup.done():
-                try:
-                    await asyncio.shield(cleanup)
-                except asyncio.CancelledError:
-                    continue
-            cleanup.result()
-            raise
 
     def _check_generation_control(self):
         if getattr(self, '_admission_owned_elsewhere', False):

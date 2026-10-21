@@ -74,10 +74,13 @@ def _load_vllm_image(entry: Any) -> Any:
     return unwrapped
 
 
-_MAX_CONCURRENCY = max(1, int(os.environ.get('TWINKLE_SAMPLER_MAX_CONCURRENCY') or 24))
+#: The actor's method-concurrency ceiling (Ray runs a decorated actor's methods one at a time
+#: unless this is raised). Shared with the server-side async backend, which decorates its own
+#: actor with the same ceiling, hence the public name.
+SAMPLER_MAX_CONCURRENCY = max(1, int(os.environ.get('TWINKLE_SAMPLER_MAX_CONCURRENCY') or 24))
 
 
-@remote_class(max_concurrency=_MAX_CONCURRENCY)
+@remote_class(max_concurrency=SAMPLER_MAX_CONCURRENCY)
 class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, PartialRolloutMixin):
     """A vLLM-based sampler using VLLMEngine (AsyncLLM).
 
@@ -225,7 +228,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, Par
                 encoded[key] = encoded[key].tolist()
         return encoded
 
-    @remote_function(dispatch='all', collect='first', lazy_collect=False)
+    @remote_function(dispatch='all', collect='first', lazy_collect=False, exclusive=True, replay=True)
     def apply_patch(self, patch_cls: Union[Patch, Type[Patch], str], **kwargs) -> None:
         apply_patch(self, patch_cls, **kwargs)
 
@@ -516,7 +519,12 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, Par
         else:
             lora_requests = [await self._aload_lora(adapter_path)] * len(encoded_inputs)
 
-        async def _generate_one(feat, multi_modal_data, lora_request):
+        # ``request_id`` is the caller-side handle for async control (submit/pause/stop): taken from
+        # the raw inputs before encoding (the encoder does not carry it) and handed to the engine as
+        # the request id, so an abort can address this exact generation.
+        request_ids = [input.get('request_id') for input in inputs_list]
+
+        async def _generate_one(feat, multi_modal_data, lora_request, request_id):
             if not allow_partial_rollout:
                 return await self._sample_single(
                     feat,
@@ -526,6 +534,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, Par
                     logprobs_only=logprobs_only,
                     disable_lora=use_base_model,
                     token_only=token_only,
+                    request_id=request_id,
                 )
 
             # Partial rollout: one generation attempt is a plain _sample_single; the resume/merge loop
@@ -540,6 +549,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, Par
                     logprobs_only=logprobs_only,
                     disable_lora=use_base_model,
                     token_only=token_only,
+                    request_id=request_id,
                 )
                 return response, None
 
@@ -554,8 +564,9 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, Par
             return outcome.response
 
         return await self._gather_generation_tasks(
-            _generate_one(feat, multi_modal_data, lora_request) for feat, multi_modal_data, lora_request in
-            zip(encoded_inputs, multi_modal_data_list, lora_requests))
+            _generate_one(feat, multi_modal_data, lora_request, request_id)
+            for feat, multi_modal_data, lora_request, request_id in
+            zip(encoded_inputs, multi_modal_data_list, lora_requests, request_ids))
 
     async def _encode_single(
         self,
@@ -743,7 +754,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, Par
     def get_state_keys(self):
         return self._run_in_loop(self.engine.get_state_keys())
 
-    @remote_function(dispatch='all', lazy_collect=True)
+    @remote_function(dispatch='all', lazy_collect=True, exclusive=True)
     @timed
     def receive_weights(
         self,

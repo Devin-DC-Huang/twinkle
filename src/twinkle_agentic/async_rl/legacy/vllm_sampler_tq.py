@@ -20,7 +20,8 @@ from twinkle.sampler.vllm_sampler import vLLMSampler
 from .data_plane import TQDataPlane
 from .generation_submissions import GenerationSubmissionMixin
 from .metrics import rollout_metrics
-from .types import PromptGroup, RLContext, RolloutOutput, RolloutPolicy
+from twinkle_agentic.async_rl.legacy.types import PromptGroup, RolloutOutput
+from twinkle_agentic.async_rl.types import RLContext, RolloutPolicy
 from .utils import resolve_adapter_path, sample_responses_to_rollout_rows
 
 logger = get_logger()
