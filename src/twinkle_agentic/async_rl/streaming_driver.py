@@ -2,7 +2,9 @@
 """持续推进生成和评分；训练确认与权重发布不占用推进线程。"""
 from __future__ import annotations
 
+import asyncio
 import copy
+import inspect
 import math
 import queue
 import shutil
@@ -16,7 +18,6 @@ from dataclasses import dataclass, field, fields
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional
 
-from twinkle.infra import call, project
 from twinkle_agentic.rollout.multi_turn import RolloutSample
 from .score_worker import ScoreWorker
 from .types import PartitionAdmission, RolloutPolicy
@@ -79,7 +80,6 @@ class _Inflight:
     control: Any = None
     paused: Any = None
     state_check: Any = None
-    lease: Any = None
     released: bool = False
 
 
@@ -137,7 +137,7 @@ class StreamingDriver:
                  snapshot_model: Any = None, snapshot_dir: Optional[str] = None,
                  adapter_name: Optional[str] = None, max_steps: Optional[int] = None,
                  reached_max: Optional[Callable] = None, score_worker: Any = None,
-                 resource_adapter: Any = None, resource_pool: Any = None,
+                 resource_adapter: Any = None,
                  allow_partial_rollout: bool = False, sleep: Optional[Callable] = None):
         for name, value, minimum in (('max_staleness', max_staleness, 0),
                                      ('num_generations', num_generations, 1),
@@ -223,7 +223,6 @@ class StreamingDriver:
                 raise TypeError(f'score_worker 必须提供 {name}。')
         self._prm_ready = bool(self._worker.prm_ready())
         self._resource_adapter = resource_adapter
-        self._resource_pool = resource_pool
         self._allow_partial = allow_partial_rollout
         self._sleep = sleep or time.sleep
         self.stats = DriverStats()
@@ -262,11 +261,36 @@ class StreamingDriver:
         return value.result() if callable(getattr(value, 'result', None)) else value
 
     @staticmethod
+    def _project(value, *path):
+        """Future 协议对象按路径取数：可投影的保持投影，其余先解包再路径遍历。"""
+        if callable(getattr(value, 'select', None)):
+            return value.select(*path)
+        if callable(getattr(value, 'result', None)):
+            value = value.result()
+        for key in path:
+            value = value[key] if isinstance(value, (dict, list, tuple)) else getattr(value, key)
+        return value
+
+    def _spawn(self, function, *args, **kwargs):
+        """非阻塞发起控制调用：远程装饰方法立即返回句柄，本地调用提交控制线程池。"""
+        component = getattr(function, '__self__', None)
+        invoke = getattr(function, '_invoke', None)
+        if component is not None and invoke is not None and '_actors' in component.__dict__:
+            return invoke(component, args, kwargs, wait=False)
+
+        def _run():
+            result = function(*args, **kwargs)
+            if inspect.iscoroutine(result):
+                result = asyncio.run(result)
+            return result
+        return self._controls.submit(_run)
+
+    @staticmethod
     def _sample_view(payload):
         """本地值直接复用；远程样本的重字段维持同一 Future 投影。"""
         small = {'truncated', 'baseline', 'orm_reward', 'policy_version', 'version_span',
                  'prompt_id', 'group_key'}
-        values = {item.name: project(payload, item.name) for item in fields(RolloutSample)}
+        values = {item.name: StreamingDriver._project(payload, item.name) for item in fields(RolloutSample)}
         for name in small:
             values[name] = StreamingDriver._value(values[name])
         return RolloutSample(**values)
@@ -354,8 +378,6 @@ class StreamingDriver:
                 self._policy_pins.pop(path)
             else:
                 self._policy_pins[path] = count - 1
-        if entry.lease is not None:
-            self._resource_pool.release_lease(entry.lease)
         entry.released = True
 
     def _adapter_paths_to_keep(self):
@@ -440,8 +462,6 @@ class StreamingDriver:
                 if not callable(getattr(entry.future, 'done', None)) or not callable(getattr(entry.future, 'result', None)):
                     raise TypeError('业务 submit 必须返回统一 Future 协议对象。')
                 self._handles[entry.future] = entry
-                if self._resource_pool is not None:
-                    entry.lease = self._resource_pool.pin_association('submit', (trajectory,), {})
                 self.stats.submit_time += time.perf_counter() - started
                 self.stats.admitted += 1
             except BaseException:
@@ -472,7 +492,7 @@ class StreamingDriver:
             error = future.exception()
             if error is not None:
                 raise error
-            self._prepare(entry, project(future))
+            self._prepare(entry, self._project(future))
             self._handles.pop(future)
             progressed = True
         fresh = []
@@ -515,11 +535,11 @@ class StreamingDriver:
             error = outcome.exception()
             if error is not None:
                 raise error
-            sample = self._sample_view(project(outcome, 'samples', index))
+            sample = self._sample_view(self._project(outcome, 'samples', index))
             previous = record.sample
             for name in ('prompt_id', 'prompt', 'extra', 'group_key', 'policy_version', 'version_span'):
                 setattr(sample, name, getattr(previous, name))
-            sample.orm_reward = self._value(project(outcome, 'orm', index))
+            sample.orm_reward = self._value(self._project(outcome, 'orm', index))
             record.sample = sample
             record.score_ref = None
             progressed = True
@@ -598,7 +618,7 @@ class StreamingDriver:
                 self._resource_adapter.register_decision(decision, step=self.stats.optimizer_steps)
             if publication.partial:
                 for entry in self._handles.values():
-                    entry.control = call(self._pause, entry.trajectory, executor=self._controls)
+                    entry.control = self._spawn(self._pause, entry.trajectory)
             publication.phase = 'pausing' if publication.partial else 'draining'
         if publication.phase == 'pausing':
             for future, entry in tuple(self._handles.items()):
@@ -609,9 +629,9 @@ class StreamingDriver:
                 error = entry.control.exception() or future.exception()
                 if error is not None:
                     raise error
-                trajectory = project(entry.control)
+                trajectory = self._project(entry.control)
                 if entry.state_check is None:
-                    entry.state_check = call(self._worker.completion_state, trajectory, executor=self._controls)
+                    entry.state_check = self._spawn(self._worker.completion_state, trajectory)
                 if not entry.state_check.done():
                     return
                 status = entry.state_check.result()
@@ -764,7 +784,7 @@ class StreamingDriver:
 
     def _drain(self):
         errors = []
-        controls = [(entry, call(self._stop, entry.trajectory, executor=self._controls))
+        controls = [(entry, self._spawn(self._stop, entry.trajectory))
                     for entry in self._handles.values()]
         for entry, control in controls:
             try:
