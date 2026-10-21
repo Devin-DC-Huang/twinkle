@@ -5,10 +5,8 @@ import numpy as np
 import os
 import random
 import re
-import threading
 import time
 import torch
-from collections import OrderedDict
 import torch.distributed as dist
 import transformers
 from copy import copy, deepcopy
@@ -31,8 +29,7 @@ from twinkle.checkpoint_engine import CheckpointEngine
 from twinkle.checkpoint_engine.mixin import CheckpointEngineMixin
 from twinkle.checkpoint_engine.weight_keys import (add_base_layer_suffix, is_lora_key, normalize_param_name,
                                                    print_weight_example)
-from twinkle.data_format import (InputFeature, ModelOutput, SampleResponse, SamplingParams, Trajectory,
-                                 prepare_sampling_call, request_identity)
+from twinkle.data_format import InputFeature, ModelOutput, SampleResponse, SamplingParams, Trajectory
 from twinkle.hub import HubOperation
 from twinkle.infra import collect_dp_and_flatten, collect_tensor_dict
 from twinkle.loss import CrossEntropyLoss, Loss
@@ -470,10 +467,6 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         }
         self.optimizer_group[_default_adapter_name].adapter_name = _default_adapter_name
         self.active_group = _default_adapter_name
-        self._generation_lock = threading.RLock()
-        self._generation_model_lock = threading.RLock()
-        self._generation_engines = {}
-        self._generation_pre_stops = OrderedDict()
 
     # Optional-feature thin shells over twinkle.model.transformers.feature_hooks; the
     # same-named methods stay so subclasses can override them.
@@ -1077,8 +1070,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
                 return_outputs['routed_experts'] = recorded_routing
             return return_outputs
 
-    @remote_function(dispatch='slice_dp', collect=collect_dp_and_flatten, lazy_collect=False,
-                     prepare=prepare_sampling_call)
+    @remote_function(dispatch='slice_dp', collect=collect_dp_and_flatten, lazy_collect=False)
     def generate(
         self,
         inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
@@ -1090,10 +1082,6 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         use_base_model: bool = False,
         adapter_paths: Optional[List[Optional[str]]] = None,
         strict: bool = True,
-        token_only: bool = False,
-        request_ids: Optional[List[str]] = None,
-        stopped_mask: Optional[List[bool]] = None,
-        **generation_kwargs,
     ) -> List[SampleResponse]:
         """Generate completions on the weights this model already holds, inside its own workers.
 
@@ -1136,6 +1124,9 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         Returns:
             One ``SampleResponse`` per input, in input order, each holding ``num_samples`` sequences.
         """
+        # Deferred: the model package must not import the sampler package at module load (it would be a
+        # cycle), and both are only needed once generation is actually requested.
+        from twinkle.sampler import generation
         from twinkle.sampler.transformers_sampler.transformers_engine import TransformersEngine
 
         if adapter_path is not None or adapter_paths is not None:
@@ -1154,74 +1145,56 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         if template is None:
             raise ValueError('Set a template with set_template() before generate(): a Trajectory input '
                              'needs it to encode, and the engine needs its tokenizer to pad and decode.')
-        inputs_list = deepcopy([inputs] if isinstance(inputs, dict) else list(inputs))
+        inputs_list = [inputs] if isinstance(inputs, dict) else list(inputs)
         if not inputs_list:
             return []
-        if request_ids is None:
-            from twinkle.sampler.base import Sampler
-            request_ids = [Sampler._engine_request_id(request_identity(item), 0) for item in inputs_list]
-        if len(request_ids) != len(inputs_list):
-            raise ValueError('request_ids 与输入必须等长。')
-        if stopped_mask is not None and (len(stopped_mask) != len(inputs_list)
-                                         or any(type(value) is not bool for value in stopped_mask)):
-            raise ValueError('stopped_mask 必须为逐输入等长的 bool 列表。')
-        # 模型初始化可能执行 collective；不能占用控制状态锁。
-        with self._generation_model_lock:
-            self._lazy_wrap_model()
-            unwrapped_model = self.strategy.unwrap_model(self.model)
-            # FSDP 的 all-gather hooks 必须由实际持有权重的包装模型执行。
-            target = self.model if hasattr(self.model, 'generate') else unwrapped_model
-            with self._generation_lock:
-                engine = self._generation_engines.get(adapter_name)
-                if engine is None:
-                    engine = TransformersEngine(self.tokenizer_id, model=target, tokenizer=template.tokenizer)
-                    engine._model_lock = self._generation_model_lock
-                    self._generation_engines[adapter_name] = engine
-                engine.model = target
-                engine.tokenizer = template.tokenizer
-                stopped = [rid for index, rid in enumerate(request_ids)
-                           if (stopped_mask is not None and stopped_mask[index])
-                           or rid in self._generation_pre_stops]
-                engine.register_requests(request_ids, stopped=stopped)
-                for rid in request_ids:
-                    self._generation_pre_stops.pop(rid, None)
-        return engine.generate_inputs(
-            inputs_list, sampling_params, adapter_name, template=template, strict=strict,
-            use_base_model=use_base_model, token_only=token_only, return_encoded=return_encoded,
-            request_ids=request_ids, registered=True, max_batch_size=_GENERATION_MAX_BATCH_SIZE,
-            **generation_kwargs)
+        if isinstance(sampling_params, dict):
+            params = SamplingParams.from_dict(sampling_params)
+        elif sampling_params is None:
+            params = SamplingParams()
+        else:
+            params = sampling_params
+        logprobs_only = params.max_tokens == 0
+        if logprobs_only:
+            params = copy(params)
+            params.max_tokens = 1
 
-    @remote_function(dispatch='all', collect='first', lazy_collect=False, control=True)
-    def pause_generation(self, request_ids: List[str]) -> None:
-        """cohort 内发出停止，等待已启动的本地生成；排队调用由 sampler Future 确认结束。"""
-        if any(not isinstance(rid, str) or not rid for rid in request_ids):
-            raise ValueError('request_ids 必须包含非空字符串。')
-        pending = []
-        with self._generation_lock:
-            now = time.monotonic()
-            for rid, created in tuple(self._generation_pre_stops.items()):
-                if now - created > 300:
-                    self._generation_pre_stops.pop(rid)
-            matched = set()
-            for engine in self._generation_engines.values():
-                with engine._request_lock:
-                    local_ids = [rid for rid in request_ids if rid in engine._requests]
-                if local_ids:
-                    engine.request_stop(local_ids)
-                    matched.update(local_ids)
-                    pending.append((engine, local_ids))
-            # 控制可先于普通执行抵达；跨 rank 广播的非本地请求只保留有界停止命令。
-            unmatched = set(request_ids) - matched
-            if len(set(self._generation_pre_stops) | unmatched) > 4096:
-                raise RuntimeError('模型排队停止命令容量已满。')
-            for rid in unmatched:
-                self._generation_pre_stops.setdefault(rid, now)
-        for engine, local_ids in pending:
-            engine.wait_requests(local_ids)
+        self._lazy_wrap_model()
+        self.model.eval()
+        unwrapped_model = self.strategy.unwrap_model(self.model)
+        # FSDP2 fully_shard is in place, so self.model still exposes .generate and its all-gather hooks
+        # must run -- generate on the wrapped model. A DDP/DeepSpeed wrapper has no .generate, so fall
+        # back to the unwrapped module (the wrapper only exists for gradient sync, irrelevant here).
+        generation_target = self.model if hasattr(self.model, 'generate') else unwrapped_model
+        engine = TransformersEngine(self.tokenizer_id, model=generation_target, tokenizer=template.tokenizer)
 
-    @remote_function(dispatch='all', collect='first', lazy_collect=False, control=True)
-    def stop_generation(self, request_ids: List[str]) -> None:
-        self.pause_generation(request_ids)
+        encoded, failures = generation.encode_all(template, inputs_list, logprobs_only=logprobs_only, strict=strict)
+        results: List[Optional[SampleResponse]] = [None] * len(inputs_list)
+        for index, response in failures.items():
+            results[index] = response
+        pending = [index for index in range(len(inputs_list)) if results[index] is None]
+
+        def call_batch(prompts, extra):
+            # The engine's synchronous core, driven inline: this worker has no event loop to keep
+            # responsive and Ray forbids asyncio.run, so there is nothing to gain from batch_sample's
+            # loop-and-thread hop (and its lock, which would be bound to the wrong loop).
+            return engine.generate_batch(
+                prompts, params, num_samples=params.num_samples, logprobs=params.logprobs is not None,
+                extra_model_inputs=extra or None)
+
+        lora_ctx = (unwrapped_model.disable_adapter()
+                    if use_base_model and isinstance(unwrapped_model, PeftModel) else contextlib.nullcontext())
+        with lora_ctx:
+            for chunk in generation.chunks(pending, _GENERATION_MAX_BATCH_SIZE):
+                for index, response in zip(
+                        chunk, generation.run_chunk(chunk, encoded, params, template, call_batch, strict=strict)):
+                    results[index] = response
+
+        if not logprobs_only:
+            generation.attach_features(template, results, encoded)
+        return [
+            r if r is not None else generation.error_response(encoded.get(i, {})) for i, r in enumerate(results)
+        ]
 
     def generate_stream(self, *args, **kwargs):
         """Refuse streaming in-place generation rather than half-build it.
@@ -2336,7 +2309,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
     def get_state_dict(self, **kwargs):
         return self._get_trainable_parameters(kwargs.pop('adapter_name', self._get_default_group()))
 
-    @remote_function(collect='first', lazy_collect=False, exclusive=True)
+    @remote_function(collect='first', lazy_collect=False)
     def get_peft_config_dict(self, adapter_name: str = None) -> dict:
         """Return the PEFT config as a dict for vLLM's PEFTHelper.
 

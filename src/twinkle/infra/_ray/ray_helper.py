@@ -1,11 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import asyncio
-import copy
 import os
-import threading
-import time
-from concurrent.futures import Future
-from dataclasses import fields, is_dataclass
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Type, TypeVar, Union
 
 from twinkle import DeviceGroup, Platform, find_free_port, find_node_ip, requires
@@ -14,144 +8,6 @@ from .. import _torch_setup
 from .resource_manager import ResourceManager
 
 T = TypeVar('T')
-_UNSET = object()
-
-
-class LazyCollect:
-    """可序列化的远程 Future；结果投影在数据所在进程完成。"""
-
-    def __init__(self, futures, method, collect_func, device_mesh=None, timeout=None, *, path=(), root=None):
-        self._futures = tuple(futures)
-        self._method = method
-        self._collect_func = collect_func
-        self.device_mesh = device_mesh
-        self._timeout = timeout
-        self._path = tuple(path)
-        self._root = root
-        self._is_lazy_collect = True
-        self._lock = threading.RLock()
-        self._result = _UNSET
-        self._error = _UNSET
-        self._projection = None
-        self._status_ref = None
-        self._projections = {}
-
-    def __getstate__(self):
-        # 句柄只传计算描述，不把已收集载荷、锁或 driver 状态带给消费者。
-        with self._lock:
-            self.as_ref()
-            return {key: value for key, value in self.__dict__.items()
-                    if key not in ('_lock', '_result', '_error', '_projections')}
-
-    def __setstate__(self, state):
-        self.__dict__.update(state)
-        self._lock = threading.RLock()
-        self._result = _UNSET
-        self._error = _UNSET
-        self._projections = {}
-
-    def done(self):
-        import ray
-        with self._lock:
-            if self._result is not _UNSET or self._error is not _UNSET:
-                return True
-            refs = (self.as_ref(),)
-        if not refs:
-            return True
-        ready, _ = ray.wait(list(refs), num_returns=len(refs), timeout=0, fetch_local=False)
-        return len(ready) == len(refs)
-
-    ready = done
-
-    def result(self, timeout=None):
-        import ray
-        limit = self._timeout if timeout is None else timeout
-        if limit is not None and limit < 0:
-            raise ValueError('timeout 必须为非负秒数或 None。')
-        deadline = None if limit is None else time.monotonic() + limit
-        acquired = self._lock.acquire() if limit is None else self._lock.acquire(timeout=limit)
-        if not acquired:
-            raise TimeoutError('等待远程结果收集锁超时。')
-        try:
-            if self._error is not _UNSET:
-                raise self._error
-            if self._result is not _UNSET:
-                return self._result
-            remaining = None if deadline is None else max(0, deadline - time.monotonic())
-            try:
-                value = ray.get(self.as_ref(), timeout=remaining)
-                self._result = value
-            except (ray.exceptions.GetTimeoutError, TimeoutError):
-                # 等待超时不缓存为任务失败；下次仍能取得真正结果。
-                raise TimeoutError('等待远程调用结果超时。') from None
-            except Exception as exc:
-                self._error = exc
-                raise
-            return self._result
-        finally:
-            self._lock.release()
-
-    def exception(self, timeout=None):
-        import ray
-        limit = self._timeout if timeout is None else timeout
-        if limit is not None and limit < 0:
-            raise ValueError('timeout 必须为非负秒数或 None。')
-        with self._lock:
-            if self._error is not _UNSET:
-                return self._error
-            if self._result is not _UNSET:
-                return None
-            if self._status_ref is None:
-                self._status_ref = RayHelper.status_ref(self.as_ref())
-            ref = self._status_ref
-        try:
-            return ray.get(ref, timeout=limit)
-        except ray.exceptions.GetTimeoutError:
-            raise TimeoutError('等待远程异常结果超时。') from None
-
-    def cancel(self):
-        # RPC 已发送，无法据此证明业务执行尚未开始。
-        return False
-
-    def __call__(self):
-        return self.result()
-
-    def __await__(self):
-        async def collect():
-            return await asyncio.to_thread(self.result)
-        return collect().__await__()
-
-    def select(self, *path):
-        if any(not isinstance(key, (str, int, slice)) or isinstance(key, bool) for key in path):
-            raise TypeError('结果投影路径只接受字符串、整数或 slice。')
-        full_path = self._path + tuple(path)
-        # slice 不可哈希，路径缓存使用规范化索引。
-        key = tuple((item.start, item.stop, item.step) if isinstance(item, slice) else item for item in full_path)
-        with self._lock:
-            if key not in self._projections:
-                self._projections[key] = LazyCollect(
-                    self._futures, self._method, self._collect_func, self.device_mesh,
-                    self._timeout, path=full_path, root=self._root if self._root is not None else self)
-            return self._projections[key]
-
-    def __getitem__(self, key):
-        return self.select(key)
-
-    def as_ref(self):
-        with self._lock:
-            if self._projection is None:
-                if self._root is None:
-                    self._projection = RayHelper.collect_ref(
-                        self._futures, self._method, self._collect_func, self.device_mesh)
-                else:
-                    self._projection = RayHelper.project_ref(self._root.as_ref(), self._path)
-            return self._projection
-
-    def __iter__(self):
-        return iter(self.result())
-
-    def __len__(self):
-        return len(self.result())
 
 
 class RayHelper:
@@ -287,7 +143,11 @@ class RayHelper:
                          on_submit: Optional[Callable] = None, timeout=None):
         """Execute method and return results.
 
-        timeout 为整个结果列表的等待上限，与 LazyCollect 相同；超时不终止业务执行。
+        ``timeout`` is passed to ``ray.get(list, timeout=)``, whose semantics are
+        the **total** wall-clock time to collect the whole list -- different from
+        ``LazyCollect``'s per-future timing (see ``do_get_and_collect_func``).
+        The two paths are each bounded on their own; the total-time semantics here
+        are strictly tighter.
         """
         import ray
         return ray.get(RayHelper.execute_all_async(method_name, workers_and_args, on_submit=on_submit), timeout=timeout)
@@ -327,8 +187,7 @@ class RayHelper:
         """Avoid create remote component twice."""
         if component not in RayHelper._remote_components:
             import ray
-            RayHelper._remote_components[component] = ray.remote(
-                concurrency_groups={'ordinary': 1, 'control': 2, 'exclusive': 1})(component)
+            RayHelper._remote_components[component] = ray.remote(component)
         return RayHelper._remote_components[component]
 
     @staticmethod
@@ -348,122 +207,90 @@ class RayHelper:
                                 futures,
                                 device_mesh,
                                 timeout=None):
-        """使用唯一的通用结果句柄。"""
+        """Return a callable to collect results in the workers."""
+
+        class LazyCollect:
+
+            def __init__(self, futures, method, collect_func, device_mesh, timeout=None):
+                self._futures = futures
+                self._method = method
+                self._collect_func = collect_func
+                self._is_lazy_collect = True
+                self.device_mesh = device_mesh
+                self._result = None  # Cache collected results
+                self._timeout = timeout
+
+            def _get_result(self):
+                """Internal method to lazily collect and cache results"""
+                import ray
+                if self._result is None:
+                    result = []
+                    for future in self._futures:
+                        if isinstance(future, ray.ObjectRef):
+                            result.append(ray.get(future, timeout=self._timeout))
+                        else:
+                            result.append(future)
+                    self._result = self._collect_func(self._method, result, device_mesh=self.device_mesh)
+                return self._result
+
+            def __call__(self):
+                """Lazily collect results, support repeated calls (with caching)"""
+                return self._get_result()
+
+            def ready(self) -> bool:
+                """Whether every referenced task has finished, WITHOUT fetching any payload.
+
+                A control-plane probe only: it exists so a driver can time a side effect (e.g. releasing an
+                adapter pin) to the true completion of a lazily-collected call, while the payload keeps
+                flowing as a reference to a downstream actor. ``ray.wait(timeout=0)`` inspects task status and
+                never materialises the result, so ``_result`` stays untouched and no data returns to the
+                caller. A FAILED task also reports ready (``ray.wait`` surfaces completion, not success); the
+                exception is raised later, at the real :meth:`__call__` collect.
+                """
+                import ray
+                refs = [future for future in self._futures if isinstance(future, ray.ObjectRef)]
+                if not refs:
+                    return True
+                ready, _ = ray.wait(refs, num_returns=len(refs), timeout=0)
+                return len(ready) == len(refs)
+
+            def __iter__(self):
+                """Support iteration: automatically collect results then iterate"""
+                return iter(self._get_result())
+
+            def __len__(self):
+                """Support len() function"""
+                return len(self._get_result())
+
         return LazyCollect(futures, method, collect_func, device_mesh, timeout=timeout)
 
     @staticmethod
     def do_get_and_collect(args, kwargs):
-        args, kwargs = RayHelper.resolve((tuple(args), dict(kwargs)))
-        return args, kwargs
+        """Collect `LazyCollect` in each arg."""
+        new_args = []
+        for arg in args:
+            if isinstance(arg, Callable) and getattr(arg, '_is_lazy_collect', False):
+                arg = arg()
+            new_args.append(arg)
+
+        new_kwargs = {}
+        for key in list(kwargs.keys()):
+            value = kwargs[key]
+            if isinstance(value, Callable) and getattr(value, '_is_lazy_collect', False):
+                value = value()
+            new_kwargs[key] = value
+        return new_args, new_kwargs
 
     @staticmethod
-    def resolve(value, *, _active=None, _memo=None):
-        try:
-            import ray
-        except ImportError:
-            ray = None
-        active = set() if _active is None else _active
-        memo = {} if _memo is None else _memo
-        reference = isinstance(value, (LazyCollect, Future)) or ray is not None and isinstance(value, ray.ObjectRef)
-        record = is_dataclass(value) and not isinstance(value, type)
-        if not isinstance(value, (list, tuple, dict)) and not record and not reference:
-            return value
-        if len(active) >= 256:
-            raise ValueError('远程调用参数的容器嵌套超过 256 层。')
-        identity = id(value)
-        if identity in active:
-            raise ValueError('远程调用参数不支持自引用容器。')
-        if identity in memo:
-            return memo[identity]
-        active.add(identity)
-        try:
-            if reference:
-                payload = value.result() if isinstance(value, (LazyCollect, Future)) else ray.get(value)
-                result = RayHelper.resolve(payload, _active=active, _memo=memo)
-            elif record:
-                result = copy.copy(value)
-                for item in fields(value):
-                    object.__setattr__(result, item.name,
-                                       RayHelper.resolve(getattr(value, item.name), _active=active, _memo=memo))
-            elif isinstance(value, dict):
-                result = {key: RayHelper.resolve(item, _active=active, _memo=memo) for key, item in value.items()}
-            else:
-                items = [RayHelper.resolve(item, _active=active, _memo=memo) for item in value]
-                if isinstance(value, tuple) and isinstance(getattr(type(value), '_fields', None), tuple):
-                    result = type(value)(*items)
-                else:
-                    result = tuple(items) if isinstance(value, tuple) else items
-            memo[identity] = result
-            return result
-        finally:
-            active.remove(identity)
-
-    @staticmethod
-    def object_refs(value, _active=None):
-        try:
-            import ray
-        except ImportError:
-            ray = None
-        active = set() if _active is None else _active
-        if ray is not None and isinstance(value, ray.ObjectRef):
-            return [value]
-        if isinstance(value, LazyCollect):
-            return [value.as_ref()]
-        record = is_dataclass(value) and not isinstance(value, type)
-        if not isinstance(value, (list, tuple, dict)) and not record:
-            return []
-        if len(active) >= 256:
-            raise ValueError('远程调用参数的容器嵌套超过 256 层。')
-        if id(value) in active:
-            raise ValueError('远程调用参数不支持自引用容器。')
-        active.add(id(value))
-        try:
-            items = ([getattr(value, item.name) for item in fields(value)] if record else
-                     value.values() if isinstance(value, dict) else value)
-            return [ref for item in items for ref in RayHelper.object_refs(item, active)]
-        finally:
-            active.remove(id(value))
-
-    @staticmethod
-    def has_ref(args, kwargs):
-        return bool(RayHelper.object_refs((args, kwargs)))
-
-    @staticmethod
-    def _collect(recipe):
-        futures, method, collector, device_mesh = recipe
-        parts = RayHelper.resolve(list(futures))
-        return collector(method, parts, device_mesh=device_mesh)
-
-    @staticmethod
-    def collect_ref(futures, method, collector, device_mesh):
-        import ray
-        return ray.remote(RayHelper._collect).options(num_cpus=0).remote(
-            (futures, method, collector, device_mesh))
-
-    @staticmethod
-    def _project(refs, path):
-        result = RayHelper.resolve(refs)[0]
-        for key in path:
-            result = result[key] if isinstance(result, (dict, list, tuple)) else getattr(result, key)
-        return result
-
-    @staticmethod
-    def project_ref(ref, path):
-        import ray
-        return ray.remote(RayHelper._project).options(num_cpus=0).remote((ref,), path)
-
-    @staticmethod
-    def _status(refs):
-        try:
-            RayHelper.resolve(refs)
-        except Exception as exc:
-            return exc
-        return None
-
-    @staticmethod
-    def status_ref(ref):
-        import ray
-        return ray.remote(RayHelper._status).options(num_cpus=0).remote((ref,))
+    def has_ref(args, kwargs) -> bool:
+        for arg in args:
+            if isinstance(arg, Callable) and getattr(arg, '_is_lazy_collect', False):
+                return True
+        for key in list(kwargs.keys()):
+            value = kwargs[key]
+            if isinstance(value, Callable) and getattr(value, '_is_lazy_collect', False):
+                return True
+        return False
 
     @staticmethod
     def create_workers(worker_cls: Type[T],
@@ -570,8 +397,6 @@ class RayHelper:
                     'namespace': 'default',
                     'runtime_env': runtime_env,
                     'num_cpus': 0.01,
-                    'max_restarts': 0,
-                    'max_task_retries': 0,
                 }
 
                 # The placement group already reserves a GPU worker's full
@@ -592,8 +417,6 @@ class RayHelper:
 
                 if max_concurrency is not None:
                     worker_options['max_concurrency'] = max_concurrency
-                worker_options['concurrency_groups'] = {
-                    'ordinary': max_concurrency or 1, 'control': 2, 'exclusive': 1}
 
                 try:
                     worker = worker_cls.options(**worker_options).remote(*args, **kwargs)
@@ -640,14 +463,10 @@ class RayHelper:
                     'namespace': 'default',
                     'runtime_env': runtime_env,
                     'num_cpus': 0.01,
-                    'max_restarts': 0,
-                    'max_task_retries': 0,
                 }
 
                 if max_concurrency is not None:
                     worker_options['max_concurrency'] = max_concurrency
-                worker_options['concurrency_groups'] = {
-                    'ordinary': max_concurrency or 1, 'control': 2, 'exclusive': 1}
 
                 try:
                     worker = worker_cls.options(**worker_options).remote(*args, **kwargs)

@@ -1,10 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 # Adapted from https://github.com/volcengine/verl/blob/main/verl/checkpoint_engine/base.py
 import threading
-from contextlib import contextmanager
 from typing import List, Literal, Optional
 
-from twinkle.infra import worker_pool
+from twinkle.infra import get_worker_id
 
 from twinkle import Platform, get_logger
 from .base import CheckpointEngine
@@ -85,8 +84,6 @@ class CheckpointEngineManager:
         self.sampler = sampler
         self.requested_mode = mode
         self.mode = self._resolve_mode(mode, model, sampler)
-        self._model_pool = worker_pool(model, required=False)
-        self._sampler_pool = worker_pool(sampler, required=False)
         self.backend_cls = self.decide_backend_engine(platform, self.mode)
         self._sync_lock = threading.RLock()
         self.receiver_worker_ids = self._validate_receiver_ids(receiver_worker_ids)
@@ -140,8 +137,8 @@ class CheckpointEngineManager:
             valid = ', '.join(sorted(_VALID_MODES))
             raise ValueError(f'Unknown checkpoint engine mode {mode!r}; expected one of: {valid}.')
 
-        model_has_actors = worker_pool(model, required=False) is not None
-        sampler_has_actors = worker_pool(sampler, required=False) is not None
+        model_has_actors = bool(getattr(model, '_actors', None))
+        sampler_has_actors = bool(getattr(sampler, '_actors', None))
         if model_has_actors != sampler_has_actors:
             raise ValueError(
                 'CheckpointEngineManager requires model and sampler to use the same deployment shape: '
@@ -186,7 +183,7 @@ class CheckpointEngineManager:
         worker_ids = tuple(worker_ids)
         if any(not isinstance(worker_id, str) for worker_id in worker_ids):
             raise ValueError('receiver_worker_ids must contain stable actor ID strings.')
-        known = set(self._sampler_pool.worker_ids())
+        known = {get_worker_id(actor) for actor in self.sampler._actors}
         if len(set(worker_ids)) != len(worker_ids) or set(worker_ids) - known:
             raise ValueError(f'receiver_worker_ids contains duplicate or unknown actor IDs: {worker_ids!r}.')
         return worker_ids
@@ -252,26 +249,8 @@ class CheckpointEngineManager:
                 self._channel_closed = True
                 self.base_sync_done = False
 
-    @contextmanager
-    def _exclusive_resources(self):
-        """整个传输期间关闭相关准入；失败时保持不可用，不恢复未确认权重。"""
-        scopes = []
-        for pool, ids in ((self._model_pool, None), (self._sampler_pool, self.receiver_worker_ids)):
-            if pool is None:
-                continue
-            ids = pool.worker_ids() if ids is None else tuple(ids)
-            available = set(pool.view().admissible_ids)
-            scopes.append((pool, ids, tuple(key for key in ids if key in available)))
-            pool.suspend_admission(ids)
-            pool.wait_idle(ids)
-        yield
-        for pool, ids, reopen in reversed(scopes):
-            pool.wait_idle(ids)
-            active = set(pool.worker_ids(states=('ACTIVE',)))
-            pool.resume_admission(tuple(key for key in reopen if key in active))
-
     def sync_weights(self, merge_and_sync=True):
-        with self._sync_lock, self._exclusive_resources():
+        with self._sync_lock:
             if self._channel_closed or self.receiver_worker_ids != self._receiver_snapshot:
                 self.close()
                 self._receiver_snapshot = self.receiver_worker_ids
@@ -447,7 +426,7 @@ class CheckpointEngineManager:
             alpha: EMA decay factor.  ``ref = alpha * ref + (1 - alpha) * policy``.
                    Closer to 1 means slower tracking.
         """
-        with self._sync_lock, self._exclusive_resources():
+        with self._sync_lock:
             if self.mode == 'naive':
                 self._sync_ema_naive(alpha)
                 return
