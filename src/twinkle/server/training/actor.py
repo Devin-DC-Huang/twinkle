@@ -36,6 +36,7 @@ class TrainingControllerActor:
         self._metrics = get_training_metrics()
         self._monitors = []
         self._unreachable_since = {}
+        self._failures: dict[str, asyncio.Task] = {}
         self._initialization = asyncio.get_event_loop().create_task(self._initialize())
 
     async def initialize(self):
@@ -67,31 +68,41 @@ class TrainingControllerActor:
                 logger.exception('Training state heartbeat failed; admission remains fenced by the state backend')
                 await asyncio.sleep(5)
                 continue
-            for instance in list(self.core.instances.values()):
-                if instance.state not in ('READY', 'RESETTING'):
-                    continue
-                try:
-                    identity = await self.driver.health(instance)
-                    if identity['unhealthy']:
-                        await self.core.fail_instance(
-                            instance.instance_id,
-                            FutureFailureRecord(
-                                reason_code='orphaned_replica',
-                                attribution='server',
-                                message='Training runtime reported a failed worker'))
-                        continue
-                    await self.store.state.touch_replica_last_seen(instance.instance_id)
-                    self._unreachable_since.pop(instance.instance_id, None)
-                except Exception:
-                    since = self._unreachable_since.setdefault(instance.instance_id, time.monotonic())
-                    if time.monotonic() - since >= 30:
-                        await self.core.fail_instance(
-                            instance.instance_id,
-                            FutureFailureRecord(
-                                reason_code='orphaned_replica',
-                                attribution='server',
-                                message='Training runtime became unavailable'))
+            await asyncio.gather(*(self._check_instance_health(instance)
+                                   for instance in list(self.core.instances.values())
+                                   if instance.state in ('READY', 'RESETTING')))
             await asyncio.sleep(5)
+
+    async def _check_instance_health(self, instance):
+        try:
+            identity = await self.driver.health(instance)
+            if identity['unhealthy']:
+                self._fail_unhealthy(instance, 'Training runtime reported a failed worker')
+                return
+            await self.store.state.touch_replica_last_seen(instance.instance_id)
+            self._unreachable_since.pop(instance.instance_id, None)
+        except Exception:
+            since = self._unreachable_since.setdefault(instance.instance_id, time.monotonic())
+            if time.monotonic() - since >= 30:
+                self._fail_unhealthy(instance, 'Training runtime became unavailable')
+
+    def _fail_unhealthy(self, instance, message):
+        identity = instance.instance_id
+        if identity in self._failures:
+            return
+        task = asyncio.create_task(
+            self.core.fail_instance(
+                identity, FutureFailureRecord(reason_code='orphaned_replica', attribution='server', message=message)))
+        self._failures[identity] = task
+
+        def done(completed):
+            self._failures.pop(identity, None)
+            if not completed.cancelled():
+                error = completed.exception()
+                if error is not None:
+                    logger.error('Unhealthy runtime cleanup failed', exc_info=(type(error), error, error.__traceback__))
+
+        task.add_done_callback(done)
 
     async def _sweep(self):
         while True:
@@ -168,6 +179,9 @@ class TrainingControllerActor:
         }
 
     async def shutdown(self):
+        if not self._initialization.done():
+            self._initialization.cancel()
+        await asyncio.gather(self._initialization, return_exceptions=True)
         restart = getattr(self, '_restart_task', None)
         if restart is not None:
             restart.cancel()
@@ -176,3 +190,6 @@ class TrainingControllerActor:
             task.cancel()
         await asyncio.gather(*self._monitors, return_exceptions=True)
         await self.core.shutdown()
+        await asyncio.gather(*self._failures.values(), return_exceptions=True)
+        await self.core.wait_for_jobs()
+        await self.driver.wait_for_cleanup()

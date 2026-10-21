@@ -120,14 +120,19 @@ class ComputeWorker:
         self._detached_tasks: dict[asyncio.Task, QueuedTask] = {}
         self._detached_reserved = 0
 
+    def ensure_accepting(self) -> None:
+        if self._stopping:
+            raise ResourceExhaustedError('The replica is shutting down.')
+
     async def ensure_started(self) -> None:
-        """Ensure the background worker coroutine is running."""
+        """Ensure the background worker coroutine is running; never reopen a stopped replica."""
+        self.ensure_accepting()
         if self._started and self._worker_task is not None and not self._worker_task.done():
             return
         async with self._start_lock:
+            self.ensure_accepting()
             if self._started and self._worker_task is not None and not self._worker_task.done():
                 return
-            self._stopping = False
             self._worker_task = asyncio.create_task(self._worker_loop())
             self._started = True
 
@@ -151,10 +156,11 @@ class ComputeWorker:
                     'Sampler task stopped during replica shutdown.',
                     QueueState.ACTIVE.value,
                     reason_code='orphaned_replica')
+        for queue_key in list(self.task_queues):
+            await self.fail_queue_tasks(queue_key, 'Replica stopped before the task could execute.')
         self._worker_task = None
         self._started = False
-        self.task_queues.clear()
-        self.queue_order.clear()
+        self._request_ids.clear()
 
     def ensure_queue_registered(self, queue_key: str) -> None:
         """Register a new per-key queue if it does not yet exist."""
@@ -343,7 +349,8 @@ class ComputeWorker:
 
     def reserve_detached(self) -> None:
         """Reserve before the future write, so capacity rejection leaves no record."""
-        if self._stopping or self._detached_reserved >= self._config.concurrent_task_limit:
+        self.ensure_accepting()
+        if self._detached_reserved >= self._config.concurrent_task_limit:
             raise ResourceExhaustedError('Concurrent compute capacity is unavailable on this replica.')
         self._detached_reserved += 1
 
@@ -393,6 +400,10 @@ class ComputeWorker:
         def done(completed: asyncio.Task) -> None:
             self._detached_tasks.pop(completed, None)
             self.release_detached()
+            if not completed.cancelled():
+                error = completed.exception()
+                if error is not None:
+                    logger.error('Detached task failed', exc_info=(type(error), error, error.__traceback__))
 
         running.add_done_callback(done)
 
@@ -418,19 +429,9 @@ class ComputeWorker:
         handler_attrs = {TOKEN_ID: task.token, MODEL_ID: task.model_id}
         handler_span_name = f'{self._deployment_name or "deployment"}.{task_type}'
         try:
-            await self._state.store_future_status(
-                task.request_id,
-                TaskStatus.RUNNING.value,
-                task.model_id,
-                queue_state=QueueState.ACTIVE.value,
-            )
-            # A client cancel (or orphan cleanup) can win the race against the
-            # running write; the terminal record is kept, so do not start work
-            # nobody will collect. Once running is stored, cancel_if_pending can
-            # no longer succeed, so this read closes the window.
-            if await self._is_record_terminal(task.request_id):
+            if not await self._state.try_start_future(task.request_id):
                 task_status = 'cancelled'
-                logger.info(f'[ComputeWorker] Task {task.request_id} became terminal before start; skipping.')
+                logger.info(f'[ComputeWorker] Task {task.request_id} was not acquired; skipping.')
                 return
             with traced_operation('task_queue.execute', attrs=queue_attrs):
                 logger.debug(f'[ComputeWorker] Task {task.request_id} executing, '
@@ -565,16 +566,6 @@ class ComputeWorker:
                 await self._fail_timed_out_task(task, queue_wait, q)
                 continue  # try the next queue
 
-            # A record already in a Terminal_State (e.g. written 'failed' by the
-            # state-hygiene orphan handling) must not be executed again.
-            if await self._is_record_terminal(task.request_id):
-                logger.info(f'[ComputeWorker] Task {task.request_id} already terminal on dequeue; skipping.')
-                q.task_done()
-                self._request_ids.discard(task.request_id)
-                if task.on_finished is not None:
-                    await task.on_finished(False, False)
-                continue
-
             # Execute the task (serial: stops after the first execution)
             await self._execute_task(task, queue_key, q)
             return True
@@ -583,11 +574,8 @@ class ComputeWorker:
 
     async def _is_record_terminal(self, request_id: str) -> bool:
         """True if the future record already holds a Terminal_State."""
-        try:
-            record = await self._state.get_future(request_id)
-        except Exception:
-            return False
-        if not record:
+        record = await self._state.get_future(request_id)
+        if record is None:
             return False
         return record.get('status') in (TaskStatus.COMPLETED.value, TaskStatus.FAILED.value, TaskStatus.CANCELLED.value)
 

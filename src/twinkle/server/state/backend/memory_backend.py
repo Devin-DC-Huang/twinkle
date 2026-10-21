@@ -84,14 +84,16 @@ class _StateActor:
         key: str,
         transform: Callable[[Any | None], Any | None],
         ttl: int | None = None,
+        *,
+        return_changed: bool = False,
     ) -> Any | None:
         current = None if self._is_expired(key) else self._store[key][0]
         new_value = transform(current)
         if new_value is None:
-            return current
+            return False if return_changed else current
         expire_at = (time.time() + ttl) if ttl is not None else None
         self._store[key] = (new_value, expire_at)
-        return new_value
+        return True if return_changed else new_value
 
     async def mget(self, keys: list[str]) -> list[Any | None]:
         results: list[Any | None] = []
@@ -168,8 +170,10 @@ class RayActorBackend(StateBackend):
         key: str,
         transform: Callable[[Any | None], Any | None],
         ttl: int | None = None,
+        *,
+        return_changed: bool = False,
     ) -> Any | None:
-        return await self._actor.update_atomic.remote(key, transform, ttl)
+        return await self._actor.update_atomic.remote(key, transform, ttl, return_changed=return_changed)
 
     async def mget(self, keys: list[str]) -> list[Any | None]:
         return await self._actor.mget.remote(keys)

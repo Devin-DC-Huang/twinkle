@@ -79,16 +79,17 @@ def main():
             'args': {
                 'model_id': 'other',
                 'backend': 'mock',
-                'device_type': 'cpu',
-                'modes': {
-                    'full': {
-                        'num_devices': 1,
-                        'device_mesh': {
-                            'dp_size': 1
-                        }
-                    }
-                }
+                'train_mode': 'full',
+                'device_group': {'ranks': 1, 'device_type': 'cpu'},
+                'device_mesh': {'dp_size': 1},
+                'min_replicas': 0,
+                'max_replicas': 1,
             },
+            'deployments': [{
+                'max_ongoing_requests': 8,
+                'autoscaling_config': {'min_replicas': 1, 'max_replicas': 1, 'target_ongoing_requests': 4},
+                'ray_actor_options': {'num_cpus': 0.1, 'runtime_env': {'env_vars': {'LEGACY_CONFIG_PROBE': '1'}}},
+            }],
         }, {
             'name': 'gateway',
             'import_path': 'server',

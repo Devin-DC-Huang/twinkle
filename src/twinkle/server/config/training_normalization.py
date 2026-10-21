@@ -8,6 +8,7 @@ from .training import LegacyExpiration, TrainingModelConfig, TrainingModes
 def normalize_model_application(app: ApplicationSpec) -> TrainingModelConfig:
     args = app.args
     assert isinstance(args, ModelArgs)
+    deployment = {}
     if args.modes is not None:
         baseline = ModelArgs(model_id=args.model_id, backend=args.backend, device_group={}, device_mesh={})
         common = {
@@ -33,6 +34,9 @@ def normalize_model_application(app: ApplicationSpec) -> TrainingModelConfig:
         if len(app.deployments) > 1:
             raise ValueError(f'{app.name}: a model application must have one deployment configuration')
         deployment = app.deployments[0] if app.deployments else {}
+        unsupported = set(args.adapter_config or {}) - {'adapter_timeout', 'adapter_max_lifetime'}
+        if unsupported:
+            raise ValueError(f'{app.name}: unsupported adapter_config fields: {sorted(unsupported)}')
         scaling = deployment.get('autoscaling_config') or {}
         ranks = args.device_group.get('ranks', args.nproc_per_node)
         if isinstance(ranks, list):
@@ -84,4 +88,8 @@ def normalize_model_application(app: ApplicationSpec) -> TrainingModelConfig:
         legacy_expiration=legacy_expiration,
         route_prefix=app.route_prefix.rstrip('/') or '/',
         data_plane_url=args.data_plane_url,
-        env_vars=env_vars)
+        env_vars=env_vars,
+        deploy_options={
+            key: value
+            for key, value in deployment.items() if key != 'name'
+        })

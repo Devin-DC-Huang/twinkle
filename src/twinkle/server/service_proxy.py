@@ -9,6 +9,7 @@ from typing import Any
 
 from twinkle.protocol.headers import H_MULTIPLEX, H_MULTIPLEX_LEGACY, H_REQUEST_ID, H_REQUEST_ID_LEGACY
 from twinkle.protocol.types.errors import ErrorCategory, ErrorPayload
+from twinkle.server.config.task_queue import TaskQueueConfig
 from twinkle.server.telemetry.tracing import inject_context
 from twinkle.utils.logger import get_logger
 
@@ -20,7 +21,9 @@ class ServiceProxy:
     def __init__(self, http_options: dict[str, Any] | None = None, route_prefix: str = '/api/v1'):
         self.http_options = http_options or {}
         self.route_prefix = route_prefix
-        self.client = httpx.AsyncClient(timeout=None, trust_env=False)
+        queue = TaskQueueConfig()
+        budget = queue.queue_timeout + queue.effective_execution_timeout
+        self.client = httpx.AsyncClient(timeout=httpx.Timeout(budget, connect=10, pool=10), trust_env=False)
 
     async def close(self) -> None:
         await self.client.aclose()

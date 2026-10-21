@@ -6,6 +6,7 @@ import asyncio
 import os
 import re
 import time
+from copy import deepcopy
 
 from twinkle.server.env_propagation import build_propagated_env_vars
 from twinkle.server.resources.allocation import DevicePool
@@ -23,6 +24,7 @@ class RayInstanceDriver:
         self.config, self.store = config, store
         self.namespace, self.controller_name = namespace, controller_name
         self._cleanup_tasks: set[asyncio.Task] = set()
+        self._deployments: dict[str, asyncio.Task] = {}
         self._metrics = get_training_metrics()
         self._catalog = TrainingCatalog(config)
         self.pool = DevicePool(
@@ -73,6 +75,14 @@ class RayInstanceDriver:
         if 'hybrid' in kwargs:
             kwargs['hybrid'] = spec.config.hybrid
         kwargs['train_mode'] = 'hybrid' if kwargs.get('hybrid') else spec.mode
+        # Each runtime has one identity. Serve autoscaling belongs to the CPU
+        # router; device-instance replica bounds are enforced by the controller.
+        options = deepcopy(spec.model.deploy_options)
+        options.pop('autoscaling_config', None)
+        options['num_replicas'] = 1
+        actor_options = options.setdefault('ray_actor_options', {})
+        actor_options.setdefault('num_cpus', 0.1)
+        actor_options.setdefault('runtime_env', {})['env_vars'] = env
         app = build_model_app(
             model_id=spec.model.model_id,
             backend=spec.model.backend,
@@ -85,15 +95,7 @@ class RayInstanceDriver:
             device_mesh={
                 **spec.config.device_mesh.model_dump(exclude_none=True), 'device_type': spec.model.device_type
             },
-            deploy_options={
-                'num_replicas': 1,
-                'ray_actor_options': {
-                    'num_cpus': 0.1,
-                    'runtime_env': {
-                        'env_vars': env
-                    }
-                }
-            },
+            deploy_options=options,
             queue_config=spec.config.queue_config,
             data_plane_url=spec.model.data_plane_url,
             training_context=context,
@@ -104,6 +106,7 @@ class RayInstanceDriver:
         deployment = asyncio.create_task(
             asyncio.to_thread(
                 serve.run, app, name=name, route_prefix=f'/api/v1/training-runtime/{instance.instance_id}'))
+        self._deployments[instance.instance_id] = deployment
         try:
             await asyncio.shield(deployment)
         except asyncio.CancelledError:
@@ -127,6 +130,14 @@ class RayInstanceDriver:
 
             task.add_done_callback(done)
             raise
+        finally:
+            if deployment.done():
+                self._deployments.pop(instance.instance_id, None)
+
+    async def wait_for_cleanup(self):
+        """Join late deployment cleanup before the controller actor is retired."""
+        while self._cleanup_tasks:
+            await asyncio.gather(*tuple(self._cleanup_tasks), return_exceptions=True)
 
     def handle(self, instance):
         from ray import serve
@@ -146,6 +157,15 @@ class RayInstanceDriver:
         import ray
         from ray import serve
         from ray.util import list_named_actors
+        deployment = self._deployments.get(instance.instance_id)
+        if deployment is not None:
+            # Cancellation of Serve's caller does not stop its deployment thread.
+            # Never certify death while that thread can still create resources.
+            try:
+                await asyncio.shield(deployment)
+            except Exception:
+                pass
+            self._deployments.pop(instance.instance_id, None)
         name = self.application_name(instance)
         owned = [
             actor for actor in list_named_actors(all_namespaces=True)

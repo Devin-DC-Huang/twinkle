@@ -47,7 +47,81 @@ async def test_shutdown_cancels_pending_restart():
     cls = TrainingControllerActor.__ray_metadata__.modified_class
     wait = asyncio.Event()
     restart = asyncio.create_task(wait.wait())
-    actor = SimpleNamespace(core=SimpleNamespace(shutdown=AsyncMock()), _monitors=[], _restart_task=restart)
+    initialization = asyncio.get_running_loop().create_future()
+    initialization.set_result(None)
+    actor = SimpleNamespace(driver=SimpleNamespace(wait_for_cleanup=AsyncMock()),
+                                core=SimpleNamespace(shutdown=AsyncMock(), wait_for_jobs=AsyncMock()),
+                            _monitors=[], _restart_task=restart, _initialization=initialization, _failures={})
     await cls.shutdown(actor)
     assert restart.cancelled()
+    actor.core.shutdown.assert_awaited_once()
+    actor.driver.wait_for_cleanup.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_keeps_healthy_peer_alive_while_probe_and_close_block():
+    cls = TrainingControllerActor.__ray_metadata__.modified_class
+    good, bad = [SimpleNamespace(instance_id=name, state='READY') for name in ('good', 'bad')]
+    probe_gate, close_gate = asyncio.Event(), asyncio.Event()
+    healthy_seen, close_started = asyncio.Event(), asyncio.Event()
+
+    async def health(instance):
+        if instance is bad:
+            await probe_gate.wait()
+        return {'unhealthy': instance is bad}
+
+    async def fail(*args):
+        close_started.set()
+        await close_gate.wait()
+
+    async def touch(identity):
+        if identity == 'good':
+            healthy_seen.set()
+
+    actor = SimpleNamespace(
+        store=SimpleNamespace(backend=SimpleNamespace(get=AsyncMock(return_value='active')),
+                              key=lambda *args: 'active', state=SimpleNamespace(touch_replica_last_seen=touch)),
+        core=SimpleNamespace(epoch='controller', instances={'bad': bad, 'good': good}, fail_instance=fail),
+        driver=SimpleNamespace(health=health), _unreachable_since={}, _failures={})
+    actor._check_instance_health = lambda instance: cls._check_instance_health(actor, instance)
+    actor._fail_unhealthy = lambda instance, message: cls._fail_unhealthy(actor, instance, message)
+    monitor = asyncio.create_task(cls._heartbeat(actor))
+    try:
+        await asyncio.wait_for(healthy_seen.wait(), 1)
+        assert not probe_gate.is_set()
+        probe_gate.set()
+        await asyncio.wait_for(close_started.wait(), 1)
+        # Closing a bad peer does not occupy the heartbeat monitor.
+        healthy_seen.clear()
+        await cls._check_instance_health(actor, good)
+        assert healthy_seen.is_set()
+        cls._fail_unhealthy(actor, bad, 'duplicate')
+        assert len(actor._failures) == 1
+    finally:
+        probe_gate.set()
+        close_gate.set()
+        monitor.cancel()
+        await asyncio.gather(monitor, *actor._failures.values(), return_exceptions=True)
+    assert not actor._failures
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancels_and_joins_initialization_before_closing_core():
+    cls = TrainingControllerActor.__ray_metadata__.modified_class
+    started, exited = asyncio.Event(), asyncio.Event()
+
+    async def initialize():
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            exited.set()
+
+    initialization = asyncio.create_task(initialize())
+    await started.wait()
+    actor = SimpleNamespace(driver=SimpleNamespace(wait_for_cleanup=AsyncMock()),
+                                core=SimpleNamespace(shutdown=AsyncMock(), wait_for_jobs=AsyncMock()),
+                            _initialization=initialization, _monitors=[], _failures={})
+    await cls.shutdown(actor)
+    assert initialization.cancelled() and exited.is_set()
     actor.core.shutdown.assert_awaited_once()

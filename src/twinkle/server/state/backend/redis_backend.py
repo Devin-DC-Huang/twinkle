@@ -127,6 +127,8 @@ class RedisBackend(StateBackend):
         key: str,
         transform: Callable[[Any | None], Any | None],
         ttl: int | None = None,
+        *,
+        return_changed: bool = False,
     ) -> Any | None:
         """WATCH/GET/MULTI/SET/EXEC with bounded retries + jittered backoff on WatchError.
 
@@ -149,7 +151,7 @@ class RedisBackend(StateBackend):
                     if new_value is None:
                         await pipe.unwatch()
                         self._metrics.update_atomic_retries.observe(attempt)
-                        return current
+                        return False if return_changed else current
                     pipe.multi()
                     if ttl is not None:
                         pipe.set(real_key, json.dumps(new_value), ex=ttl)
@@ -158,7 +160,7 @@ class RedisBackend(StateBackend):
                     executing = True
                     await pipe.execute()
                     self._metrics.update_atomic_retries.observe(attempt)
-                    return new_value
+                    return True if return_changed else new_value
                 except WatchError as exc:
                     # redis-py also wraps a lost watched connection as WatchError.
                     # Once EXEC was sent, its outcome may be unknown, not aborted.

@@ -14,7 +14,6 @@ offending name pointed at.
 """
 from __future__ import annotations
 
-from functools import cached_property
 from pathlib import Path
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing import Any
@@ -86,7 +85,7 @@ class ServerConfig(BaseModel):
                     raise ValueError(f'training route conflicts with application: {path}')
         return self
 
-    @cached_property
+    @property
     def training_config(self) -> TrainingConfig:
         """Normalize old and extended model args into one runtime catalog."""
         return TrainingConfig(

@@ -14,7 +14,7 @@ logger = get_logger()
 
 # Status sets used by the do-not-regress guard inside the atomic transform.
 _TERMINAL_STATUSES = frozenset({'completed', 'failed', 'cancelled'})
-_NON_TERMINAL_STATUSES = frozenset({'pending', 'queued', 'running'})
+_STATUS_ORDER = {'pending': 0, 'queued': 1, 'running': 2}
 
 
 def _future_record_transform(
@@ -47,6 +47,11 @@ def _future_record_transform(
     if existing_status in _TERMINAL_STATUSES:
         if new_status != existing_status:
             logger.warning('future %s already terminal as %r; refusing %r', request_id, existing_status, new_status)
+        return None
+    if new_status in _STATUS_ORDER and existing_status in _STATUS_ORDER:
+        if _STATUS_ORDER[new_status] <= _STATUS_ORDER[existing_status]:
+            return None
+    if new_status == 'cancelled' and existing_status == 'running':
         return None
 
     if existing is None:
@@ -89,6 +94,13 @@ def _future_record_transform(
 
 
 _CANCELLABLE_STATUSES = frozenset({'pending', 'queued'})
+
+
+def _start_if_pending_transform(existing: dict | None, *, now: str) -> dict | None:
+    """Acquire execution only from pending/queued, using the existing record."""
+    if existing is None or existing.get('status') not in _CANCELLABLE_STATUSES:
+        return None
+    return {**existing, 'status': 'running', 'queue_state': 'active', 'updated_at': now}
 
 
 def _cancel_if_not_started_transform(existing: dict | None, *, failure: dict, now: str) -> dict | None:
@@ -166,6 +178,14 @@ class FutureManager(BaseManager[FutureRecord]):
                 absolute_deadline=absolute_deadline,
                 now=now,
             ),
+        )
+
+    async def try_start(self, request_id: str) -> bool:
+        """True only when this attempt atomically acquired execution rights."""
+        return await self._backend.update_atomic(
+            self._make_key(request_id),
+            functools.partial(_start_if_pending_transform, now=_now_iso()),
+            return_changed=True,
         )
 
     async def cancel_if_pending(self, request_id: str) -> str | None:

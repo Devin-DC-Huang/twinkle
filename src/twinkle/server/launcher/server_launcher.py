@@ -13,6 +13,7 @@ import os
 import signal
 import threading
 from collections.abc import Callable
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -348,16 +349,14 @@ class ServerLauncher:
             raise
         self._training_controller = controller
         for model in self.config.training_config.models:
+            options = deepcopy(model.deploy_options)
+            if 'autoscaling_config' not in options:
+                options.setdefault('num_replicas', 1)
+            actor_options = options.setdefault('ray_actor_options', {})
+            actor_options.setdefault('num_cpus', 0.1)
+            actor_options.setdefault('runtime_env', {})['env_vars'] = {**env, **model.env_vars}
             app = build_training_router(self.config.training_config, model, namespace,
-                                        self.config.http_options.model_dump(), {
-                                            'num_replicas': 1,
-                                            'ray_actor_options': {
-                                                'num_cpus': 0.1,
-                                                'runtime_env': {
-                                                    'env_vars': env
-                                                }
-                                            }
-                                        })
+                                        self.config.http_options.model_dump(), options)
             serve.run(
                 app,
                 name=f'training-router-{namespace}-{model.name}',

@@ -307,6 +307,58 @@ async def test_explicit_tinker_request_id_is_preserved():
 
 
 @pytest.mark.asyncio
+async def test_shutdown_waits_for_late_serve_deployment_before_confirming_release(monkeypatch):
+    import importlib
+    import threading
+    from types import SimpleNamespace
+    from twinkle.server.config.training import TrainingConfig
+    from twinkle.server.state.training_records import InstanceRecord
+    from twinkle.server.training.driver import RayInstanceDriver
+    from ray import serve
+    config = TrainingConfig(models=[{
+        'name': 'small', 'model_id': 'weights', 'backend': 'mock', 'device_type': 'cpu',
+        'modes': {'lora': {'num_devices': 1, 'device_mesh': {'dp_size': 1}}}
+    }])
+    store = SimpleNamespace(state=SimpleNamespace(unregister_replica_capacity=AsyncMock()))
+    driver = RayInstanceDriver(config, store, 'test-late', 'controller')
+    instance = InstanceRecord(instance_id='instance', controller_epoch='epoch', base_model='small',
+                              mode='lora', startup_deadline=0)
+    entered, release = threading.Event(), threading.Event()
+    remove = AsyncMock()
+
+    def deploy(*args, **kwargs):
+        entered.set()
+        if not release.wait(10):
+            raise TimeoutError('test did not release Serve')
+
+    monkeypatch.setattr('twinkle.server.model.app.build_model_app', lambda **kwargs: 'app')
+    monkeypatch.setattr(importlib.import_module('ray.util.placement_group'), 'get_placement_group', lambda name: 'pg')
+    monkeypatch.setattr('ray.util.list_named_actors', lambda **kwargs: [])
+    monkeypatch.setattr(serve, 'run', deploy)
+    monkeypatch.setattr(serve, 'delete', lambda name: None)
+    monkeypatch.setattr(driver.pool, 'remove', remove)
+    deploying = asyncio.create_task(driver.deploy(instance, driver._catalog.get('small', 'lora')))
+    closing = None
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        deploying.cancel()
+        await asyncio.gather(deploying, return_exceptions=True)
+        closing = asyncio.create_task(driver.shutdown(instance))
+        await asyncio.sleep(0.01)
+        assert not closing.done()
+        remove.assert_not_awaited()
+        store.state.unregister_replica_capacity.assert_not_awaited()
+    finally:
+        release.set()
+        await asyncio.gather(deploying, return_exceptions=True)
+        if closing is not None:
+            await closing
+        await driver.wait_for_cleanup()
+    assert not driver._deployments and not driver._cleanup_tasks
+    store.state.unregister_replica_capacity.assert_awaited()
+
+
+@pytest.mark.asyncio
 async def test_capacity_unregister_does_not_retire_managed_model():
     controller, state, _, _ = await setup(backend=FakeBackend())
     identity = await create(controller, state, 'capacity-only')

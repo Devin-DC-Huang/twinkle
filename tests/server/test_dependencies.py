@@ -1,6 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Executable dependency architecture for every ``twinkle.server`` component."""
 import grimp
+import subprocess
+import sys
+
+import pytest
 
 _ROOT = 'twinkle.server'
 _ROOT_COMPONENT = '__root__'
@@ -27,6 +31,42 @@ def _component(module: str) -> str:
     if module == _ROOT:
         return _ROOT_COMPONENT
     return module.removeprefix(f'{_ROOT}.').split('.', 1)[0]
+
+
+@pytest.mark.parametrize('statement', [
+    'import twinkle.server.exceptions',
+    'from twinkle.server.config import ServerConfig',
+    'from twinkle.server.state.models import FutureRecord',
+    'from twinkle.server.state import SessionRecord',
+])
+def test_lightweight_imports_do_not_load_runtime(statement):
+    code = statement + '''
+import sys
+assert not any(name in sys.modules for name in (
+    'torch', 'ray', 'twinkle.server.launcher', 'twinkle.server.training.actor', 'twinkle.hub.hub'
+)), sorted(sys.modules)
+'''
+    result = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+
+
+def test_hub_first_import_does_not_reenter_plugin_loader():
+    code = '''
+from twinkle.hub.hub import HFHub
+from twinkle.utils.loader import Plugin
+assert HFHub.__module__ == 'twinkle.hub.hub'
+assert Plugin.__module__ == 'twinkle.utils.loader'
+'''
+    result = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stderr
+
+
+def test_public_launcher_is_the_actual_implementation():
+    import twinkle.server
+    from twinkle.server.launcher.server_launcher import ServerLauncher, launch_server
+    assert twinkle.server.ServerLauncher is ServerLauncher
+    assert twinkle.server.launch_server is launch_server
+    assert twinkle.server.__all__ == ['ServerLauncher', 'launch_server']
 
 
 def test_server_components_form_declared_dag():

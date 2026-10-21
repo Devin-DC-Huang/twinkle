@@ -40,6 +40,13 @@ class _State:
     async def store_future_status(self, request_id, status, model_id=None, **kwargs):
         self.records[request_id] = {'status': status, **kwargs}
 
+    async def try_start_future(self, request_id):
+        record = self.records.get(request_id)
+        if record is None or record['status'] not in ('pending', 'queued'):
+            return False
+        record['status'] = 'running'
+        return True
+
     async def get_future(self, request_id):
         return self.records.get(request_id)
 

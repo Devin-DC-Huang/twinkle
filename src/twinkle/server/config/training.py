@@ -87,6 +87,7 @@ class TrainingModelConfig(_TrainingConfig):
     route_prefix: str | None = None
     data_plane_url: str | None = None
     env_vars: dict[str, str] = Field(default_factory=dict)
+    deploy_options: dict = Field(default_factory=dict)
 
     @model_validator(mode='after')
     def _validate_backend(self):

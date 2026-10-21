@@ -24,7 +24,9 @@ async def main():
         cluster.add_node(num_cpus=4, num_gpus=4, resources={'left': 1}, include_dashboard=False, dashboard_port=0)
         cluster.add_node(num_cpus=4, num_gpus=4, resources={'right': 1})
         ray.init(address=cluster.address, namespace='fragmentation_' + uuid.uuid4().hex, log_to_driver=False)
-        pool = DevicePool(ray.get_runtime_context().namespace, allocation_timeout=1, shutdown_timeout=10)
+        # Keep fragmentation rejection fast, but allow a cold Ray worker to
+        # import the allocation probe before confirming a successful placement.
+        pool = DevicePool(ray.get_runtime_context().namespace, allocation_timeout=1, shutdown_timeout=60)
         spec = TrainingCatalog(
             TrainingConfig(models=[{
                 'name': 'two',

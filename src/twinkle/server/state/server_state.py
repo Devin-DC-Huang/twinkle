@@ -498,6 +498,10 @@ class ServerState:
         await self._backend.update_atomic(f'seq_ledger::{training_id}::{stream}',
                                           functools.partial(release_sequence, sequence=sequence, request_id=request_id))
 
+    async def try_start_future(self, request_id: str) -> bool:
+        """Acquire task execution atomically, without inferring ownership from reads."""
+        return await self._future_mgr.try_start(request_id)
+
     async def cancel_future(self, request_id: str) -> dict[str, Any]:
         """Best-effort cancel: drop the task iff it has not started running.
 

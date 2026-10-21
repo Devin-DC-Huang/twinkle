@@ -146,6 +146,16 @@ def test_mock_mode_reaches_ready_and_is_deterministic(ray_cluster, monkeypatch) 
     # separately because tinker's polling can stall the test budget on flaky
     # cross-replica state.
     if os.environ.get('TWINKLE_TEST_TINKER', '0') == '1':
+        # The native patch dirties the resident instance; release replaces it.
+        # A create during that replacement is correctly rejected, not queued.
+        deadline = time.monotonic() + READY_BUDGET_SECONDS
+        while time.monotonic() < deadline:
+            health = _http(f'{base}/api/v1/model/mock-model/healthz').json()
+            if health.get('healthy'):
+                break
+            time.sleep(0.2)
+        else:
+            raise AssertionError('Resident replacement did not become ready')
         _exercise_tinker_client(base)
 
 
@@ -208,7 +218,11 @@ def _exercise_twinkle_clients(base: str) -> None:
     # must not publish files to an external account.
 
     # --- sampler service ---
-    sampler = vLLMSampler(model_id='mock-model')
+    from twinkle_client.http import ClientTransport
+    from twinkle_client.http.context import capture_transport
+    # Cold PEFT imports on NAS can exceed the default 90-second HTTP timeout.
+    sampler_transport = ClientTransport(capture_transport().context, timeout=600)
+    sampler = vLLMSampler(model_id='mock-model', transport=sampler_transport)
     # Sampler /add_adapter_to_sampler reuses the model-side ``AddAdapterRequest``
     # shape (``config: str``), so send JSON. Skip a real ``LoraConfig`` here
     # because its ``runtime_config`` member isn't JSON-serializable.
@@ -236,6 +250,9 @@ def _exercise_twinkle_clients(base: str) -> None:
     )
 
     sampler.apply_patch('NoopPatch')
+    sampler_transport.close()
+    model.remove_adapter()
+    twinkle.close()
 
 
 def _exercise_tinker_client(base: str) -> None:
@@ -276,6 +293,12 @@ def _exercise_tinker_client(base: str) -> None:
     sampler_ckpt = training.save_weights_for_sampler(name='step-1').result()
     # path mode: save_weights_for_sampler(name) must return path != None
     assert sampler_ckpt.path is not None
+    from pathlib import Path
+    from peft import LoraConfig
+    from twinkle.server.checkpoint import create_checkpoint_manager
+    checkpoint_manager = create_checkpoint_manager('EMPTY_TOKEN', client_type='tinker')
+    sampler_dir = Path(checkpoint_manager.resolve_checkpoint_dir(sampler_ckpt.path)).resolve()
+    LoraConfig(r=4, target_modules='all-linear').save_pretrained(sampler_dir)
     # Gateway's /asample resolves ``base_model`` from ``body.base_model`` or
     # ``sampling_session_id``; pass it explicitly because the SDK only sets
     # ``model_path`` and the gateway doesn't parse ``twinkle://`` URIs.
@@ -289,6 +312,11 @@ def _exercise_tinker_client(base: str) -> None:
     # sampling_session_seq_id mode: save_weights_and_get_sampling_client()
     # must return path == None and sampling_session_id != None (asserted by SDK internally)
     sampling_client = training.save_weights_and_get_sampling_client()
+    # Mock saves contain no tensors. Mark the newly versioned sampler checkpoint
+    # as LoRA, just as the native smoke does, rather than pretending it is full weights.
+    for checkpoint in sampler_dir.parent.iterdir():
+        if checkpoint.is_dir():
+            LoraConfig(r=4, target_modules='all-linear').save_pretrained(checkpoint)
     sampling_client.sample(
         prompt=types.ModelInput.from_ints([1, 2, 3]),
         num_samples=1,
@@ -299,3 +327,5 @@ def _exercise_tinker_client(base: str) -> None:
     # the wire-level handler is /tinker/save_weights either way.
     ckpt = training.save_state(name='step-2').result()
     training.load_state(ckpt.path).result()
+    from tests.server.integration.on_demand_training.on_demand_sdk import unload_tinker_model
+    unload_tinker_model(client, training.model_id)

@@ -185,3 +185,92 @@ def test_launcher_keeps_training_and_sampling_capabilities_separate(monkeypatch)
     launcher._deploy_application(config.applications[1])
     assert captured['training_models'] == ['Qwen/small']
     assert captured['supported_models'] == ['teacher']
+
+
+def legacy_application():
+    return {'name': 'model', 'route_prefix': '/api/v1/model/small', 'import_path': 'model', 'args': {
+        'model_id': 'weights', 'backend': 'mock', 'train_mode': 'lora', 'max_length': 128,
+        'device_group': {'ranks': 2, 'device_type': 'cpu'}, 'device_mesh': {'dp_size': 2},
+        'env_vars': {'USER_OPTION': 'args-wins'}, 'adapter_config': {'adapter_timeout': 30},
+    }, 'deployments': [{
+        'name': 'ModelManagement', 'max_ongoing_requests': 17,
+        'autoscaling_config': {'min_replicas': 1, 'max_replicas': 2, 'target_ongoing_requests': 16},
+        'ray_actor_options': {'num_cpus': 2, 'runtime_env': {
+            'env_vars': {'USER_OPTION': 'deployment', 'OTHER_OPTION': 'retained'}, 'pip': ['example==1.0']
+        }},
+    }]}
+
+
+def test_legacy_options_reach_cpu_router_without_changing_yaml(monkeypatch):
+    from types import SimpleNamespace
+    from twinkle.server.launcher.server_launcher import ServerLauncher
+    from twinkle.server.training.actor import TrainingControllerActor
+    import ray
+    from ray import serve
+    config = ServerConfig(applications=[legacy_application()])
+    remote = SimpleNamespace(initialize=SimpleNamespace(remote=lambda: None))
+    monkeypatch.setattr(TrainingControllerActor, 'options',
+                        lambda **kwargs: SimpleNamespace(remote=lambda *args: remote))
+    monkeypatch.setattr(ray, 'get', lambda *args, **kwargs: None)
+    captured = {}
+
+    def router(*args):
+        captured.update(args[-1])
+        return 'app'
+
+    monkeypatch.setattr('twinkle.server.training.router.build_training_router', router)
+    monkeypatch.setattr(serve, 'run', lambda *args, **kwargs: None)
+    ServerLauncher(config)._deploy_training()
+    assert captured['max_ongoing_requests'] == 17
+    assert captured['autoscaling_config']['target_ongoing_requests'] == 16
+    actor = captured['ray_actor_options']
+    assert actor['num_cpus'] == 2 and actor['runtime_env']['pip'] == ['example==1.0']
+    assert actor['runtime_env']['env_vars']['USER_OPTION'] == 'args-wins'
+    assert actor['runtime_env']['env_vars']['OTHER_OPTION'] == 'retained'
+    assert config.to_yaml_dict()['applications'][0]['deployments'][0] == legacy_application()['deployments'][0]
+
+
+@pytest.mark.asyncio
+async def test_legacy_options_reach_runtime_with_one_controller_owned_replica(monkeypatch):
+    import importlib
+    from twinkle.server.state.training_records import InstanceRecord
+    from twinkle.server.training.driver import RayInstanceDriver
+    from ray import serve
+    config = ServerConfig(applications=[legacy_application()])
+    model = config.training_config.models[0]
+    driver = RayInstanceDriver(config.training_config, None, 'test', 'controller')
+    instance = InstanceRecord(instance_id='instance', controller_epoch='epoch', base_model=model.name,
+                              mode='lora', startup_deadline=0, devices=['0', '1'])
+    captured = {}
+
+    def builder(**kwargs):
+        captured.update(kwargs)
+        return 'app'
+
+    monkeypatch.setattr('twinkle.server.model.app.build_model_app', builder)
+    monkeypatch.setattr(importlib.import_module('ray.util.placement_group'), 'get_placement_group', lambda name: 'pg')
+    monkeypatch.setattr(serve, 'run', lambda *args, **kwargs: None)
+    await driver.deploy(instance, driver._catalog.get(model.name, 'lora'))
+    options = captured['deploy_options']
+    assert options['num_replicas'] == 1 and 'autoscaling_config' not in options
+    assert options['max_ongoing_requests'] == 17
+    assert options['ray_actor_options']['num_cpus'] == 2
+    assert options['ray_actor_options']['runtime_env']['pip'] == ['example==1.0']
+    assert captured['max_length'] == 128
+    assert captured['nproc_per_node'] == 2
+    assert captured['queue_config'] == model.modes.lora.queue_config
+    assert not driver._deployments
+
+
+def test_mutated_configuration_does_not_reuse_a_stale_catalog():
+    config = ServerConfig(applications=[legacy_application()])
+    assert config.training_config.models[0].modes.lora.min_replicas == 1
+    config.applications[0].args.min_replicas = 0
+    assert config.training_config.models[0].modes.lora.min_replicas == 0
+
+
+def test_unsupported_adapter_parameters_are_not_silently_ignored():
+    app = legacy_application()
+    app['args']['adapter_config']['misspelled_timeout'] = 12
+    with pytest.raises(ValidationError, match='misspelled_timeout'):
+        ServerConfig(applications=[app])
