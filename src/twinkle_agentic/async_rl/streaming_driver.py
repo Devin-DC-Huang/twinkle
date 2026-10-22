@@ -8,8 +8,7 @@ import threading
 import time
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
-from enum import Enum
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .context_manager import RLContextManager
 from .types import PartitionAdmission, RLContext, RolloutPolicy
@@ -19,29 +18,6 @@ from .types import PartitionAdmission, RLContext, RolloutPolicy
 #: group key it will carry into the ready buffer (every trajectory of one prompt shares it, see
 #: :class:`BufferRecord`).
 _Inflight = Tuple[Any, RolloutPolicy, str]
-
-
-class GroupDecision(Enum):
-    """What the injected ``group_complete`` seam decides once a training group is fully collected.
-
-    The driver is algorithm-agnostic: it fires ``group_complete`` exactly once per group, the instant that
-    group's ``num_generations`` trajectories are all in the ready buffer -- an INTRA-group barrier, so other
-    groups keep streaming and overlapping and this never degrades into a fixed-batch barrier. The decision
-    tells the driver what to do with the completed group:
-
-    * ``ACCEPT``: the group is trainable as-is; leave it buffered for ``assembly_ready`` to pull.
-    * ``AUGMENT``: the hook wrote extra fields onto the samples (e.g. a ReMax greedy ``baseline``) in
-      addition to the mandatory scoring. The driver keeps the group exactly as ``ACCEPT`` does -- the
-      augmentation is the hook's own side effect, invisible to the driver's buffer.
-    * ``REGENERATE``: the group is unusable (e.g. a zero-variance dynamic-sampling group). The driver DROPS
-      its buffered records and re-admits the same prompt as a fresh group under the CURRENT policy version
-      (the re-admitted siblings are pinned to the new admission version, the conservative staleness anchor),
-      bounded by ``max_group_regenerations``; past the cap the group is accepted as-is, matching the
-      fixed-batch dynamic-sampling fallback.
-    """
-    ACCEPT = 'accept'
-    AUGMENT = 'augment'
-    REGENERATE = 'regenerate'
 
 
 #: Internal marker the iterator bridge pushes onto its batch queue once the background :meth:`run` thread
@@ -263,9 +239,9 @@ class StreamingDriver:
     the driver flattens and reads for ``num_train_epochs`` passes), the
     regime knobs (``max_staleness``; ``num_generations`` trajectories per prompt; ``groups_per_partition``
     = the groups one publish cycle is expected to train, used as the window's sizing declaration;
-    ``buffer_depth`` = the in-flight + ready backpressure cap in samples), the data-plane seams, and --
-    for the RL regime ONLY -- the control-plane objects (``ctx_mgr`` / ``ctx``). Omit ``ctx_mgr``/``ctx``
-    for the infer regime: the driver then runs on an internal null ledger (version pinned at 0, no
+    ``buffer_depth`` = the in-flight + ready backpressure cap in samples), and the data-plane seams.
+    ``version_control=True`` selects the RL regime (the driver builds its own version ledger); False
+    is the infer regime: the driver then runs on an internal null ledger (version pinned at 0, no
     windows, no pins) and never publishes, so it carries no RL scaffolding.
 
     The driver owns NO weight/model control and NO publish cadence: publication is an external signal
@@ -287,16 +263,12 @@ class StreamingDriver:
                  collect: Optional[Callable[[Any], Any]] = None,
                  assembly_ready: Optional[Callable[[List[BufferRecord]], Optional[List[BufferRecord]]]] = None,
                  rollout: Optional[Any] = None,
-                 pull_rule: Optional[Literal['group', 'prefix']] = None,
+                 group_pull: Optional[bool] = None,
                  need_rows: Optional[int] = None,
-                 ctx_mgr: Optional[RLContextManager] = None,
-                 ctx: Optional[RLContext] = None,
-                 run_id: Optional[str] = None,
+                 version_control: bool = False,
                  consume: Optional[Callable[[List[BufferRecord]], Optional[int]]] = None,
                  group_key: Optional[Callable[[Any], str]] = None,
                  score: Optional[Callable[[Any], Any]] = None,
-                 assemble: Optional[Callable[[List[BufferRecord]], Any]] = None,
-                 group_complete: Optional[Callable[[str, List[BufferRecord]], GroupDecision]] = None,
                  max_group_regenerations: int = 0,
                  regenerate: Optional[Callable[[str, List[Any]], bool]] = None,
                  baseline_fn: Optional[Callable[[str, List[Any]], Optional[float]]] = None,
@@ -306,23 +278,16 @@ class StreamingDriver:
                  snapshot_dir: Optional[str] = None,
                  adapter_name: Optional[str] = None,
                  max_steps: Optional[int] = None,
-                 reached_max: Optional[Callable[[], bool]] = None,
                  score_worker: Optional[Any] = None,
                  resource_adapter: Optional[Any] = None,
                  sleep: Optional[Callable[[float], None]] = None) -> None:
         # Fail loudly on a mis-wired seam: a non-callable injected here would otherwise surface deep
         # inside the run loop (or silently skip a lifecycle step), far from the construction that caused it.
-        # The group-barrier algorithm hooks decompose the deprecated ``group_complete`` seam: PRM
-        # scoring is the ``score_worker`` collaborator's own channel, the variance-style verdict is
-        # ``regenerate`` and the remax-style baseline is ``baseline_fn``. All three are optional and
-        # stack freely; wiring BOTH the deprecated hook and any of its replacements is rejected.
+        # The group-barrier algorithm hooks: PRM scoring is the ``score_worker`` collaborator's own channel,
+        # the variance-style verdict is ``regenerate`` and the remax-style baseline is ``baseline_fn``. All
+        # three are optional and stack freely.
         self._regenerate = regenerate
         self._baseline_fn = baseline_fn
-        if group_complete is not None and (regenerate is not None or baseline_fn is not None
-                                            or score_worker is not None):
-            raise ValueError('StreamingDriver group_complete is deprecated: its former jobs are now the '
-                             'score_worker / regenerate / baseline_fn parameters; pass one or the other, '
-                             'not both.')
         for name, fn in (('regenerate', regenerate), ('baseline_fn', baseline_fn)):
             if fn is not None and not callable(fn):
                 raise TypeError(f'StreamingDriver optional seam {name!r} must be callable or None, '
@@ -338,27 +303,28 @@ class StreamingDriver:
             poll = rollout.poll
         if collect is None and rollout is not None:
             collect = self._default_collect
-        # The pull rule is the same kind of defaulted knob: 'group' waits for whole num_generations
-        # groups and re-emits them contiguous, 'prefix' takes a whole-unit multiple of the buffer front.
-        # An explicit assembly_ready callable overrides either built-in.
-        if pull_rule is not None and pull_rule not in ('group', 'prefix'):
-            raise ValueError(f"pull_rule must be 'group' or 'prefix', got {pull_rule!r}")
-        if pull_rule is not None and need_rows is None:
-            raise ValueError(f'pull_rule={pull_rule!r} needs need_rows (train_batch_size * ga) to size a pull')
+        # The pull rule is the same kind of defaulted knob: group_pull=True waits for whole
+        # num_generations groups and re-emits them contiguous; False takes a whole-unit multiple of
+        # the buffer front without waiting for any group. An explicit assembly_ready callable
+        # overrides either built-in.
+        if group_pull is not None and not isinstance(group_pull, bool):
+            raise TypeError(f'group_pull must be a bool or None, got {type(group_pull).__name__}')
+        if group_pull is not None and need_rows is None:
+            raise ValueError(f'group_pull={group_pull!r} needs need_rows (train_batch_size * ga) to size a pull')
         if need_rows is not None and need_rows <= 0:
             raise ValueError(f'need_rows must be positive, got {need_rows}')
-        if assembly_ready is None and pull_rule == 'group':
+        if assembly_ready is None and group_pull:
             assembly_ready = self._make_group_pull_rule(num_generations, need_rows)
-        if assembly_ready is None and pull_rule == 'prefix':
-            assembly_ready = self._make_prefix_pull_rule(need_rows)
+        if assembly_ready is None and group_pull is False:
+            assembly_ready = self._make_no_group_pull_rule(need_rows)
         # Two more defaulted collaborators, same duck-typed style as ``rollout``: ``score_worker``
         # (protocol: ``score_group(samples) -> [N][n_scorers]`` rows) default-binds the ORM scoring
-        # -- 'group' runs it at the group barrier, 'prefix' at the pull boundary on the whole batch,
-        # so a per-sample consumer batches instead of one round-trip per sample; ``resource_adapter``
+        # -- group_pull=True runs it at the group barrier, False at the pull boundary on the whole
+        # batch, so a per-sample consumer batches instead of one round-trip per sample; ``resource_adapter``
         # (protocol: ``observe/decide/register_decision``) is fed at every pull boundary and inside
         # the publish bracket BEFORE the push, so its scaling decision is produced and consumed in
         # the same publication.
-        self._pull_rule = pull_rule
+        self._group_pull = group_pull
         self._score_worker = score_worker
         if score_worker is not None and not callable(getattr(score_worker, 'score_group', None)):
             raise TypeError(f'StreamingDriver score_worker needs a score_group(samples) method, '
@@ -377,44 +343,25 @@ class StreamingDriver:
                                 f'-- inject it explicitly or pass a rollout to default-bind it')
         # ``consume`` is optional: providing it selects the blocking regime (run() trains in-process, the
         # PPO/RFT/distill path); omitting it selects the iterator regime (run() is bridged to __next__ and
-        # the recipe trains, see __iter__). score/assemble/group_complete are the iterator regime's
-        # per-sample scoring, batch-assembly and group-barrier seams -- all optional and algorithm-agnostic.
-        for name, fn in (('consume', consume), ('score', score), ('assemble', assemble),
-                         ('group_complete', group_complete)):
+        # the recipe trains, see __iter__). ``score`` is the iterator regime's per-sample scoring seam --
+        # optional and algorithm-agnostic.
+        for name, fn in (('consume', consume), ('score', score)):
             if fn is not None and not callable(fn):
                 raise TypeError(f'StreamingDriver optional seam {name!r} must be callable or None, '
                                 f'got {type(fn).__name__}')
         if max_group_regenerations < 0:
             raise ValueError(f'max_group_regenerations must be non-negative, got {max_group_regenerations}')
-        # The control plane is OPTIONAL and has three shapes: BOTH ctx_mgr+ctx injected -> the RL regime
-        # with an external ledger (dev's builders; a SHARED manager is the multi-tenant composition point);
-        # run_id given -> the RL regime with an internally built ledger keyed by that string (the single-run
-        # shape; registers into an injected ctx_mgr when both are given); ALL of them None -> the infer
-        # regime (an internal _NullLedger: version pinned at 0, no staleness gate, no pins, nothing
-        # publishes). Mixing run_id with an explicit ctx, or ctx without ctx_mgr, is a wiring bug.
-        if ctx is not None and run_id is not None:
-            raise ValueError('Pass either run_id (the driver builds its own context) or an explicit ctx, not both.')
-        if ctx_mgr is None and ctx is not None:
-            raise ValueError('StreamingDriver needs BOTH ctx_mgr and ctx (the RL regime) or NEITHER (the infer '
-                             'regime, an internal null ledger); got ctx without ctx_mgr.')
-        if ctx_mgr is not None and ctx is None and run_id is None:
-            raise ValueError('StreamingDriver got ctx_mgr without a context: inject the ctx alongside it, or '
-                             'pass run_id and the driver builds its own context into this manager.')
-        if ctx_mgr is not None and not hasattr(ctx_mgr, 'request_rollout_partition'):
-            raise TypeError(f'StreamingDriver ctx_mgr must be an RLContextManager, got {type(ctx_mgr).__name__}')
+        # The control plane is OPTIONAL: version_control=True is the RL regime with an internally built
+        # version ledger; False is the infer regime (an internal _NullLedger: version pinned at 0, no
+        # staleness gate, no pins, nothing publishes).
+        if not isinstance(version_control, bool):
+            raise TypeError(f'version_control must be a bool, got {type(version_control).__name__}')
         if max_staleness < 0:
             raise ValueError(f'max_staleness must be non-negative, got {max_staleness}')
-        if ctx_mgr is None and run_id is not None:
+        if version_control:
             ctx_mgr = RLContextManager(max_staleness=max_staleness)
-        if run_id is not None:
-            from .types import RLContext
-
-            ctx = RLContext(tenant_id='default', training_run_id=run_id, base_model_id='policy',
+            ctx = RLContext(tenant_id='default', training_run_id='default', base_model_id='policy',
                             adapter_name=adapter_name)
-        if ctx_mgr is not None and ctx_mgr.max_staleness != max_staleness:
-            raise ValueError(f'max_staleness={max_staleness} disagrees with the injected control plane '
-                             f'(ctx_mgr.max_staleness={ctx_mgr.max_staleness}): the gate lives on the control '
-                             f'plane and the stale scan / backpressure sizing here must match it.')
         if num_generations <= 0:
             raise ValueError(f'num_generations must be positive, got {num_generations}')
         if groups_per_partition <= 0:
@@ -429,7 +376,7 @@ class StreamingDriver:
         # state the driver holds, and the weight push itself never lives here.
         self._ledger = (_ContextLedger(ctx_mgr, ctx, groups_per_partition=groups_per_partition,
                                        num_generations=num_generations)
-                        if ctx_mgr is not None else _NullLedger())
+                        if version_control else _NullLedger())
         self._prompt_stream = prompt_stream
         #: Passes over ``prompt_stream`` before it counts as exhausted (a fractional epoch still runs one
         #: truncated pass, ceil). The driver loops them itself because a dataloader reads one pass per
@@ -447,11 +394,9 @@ class StreamingDriver:
         self._assembly_ready = assembly_ready
         self._consume = consume
         self._score = score
-        self._assemble = assemble
-        self._group_complete = group_complete
         self._max_group_regenerations = max_group_regenerations
         # The PRM pass at the group barrier runs whenever the worker carries a wired channel -- its
-        # consumer may be a hook here (regenerate / baseline_fn / the deprecated group_complete) OR
+        # consumer may be a hook here (regenerate / baseline_fn) OR
         # the training half reading ``sample.prm_process`` downstream (advantage fusion); the
         # channel's own wiring is the signal, probed on the worker once (a Ray proxy shell exposes
         # no fields, so this cannot be a driver-side attribute read).
@@ -470,11 +415,10 @@ class StreamingDriver:
                 prune = self._default_prune_snapshots
         self._prune = prune if prune is not None else _no_prune
         self._initial_adapter_path = initial_adapter_path if initial_adapter_path is not None else _no_initial_path
-        # The optimizer-step budget: either an explicit reached_max callable (dev's builders) or a plain
-        # max_steps number compared against the steps commit() has reported so far.
+        # The optimizer-step budget: a plain max_steps number compared against the steps commit() has
+        # reported so far.
         self._max_steps = max_steps
         self._budget_steps = 0
-        self._reached_max = reached_max if reached_max is not None else self._default_reached_max
         self._sleep = sleep if sleep is not None else time.sleep
         self.stats = DriverStats()
         #: Optimizer steps the most recent ``_train_pull`` consume reported (its return channel).
@@ -540,7 +484,7 @@ class StreamingDriver:
         return _rule
 
     @staticmethod
-    def _make_prefix_pull_rule(need_rows: int) -> Callable[[List[BufferRecord]], Optional[List[BufferRecord]]]:
+    def _make_no_group_pull_rule(need_rows: int) -> Callable[[List[BufferRecord]], Optional[List[BufferRecord]]]:
         """Pull the buffer prefix in whole need_rows multiples (per-sample consumers).
 
         PPO / distillation score each sample independently, so there is no group
@@ -628,7 +572,7 @@ class StreamingDriver:
         batch, train it and count the optimizer steps it reports. A pass with in-flight work but no
         completion and no ready batch sleeps briefly instead of spinning.
 
-        Exits when the budget (``reached_max``) is hit, or one pass after the prompt stream is
+        Exits when the budget (``max_steps``) is hit, or one pass after the prompt stream is
         exhausted, the in-flight set has drained and ``assembly_ready`` declines the remaining buffer
         (the leftover -- an incomplete group or a sub-batch remainder -- is dropped in the ``finally``,
         counted as ``stats.dropped_incomplete``). The ``finally`` also ends (stop) and unpins whatever is
@@ -664,12 +608,12 @@ class StreamingDriver:
         stream_done = pending is None
         exhausted = False
         exhausted_notified = False
-        # Group-completion bookkeeping (only load-bearing when a ``group_complete`` seam is injected; the
+        # Group-completion bookkeeping (only load-bearing when a group-barrier hook is wired; the
         # counters are cheap and stay correct regardless). ``group_counts`` is the per-group collected count
         # in the ready buffer (the intra-group barrier reads it); ``group_prompt`` maps a group_key to the
-        # prompt it expands (a REGENERATE re-admits that prompt); ``resolved_groups`` fires the seam at most
-        # once per group; ``regen_queue`` holds (prompt, group_key) re-admissions a REGENERATE queued;
-        # ``regen_counts`` caps them at ``max_group_regenerations``.
+        # prompt it expands (a regenerate verdict re-admits that prompt); ``resolved_groups`` fires the
+        # barrier at most once per group; ``regen_queue`` holds (prompt, group_key) re-admissions a
+        # regenerate verdict queued; ``regen_counts`` caps them at ``max_group_regenerations``.
         group_counts: Dict[str, int] = {}
         group_prompt: Dict[str, Any] = {}
         resolved_groups: set = set()
@@ -677,7 +621,7 @@ class StreamingDriver:
         regen_counts: Dict[str, int] = {}
         try:
             while True:
-                if exhausted or self._reached_max():
+                if exhausted or self._default_reached_max():
                     break
 
                 # (1) Publish phase: run an EXTERNALLY-requested publication (see request_publish). The driver
@@ -721,7 +665,7 @@ class StreamingDriver:
                     while capacity > 0:
                         if partial is None:
                             if regen_queue:
-                                # A group the ``group_complete`` seam rejected (REGENERATE): re-admit its
+                                # A group the regenerate verdict rejected: re-admit its
                                 # prompt under the CURRENT policy version, REUSING its group_key (the same
                                 # logical group, retried) so its fresh siblings are counted, assembled and
                                 # barrier-checked together. No group_seq bump -- it is not a new epoch.
@@ -827,10 +771,10 @@ class StreamingDriver:
                 #     pulls only; the remainder stays buffered for the next batch).
                 records = self._assembly_ready(ready) if ready else None
                 if records:
-                    if self._score_worker is not None and self._pull_rule == 'prefix':
+                    if self._score_worker is not None and self._group_pull is False:
                         # A per-sample consumer scores at the PULL boundary: one batched pass over
-                        # the whole pulled batch (no group ever fires under 'prefix'), timed into
-                        # score_time exactly like the group barrier's pass.
+                        # the whole pulled batch (no group barrier ever fires when group_pull is
+                        # False), timed into score_time exactly like the group barrier's pass.
                         pulled = [record.sample for record in records]
                         _t = time.perf_counter()
                         if self._prm_ready:
@@ -1028,16 +972,15 @@ class StreamingDriver:
         pipeline, in order: the scoring pass (``score_worker.score_group`` -> ``sample.orm_reward``, or
         the merged ``score_group_prm`` -> both fields at once when a PRM channel is wired), the
         optional ``regenerate`` verdict, then -- once the group is final (accepted, or a regeneration
-        verdict past the cap accepted as-is) -- the optional ``baseline_fn`` write, or -- dev-compat
-        only -- the deprecated ``group_complete`` hook doing all three itself. Everything is timed into
-        ``stats.score_time`` HERE, not inside any hook. On ``REGENERATE`` (or a ``True`` verdict)
+        verdict past the cap accepted as-is) -- the optional ``baseline_fn`` write. Everything is timed
+        into ``stats.score_time`` HERE, not inside any hook. On a ``True`` regenerate verdict
         within the attempt cap the group's records are dropped from the buffer and its prompt
         re-queued for admission under the current policy version (the conservative staleness
         anchor); the group_key is reused so the retried siblings are counted and barrier-checked
         as one group. A verdict past the cap is accepted as-is, matching the fixed-batch
         dynamic-sampling fallback.
         """
-        if (self._group_complete is None and self._score_worker is None
+        if (self._score_worker is None
                 and self._regenerate is None and self._baseline_fn is None):
             return
         if group_key in resolved_groups:
@@ -1048,11 +991,11 @@ class StreamingDriver:
         samples = [record.sample for record in group_records]
         # The kernel-defaulted scoring: one scoring pass per channel that writes its results onto
         # the samples themselves, so whatever runs next (the algorithm's verdict hooks, the pull,
-        # the assembled batch) reads them off the samples. A 'prefix' consumer never reaches here
-        # (no group ever completes at num_generations > 1); under num_generations == 1 this barrier
+        # the assembled batch) reads them off the samples. A group_pull=False consumer never reaches
+        # here (no group ever completes at num_generations > 1); under num_generations == 1 this barrier
         # would degenerate to one score_group call PER SAMPLE -- the pull-boundary batch pass below
         # is the one that serves it.
-        if self._score_worker is not None and self._pull_rule != 'prefix':
+        if self._score_worker is not None and self._group_pull is not False:
             _t = time.perf_counter()
             if self._prm_ready:
                 rows, prm_refs = self._score_worker.score_group_prm(samples)
@@ -1063,14 +1006,7 @@ class StreamingDriver:
             self.stats.score_time += time.perf_counter() - _t
             for sample, row in zip(samples, rows):
                 sample.orm_reward = row
-        if self._group_complete is not None:
-            decision = self._group_complete(group_key, group_records)
-        else:
-            if self._regenerate is not None and self._regenerate(group_key, samples):
-                decision = GroupDecision.REGENERATE
-            else:
-                decision = GroupDecision.ACCEPT
-        if (decision == GroupDecision.REGENERATE
+        if (self._regenerate is not None and self._regenerate(group_key, samples)
                 and regen_counts.get(group_key, 0) < self._max_group_regenerations):
             for record in group_records:
                 ready.remove(record)
@@ -1079,10 +1015,10 @@ class StreamingDriver:
             resolved_groups.discard(group_key)
             regen_queue.append((group_prompt[group_key], group_key))
         else:
-            # The group is FINAL now (plainly accepted, or a REGENERATE verdict past the cap that
+            # The group is FINAL now (plainly accepted, or a regenerate verdict past the cap that
             # is accepted as-is): a remax-style baseline must land on every kept sibling here, or
             # this group would train with no baseline while its batch peers carry one.
-            if self._group_complete is None and self._baseline_fn is not None:
+            if self._baseline_fn is not None:
                 baseline = self._baseline_fn(group_key, samples)
                 if baseline is not None:
                     for sample in samples:
@@ -1106,13 +1042,12 @@ class StreamingDriver:
         """Iterator-regime consume: assemble the batch, hand it to ``__next__``, block for the recipe's ack.
 
         The FIXED output format is the list of scored samples (``group_key`` / ``policy_version`` stamped
-        by the kernel, scoring fields written by the hooks); the optional ``assemble`` override replaces
-        it with a custom batch object. The batch goes on the single-slot queue (the driver thread blocks on
+        by the kernel, scoring fields written by the hooks). The batch goes on the single-slot queue (the driver thread blocks on
         the ack right after, so the queue never overflows and generation keeps overlapping on the sampler
         actor), and the step count the recipe reports via :meth:`commit` becomes this consume's return --
         the publish cadence unit.
         """
-        batch = self._assemble(records) if self._assemble is not None else [record.sample for record in records]
+        batch = [record.sample for record in records]
         self._committed_steps = 0
         self._ack_event.clear()
         self._batch_queue.put(batch)
@@ -1133,7 +1068,7 @@ class StreamingDriver:
             raise RuntimeError(
                 'StreamingDriver was constructed with a blocking consume seam, so it is driven by run() and '
                 'is not iterable. To iterate (`for batch in driver:`), construct it with consume=None and '
-                'inject the score/assemble/group_complete seams instead.')
+                'inject the score seam instead.')
         if self._iter_thread is not None:
             raise RuntimeError('StreamingDriver iteration was already started; a driver instance is single-use.')
         self._batch_queue = queue.Queue(maxsize=1)

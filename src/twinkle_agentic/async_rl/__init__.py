@@ -25,7 +25,6 @@ _EXPORTS = {
     'ClusterAdapter': 'cluster_adapter',
     'ContextStatus': 'context_manager',
     'DriverStats': 'streaming_driver',
-    'GroupDecision': 'streaming_driver',
     'InPlaceWeightSync': 'weight_sync',
     'LoraContextManager': 'context_manager',
     'ModelMemoryEstimate': 'cluster_adapter',

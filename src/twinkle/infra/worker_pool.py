@@ -368,6 +368,7 @@ class WorkerPool:
                 tp = getattr(mesh, 'tp_world_size', 1) or 1
                 dp = max(1, len(self._actors) // tp)
                 self.device_mesh = DeviceMesh.from_sizes(world_size=dp * tp, dp_size=dp, tp_size=tp)
+            self._drop_worker_bookkeeping(worker_ids)
         error = None
         for actor in actors:
             try:
@@ -377,6 +378,30 @@ class WorkerPool:
         if error is not None:
             raise error
         return True
+
+    def _drop_worker_bookkeeping(self, worker_ids):
+        """Retire removed workers' bookkeeping: sticky ownership, pool admission tables, cw load.
+
+        Called from both retirement paths (_discard_workers and remove_replicas) so model replicas
+        get the same cleanup as engine workers. Re-entrant: callers already hold _worker_lock (an
+        RLock) or it does not exist yet.
+        """
+        lock = getattr(self, '_worker_lock', None)
+        with (lock if lock is not None else nullcontext()):
+            for worker_id in worker_ids:
+                _sticky_drop_worker(worker_id)
+            if hasattr(self, '_sampler_workers'):
+                for worker_id in worker_ids:
+                    self._sampler_workers.pop(worker_id, None)
+                self._suspended_workers.difference_update(worker_ids)
+                self._paused_generation_workers.difference_update(worker_ids)
+            state = getattr(self, '_continous_work_state', None)
+            if state is not None:
+                with state['lock']:
+                    refs = [ref for ref, (owner, _) in state['owners'].items() if owner in worker_ids]
+                    _cw_drop_locked(state, refs)
+                    for worker_id in worker_ids:
+                        state['load'].pop(worker_id, None)
 
     def _discard_workers(self, actors):
         """Terminate engines and actors; keep cleaning the remaining members even if one close fails."""
@@ -406,20 +431,7 @@ class WorkerPool:
             lock = getattr(self, '_worker_lock', None)
             with (lock if lock is not None else nullcontext()):
                 self._actors = tuple(actor for actor in self._actors if get_worker_id(actor) not in worker_ids)
-                for worker_id in worker_ids:
-                    _sticky_drop_worker(worker_id)
-                if hasattr(self, '_sampler_workers'):
-                    for worker_id in worker_ids:
-                        self._sampler_workers.pop(worker_id, None)
-                    self._suspended_workers.difference_update(worker_ids)
-                    self._paused_generation_workers.difference_update(worker_ids)
-                state = getattr(self, '_continous_work_state', None)
-                if state is not None:
-                    with state['lock']:
-                        refs = [ref for ref, (owner, _) in state['owners'].items() if owner in worker_ids]
-                        _cw_drop_locked(state, refs)
-                        for worker_id in worker_ids:
-                            state['load'].pop(worker_id, None)
+                self._drop_worker_bookkeeping(worker_ids)
         if error is not None:
             raise error
 
@@ -448,7 +460,7 @@ _POOL_METHODS = (
     '_record_worker_configuration', 'add_workers', '_worker_ready', 'activate_workers', 'drain_workers',
     'pause_workers', 'suspend_admission', 'resume_admission', 'close_admission', 'worker_inflight',
     'inflight_count', 'workers_idle', 'remove_workers', 'add_replicas', 'remove_replicas',
-    '_discard_workers', 'close_workers',
+    '_discard_workers', '_drop_worker_bookkeeping', 'close_workers',
 )
 
 
