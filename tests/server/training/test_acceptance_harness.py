@@ -110,3 +110,10 @@ def test_training_release_assertion_excludes_but_does_not_remove_sampling(monkey
     groups['training'] = {'name': training_name, 'state': 'CREATED'}
     with pytest.raises(AssertionError):
         assert_released(controller, namespace)
+
+
+@pytest.mark.parametrize('values', [[], [0.0, 0.0], [float('nan')], [float('-inf')]])
+def test_checkpoint_probe_rejects_vacuous_comparisons(values):
+    from tests.server.integration.on_demand_training.acceptance_support import checked_logps
+    with pytest.raises(AssertionError):
+        checked_logps(values)

@@ -8,6 +8,15 @@ import requests
 from tests.server.integration.on_demand_training.on_demand_sdk import unload_tinker_model
 
 
+def checked_logps(values):
+    """Reject empty/default metric values before numerical checkpoint comparisons."""
+    import numpy as np
+    values = np.asarray(values, dtype=float).reshape(-1)
+    assert values.size and np.isfinite(values).all(), 'Empty or non-finite checkpoint probe'
+    assert (values < 0).any(), 'Checkpoint probe contains no nontrivial token log probabilities'
+    return values
+
+
 class TrainingHandle:
     """A small fixed-token workload with optimizer checkpoint support."""
 
@@ -77,10 +86,7 @@ class TrainingHandle:
         else:
             result = self.client.forward(self.datums(), 'cross_entropy').result()
             values = [output['logprobs'].tolist() for output in result.loss_fn_outputs]
-        import numpy as np
-        values = np.asarray(values, dtype=float).reshape(-1)
-        assert values.size and np.isfinite(values).all(), 'Non-finite checkpoint probe'
-        return values
+        return checked_logps(values)
 
     def save(self, name):
         if self.protocol == 'twinkle':

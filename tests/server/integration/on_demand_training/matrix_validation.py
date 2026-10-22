@@ -37,8 +37,16 @@ def validate_controller_restart(base_url, controller, model_name):
     snapshots = []
     try:
         for handle in old:
+            # Two calls end the native GA=2 workload on an optimizer boundary.
             handle.step()
-            snapshots.append((handle.save('restart-state'), handle.evaluate(), handle.consumed_samples))
+            handle.step()
+            path = handle.save('restart-state')
+            values, consumed = handle.evaluate(), handle.consumed_samples
+            handle.step()
+            handle.step()
+            continued = handle.evaluate()
+            assert np.max(np.abs(continued - values)) > 2e-3, 'The reference optimizer did not change logprobs'
+            snapshots.append((path, values, consumed, continued))
         old_epoch = ray.get(controller.diagnostics.remote())['epoch']
         ray.kill(controller, no_restart=False)
 
@@ -57,7 +65,8 @@ def validate_controller_restart(base_url, controller, model_name):
         try:
             # Keep restored peers on one runtime: checkpoint/optimizer isolation
             # is checked without reloading the base model for each protocol.
-            for protocol, (path, values, consumed) in zip(('twinkle', 'tinker'), snapshots):
+            optimizer_errors = {}
+            for protocol, (path, values, consumed, continued) in zip(('twinkle', 'tinker'), snapshots):
                 fresh = TrainingHandle(base_url, model_name, protocol, 'restored-' + protocol)
                 restored.append(fresh)
                 progress = fresh.resume(path)
@@ -65,6 +74,14 @@ def validate_controller_restart(base_url, controller, model_name):
                     assert progress['consumed_train_samples'] == consumed
                 np.testing.assert_allclose(fresh.evaluate(), values, rtol=0, atol=2e-3)
                 fresh.step()
+                fresh.step()
+                resumed = fresh.evaluate()
+                np.testing.assert_allclose(resumed, continued, rtol=0, atol=2e-3)
+                optimizer_errors[protocol] = {
+                    'max_error': float(np.max(np.abs(resumed - continued))),
+                    'checkpoint_logps': values.tolist(), 'continued_logps': continued.tolist(),
+                    'resumed_logps': resumed.tolist(),
+                }
             active = next(row for row in ray.get(controller.diagnostics.remote())['instances']
                           if restored[0].identity in row['training_ids'])
             assert set(active['training_ids']) == {handle.identity for handle in restored}
@@ -90,7 +107,8 @@ def validate_controller_restart(base_url, controller, model_name):
     finally:
         for handle in old:
             handle.close(stale=True)
-    return {'epoch': diagnostic['epoch'], 'worker_fault_recovered': True, 'checkpoint_restored': True}
+    return {'epoch': diagnostic['epoch'], 'worker_fault_recovered': True, 'checkpoint_restored': True,
+            'optimizer_continuation': optimizer_errors}
 
 
 def validate_idempotent_create(base_url, controller, model_name):
