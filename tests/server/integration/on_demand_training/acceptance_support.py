@@ -11,7 +11,8 @@ from tests.server.integration.on_demand_training.on_demand_sdk import unload_tin
 def checked_logps(values):
     """Reject empty/default metric values before numerical checkpoint comparisons."""
     import numpy as np
-    values = np.asarray(values, dtype=float).reshape(-1)
+    rows = [np.asarray(row, dtype=float).reshape(-1) for row in values]
+    values = np.concatenate(rows) if rows else np.array([], dtype=float)
     assert values.size and np.isfinite(values).all(), 'Empty or non-finite checkpoint probe'
     assert (values < 0).any(), 'Checkpoint probe contains no nontrivial token log probabilities'
     return values

@@ -117,3 +117,8 @@ def test_checkpoint_probe_rejects_vacuous_comparisons(values):
     from tests.server.integration.on_demand_training.acceptance_support import checked_logps
     with pytest.raises(AssertionError):
         checked_logps(values)
+
+
+def test_checkpoint_probe_accepts_variable_length_sequences():
+    from tests.server.integration.on_demand_training.acceptance_support import checked_logps
+    assert checked_logps([[-0.25, -0.5], [-0.75]]).tolist() == [-0.25, -0.5, -0.75]
