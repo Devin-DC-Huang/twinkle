@@ -27,6 +27,8 @@ flowchart TD
 
 The three runtime modules have different boundaries: `server/runtime.py` initializes Twinkle and DeviceMesh; `resources/runtime.py` owns Ray/Serve effects; `sampler/runtime.py` tracks request execution inside a sampling instance.
 
+Multi-LoRA execution registers every preallocated slot with the distributed reducer. DDP requires `find_unused_parameters=True` and `static_graph=False`; FSDP requires `reshard_after_forward=True` so adapter switches act on sharded parameters instead of retained views. Incompatible overrides fail during model initialization, before weights are loaded.
+
 ## Sampling ownership and state reconstruction
 
 Stable sampling uses shared access; configuration and full-weight updates use exclusive access. Every participating instance is reserved before an update. Idle sweep checks the same reservations under the state lock. The lock order is configuration then state; startup is never awaited while holding the configuration lock.

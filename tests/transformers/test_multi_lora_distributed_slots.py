@@ -99,6 +99,18 @@ def test_multi_lora_rejects_static_ddp_reducers(options, monkeypatch):
         MultiLoraTransformersModel(ddp_config=options)
 
 
+@pytest.mark.parametrize('reshard_after_forward', [None, False, 2])
+def test_multi_lora_rejects_retained_or_partial_fsdp_views(reshard_after_forward, monkeypatch):
+    monkeypatch.setattr(MultiLoraTransformersModel, '_try_init_process_group', lambda _: None)
+
+    def unexpected_strategy(*args):
+        raise AssertionError('Invalid FSDP config reached strategy initialization')
+
+    monkeypatch.setattr(MultiLoraTransformersModel, '_decide_strategy', unexpected_strategy)
+    with pytest.raises(ValueError, match='Multi-LoRA FSDP requires reshard_after_forward=True'):
+        MultiLoraTransformersModel(fsdp_config={'reshard_after_forward': reshard_after_forward})
+
+
 def test_checkpoint_as_first_operation_preserves_fresh_slot_reset_basis(tmp_path):
     config = LoraConfig(r=2, lora_alpha=2, target_modules=['0'])
     manager = MultiLora(max_loras=1, max_r=2)

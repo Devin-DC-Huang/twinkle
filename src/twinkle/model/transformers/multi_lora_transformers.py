@@ -48,6 +48,8 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self.device_mesh = device_mesh
         self.mixed_precision = mixed_precision
         self._fsdp_config = dict(fsdp_config or {})
+        if self._fsdp_config.get('reshard_after_forward', True) is not True:
+            raise ValueError('Multi-LoRA FSDP requires reshard_after_forward=True for safe adapter switching.')
         self._ddp_config = dict(ddp_config or {})
         if self._ddp_config.get('find_unused_parameters') is False or self._ddp_config.get('static_graph', False):
             raise ValueError('Multi-LoRA DDP requires find_unused_parameters=True and static_graph=False.')
