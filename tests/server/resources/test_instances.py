@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 import logging
 import pytest
@@ -80,3 +81,42 @@ async def test_shared_health_rule_tolerates_transient_probe_timeout():
     assert not lifecycle.unreachable_since
     assert await lifecycle.health('instance', unreachable) is None
     assert await lifecycle.health('instance', failed) is False
+
+
+@pytest.mark.asyncio
+async def test_shutdown_actor_lookup_cannot_block_the_close_deadline(monkeypatch):
+    import threading
+    from unittest.mock import AsyncMock
+    import ray
+    from ray import serve
+    from twinkle.server.resources.runtime import RayRuntime
+
+    runtime = RayRuntime('test', allocation_timeout=1, shutdown_timeout=1)
+    entered, resume, returned = threading.Event(), threading.Event(), threading.Event()
+
+    def lookup(*args, **kwargs):
+        entered.set()
+        try:
+            # A bounded fallback makes the broken implementation fail rather than hang pytest.
+            if not resume.wait(2):
+                raise TimeoutError('blocked actor class import')
+            raise ValueError('actor already gone')
+        finally:
+            returned.set()
+
+    monkeypatch.setattr(ray.util, 'list_named_actors', lambda **kwargs: [{'namespace': 'test', 'name': 'owned-worker'}])
+    monkeypatch.setattr(ray, 'get_actor', lookup)
+    monkeypatch.setattr(serve, 'delete', lambda name: None)
+    runtime.pool.remove = AsyncMock()
+    stopped, quarantined = AsyncMock(), AsyncMock()
+    lifecycle = InstanceLifecycle('test')
+    try:
+        await lifecycle.close('owned', lambda: runtime.shutdown('owned', 'app'), .02, stopped, quarantined)
+        assert entered.is_set()
+        quarantined.assert_awaited_once()
+        stopped.assert_not_awaited()
+        assert not returned.is_set(), 'Synchronous actor lookup blocked the event loop past the close deadline'
+    finally:
+        resume.set()
+        await asyncio.to_thread(returned.wait, 3)
+        await lifecycle.join()

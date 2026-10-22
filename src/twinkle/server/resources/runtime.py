@@ -94,15 +94,18 @@ class RayRuntime:
             self.deployments.pop(identity, None)
         # Both features give workers the controller identity, not a Serve replica ID.
         actors = []
-        for row in list_named_actors(all_namespaces=True):
+        for row in await asyncio.to_thread(list_named_actors, all_namespaces=True):
             if row['namespace'] != self.namespace or identity not in row['name']:
                 continue
             try:
-                handle = ray.get_actor(row['name'], namespace=self.namespace)
+                # Ray may import the worker class when resolving its handle.
+                # Keep imports and GCS calls outside the controller event loop
+                # so its shutdown deadline and other instances remain live.
+                handle = await asyncio.to_thread(ray.get_actor, row['name'], namespace=self.namespace)
             except ValueError:
                 continue
             actors.append(handle)
-            ray.kill(handle, no_restart=True)
+            await asyncio.to_thread(ray.kill, handle, no_restart=True)
         await asyncio.to_thread(serve.delete, name)
         started, status = time.monotonic(), 'error'
         try:
