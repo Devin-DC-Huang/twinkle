@@ -1,10 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Directed tests for ``gateway/proxy.py``.
-
-Covers the route-URL construction now sourced from ``gateway.routes``, the
-``H_MULTIPLEX`` header compatibility in ``_prepare_headers``, and the 502 ``ErrorPayload``
-fallback when the upstream is unreachable.
-"""
+"""ServiceProxy URL construction, headers, bounded waits, and upstream error mapping."""
 from __future__ import annotations
 
 import asyncio

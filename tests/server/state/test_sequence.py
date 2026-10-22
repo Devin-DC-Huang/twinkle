@@ -57,7 +57,7 @@ async def test_out_of_order_sequences_and_preflight_release_remain_retryable(sta
 
 @pytest.mark.asyncio
 async def test_retiring_a_handle_removes_native_and_tinker_stream_ledgers(state):
-    from tests.server.training.test_controller import create, setup
+    from tests.server.training.helpers import create, setup
     controller, state, _, _ = await setup(backend=state._backend)
     try:
         identity = await create(controller, state, 'dedup-retirement')

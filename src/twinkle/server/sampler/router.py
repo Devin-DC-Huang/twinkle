@@ -13,7 +13,8 @@ from twinkle.server.checkpoint import create_checkpoint_manager
 from twinkle.server.deployment import bind_deployment, build_deployment_app
 from twinkle.server.middleware.auth import get_token_from_request
 from twinkle.server.state import get_server_state
-from .controller import create_controller_actor, sampler_controller_name, sampling_pool_id
+from .actor import create_controller_actor
+from .controller import sampler_controller_name, sampling_pool_id
 from .weights import is_full_checkpoint
 
 

@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests.server.utils.test_task_queue_mixin import _DummyQueue
+from tests.server.task_queue.helpers import _DummyQueue
 from twinkle.server.config.task_queue import TaskQueueConfig
 from twinkle.server.sampler.concurrency import SamplerConcurrency
 from twinkle.server.task_queue.types import ExecutionScope, execution_scope

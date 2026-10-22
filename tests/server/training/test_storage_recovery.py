@@ -8,7 +8,7 @@ import pytest
 from twinkle.server.state.backend.memory_backend import RayActorBackend
 from twinkle.server.state.backend.redis_backend import RedisBackend
 from twinkle.server.training.controller import TrainingController
-from tests.server.training.test_controller import create, request, setup
+from tests.server.training.helpers import create, request, setup
 
 
 @pytest.mark.asyncio

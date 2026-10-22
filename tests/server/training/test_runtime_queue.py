@@ -3,43 +3,14 @@
 import asyncio
 import threading
 from types import SimpleNamespace
+from tests.server.training.helpers import RPC, RuntimeQueue, settle
 
 import pytest
 
 from twinkle.server.config.task_queue import TaskQueueConfig
 from twinkle.server.task_queue import TaskQueueMixin
 from twinkle.server.model.managed_runtime import ManagedTrainingRuntime, _tinker_operation
-from tests.server.training.test_controller import create, setup
-
-
-class RPC:
-    def __init__(self, method):
-        self.method = method
-
-    def remote(self, *args, **kwargs):
-        return asyncio.create_task(self.method(*args, **kwargs))
-
-
-class RuntimeQueue(ManagedTrainingRuntime, TaskQueueMixin):
-    def __init__(self, controller, state, instance):
-        self.state, self.replica_id = state, instance.instance_id
-        self.training_context = {'instance_id': instance.instance_id, 'epoch': controller.epoch}
-        self._model_unhealthy = False
-        self._training_controller = SimpleNamespace(**{
-            name: RPC(getattr(controller, name))
-            for name in ('admit', 'finish_operation', 'fail_instance')
-        })
-        self._init_task_queue(TaskQueueConfig(execution_timeout=0.1, inline_fast_path_timeout=0.01),
-                              enable_admission_gate=True)
-
-
-async def settle(state, request_id):
-    for _ in range(300):
-        future = await state.get_future(request_id)
-        if future and future['status'] in ('completed', 'failed', 'cancelled'):
-            return future
-        await asyncio.sleep(0.01)
-    raise AssertionError('Future did not settle')
+from tests.server.training.helpers import create, setup
 
 
 @pytest.mark.asyncio

@@ -7,7 +7,7 @@ import pytest
 from starlette.requests import Request
 
 from tests.server.state.fake_backend import FakeBackend
-from tests.server.training.test_runtime_queue import settle
+from tests.server.training.helpers import settle
 from twinkle.hub import HubOperation
 from twinkle.server.state import ServerState
 from twinkle.server.training.router import TrainingRouter

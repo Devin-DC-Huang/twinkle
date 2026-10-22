@@ -8,7 +8,7 @@ from unittest.mock import Mock
 import pytest
 
 from tests.server.state.fake_backend import FakeBackend
-from tests.server.training.test_controller import create, setup
+from tests.server.training.helpers import create, setup
 from twinkle.server.model.managed_runtime import ManagedTrainingRuntime
 from twinkle.server.state.training_records import CreateTraining
 

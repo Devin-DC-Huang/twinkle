@@ -98,3 +98,14 @@ def test_server_components_form_declared_dag():
     assert not violations, (
         'Server dependencies must point strictly down the declared DAG; '
         f'invalid edges={violations}')
+
+
+@pytest.mark.parametrize('component', ['training', 'sampler'])
+def test_controller_import_does_not_load_ray_composition(component):
+    code = f'''import twinkle.server.{component}.controller
+import sys
+assert 'ray' not in sys.modules or not sys.modules['ray'].is_initialized()
+assert not any('twinkle.server.{component}.' + name in sys.modules for name in ('actor', 'driver', 'app'))
+'''
+    result = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr

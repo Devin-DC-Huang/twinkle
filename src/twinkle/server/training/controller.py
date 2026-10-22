@@ -21,6 +21,7 @@ from twinkle.server.state.training_records import (LIVE_INSTANCES, TERMINAL_TRAI
                                                    TrainingRecord)
 from twinkle.server.state.training_store import TrainingStore
 from twinkle.server.telemetry.metrics import get_training_metrics
+from twinkle.server.telemetry.training_metrics import TrainingInstanceMetrics, quarantine_reason
 from .catalog import TrainingCatalog, TrainingSpec
 from .errors import TrainingExpiredError
 
@@ -93,8 +94,7 @@ class TrainingController:
         self._lock = asyncio.Lock()
         self._ready = False
         self._metrics = get_training_metrics()
-        self._reported_metric_keys: set[tuple[str, str, str, str]] = set()
-        self._reported_resource_metric_keys: set[tuple[str, str, str]] = set()
+        self._instance_metrics = TrainingInstanceMetrics(self._metrics)
 
     def _instance_metric_tags(self, instance: InstanceRecord) -> dict[str, str]:
         spec = self.catalog.get(instance.base_model, instance.mode)
@@ -106,39 +106,10 @@ class TrainingController:
         }
 
     def _report_instance_metrics(self) -> None:
-        counts: dict[tuple[str, str, str, str], int] = {}
-        resources: dict[tuple[str, str], tuple[int, int]] = {}
-        for instance in self.instances.values():
-            if instance.state == 'STOPPED':
-                continue
-            tags = self._instance_metric_tags(instance)
-            key = tuple(tags[name] for name in ('backend', 'mode', 'state', 'resident'))
-            counts[key] = counts.get(key, 0) + 1
-            resource_key = tags['backend'], tags['mode'], self.catalog.get(instance.base_model,
-                                                                           instance.mode).model.device_type
-            devices, groups = resources.get(resource_key, (0, 0))
-            resources[resource_key] = (devices + len(instance.devices), groups + int(bool(instance.application_name)))
-        for key in self._reported_metric_keys | counts.keys():
-            tags = dict(zip(('backend', 'mode', 'state', 'resident'), key))
-            self._metrics.instances_active.set(counts.get(key, 0), tags=tags)
-        for key in self._reported_resource_metric_keys | resources.keys():
-            tags = dict(zip(('backend', 'mode', 'device_type'), key))
-            devices, groups = resources.get(key, (0, 0))
-            self._metrics.devices_allocated.set(devices, tags=tags)
-            self._metrics.placement_groups_active.set(groups, tags=tags)
-        self._reported_metric_keys = set(counts)
-        self._reported_resource_metric_keys = set(resources)
-
-    @staticmethod
-    def _quarantine_reason(exc: Exception) -> str:
-        message = str(exc).lower()
-        if isinstance(exc, TimeoutError):
-            return 'timeout'
-        if 'worker death' in message:
-            return 'worker_death'
-        if 'placement group' in message:
-            return 'pg_removal'
-        return 'other'
+        self._instance_metrics.report((self._instance_metric_tags(instance),
+                                       self.catalog.get(instance.base_model, instance.mode).model.device_type,
+                                       len(instance.devices), int(bool(instance.application_name)))
+                                      for instance in self.instances.values() if instance.state != 'STOPPED')
 
     async def initialize(self) -> None:
         """Discard old state only after owned compute has been confirmed dead."""
@@ -618,7 +589,7 @@ class TrainingController:
                 self._metrics.quarantined_total.inc(tags={
                     'backend': tags['backend'],
                     'mode': tags['mode'],
-                    'reason': self._quarantine_reason(exc),
+                    'reason': quarantine_reason(exc),
                 })
             self._metrics.shutdown_seconds.observe(time.monotonic() - started, tags={**timing_tags, 'status': 'error'})
 

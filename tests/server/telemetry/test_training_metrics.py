@@ -7,6 +7,7 @@ import pytest
 
 from twinkle.server.telemetry import metrics
 from twinkle.server.training.controller import TrainingController
+from twinkle.server.telemetry.training_metrics import TrainingInstanceMetrics
 
 _ALLOWED_ATTRIBUTES = {'backend', 'mode', 'state', 'status', 'reason', 'device_type', 'resident'}
 
@@ -106,8 +107,7 @@ def test_controller_metrics_clear_old_states_and_released_resources(monkeypatch,
     controller = TrainingController.__new__(TrainingController)
     controller.catalog = SimpleNamespace(get=lambda base_model, mode: spec)
     controller._metrics = registry.training_metrics()
-    controller._reported_metric_keys = set()
-    controller._reported_resource_metric_keys = set()
+    controller._instance_metrics = TrainingInstanceMetrics(controller._metrics)
     controller.instances = {
         str(index): SimpleNamespace(
             instance_id=f'instance_{index}', base_model='private-model', mode='lora',
@@ -148,5 +148,3 @@ def test_controller_metrics_clear_old_states_and_released_resources(monkeypatch,
     controller._report_instance_metrics()
     for name in (instances_name, devices_name, groups_name):
         assert all(value == 0 for value in totals(name).values())
-    assert not controller._reported_metric_keys
-    assert not controller._reported_resource_metric_keys

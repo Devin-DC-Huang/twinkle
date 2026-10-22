@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Exercise real controller/storage decisions against a controllable runtime."""
 from __future__ import annotations
+from tests.server.training.helpers import Clock, Runtime, setup, request, create
 
 import asyncio
 
@@ -14,62 +15,6 @@ from twinkle.server.training.controller import TrainingController
 from twinkle.server.training.errors import TrainingExpiredError
 from twinkle.server.resources.allocation import CapacityUnavailableError
 from twinkle.server.state.training_records import CreateTraining
-
-
-class Clock:
-    now = 0.0
-
-    def __call__(self):
-        return self.now
-
-
-class Runtime:
-    """Allocates a finite pool and stores actual per-user state for assertions."""
-
-    def __init__(self, devices=16):
-        self.devices = devices
-        self.allocations = {}
-        self.users = {}
-        self.starts = 0
-        self.stopped = []
-        self.start_gate = asyncio.Event()
-        self.start_gate.set()
-        self.fail_start = False
-        self.fail_shutdown = False
-
-    async def allocate(self, instance, spec):
-        self.starts += 1
-        if self.fail_start:
-            raise RuntimeError('injected startup failure')
-        used = sum(self.allocations.values())
-        if used + spec.config.num_devices > self.devices:
-            raise CapacityUnavailableError('No devices available')
-        self.allocations[instance.instance_id] = spec.config.num_devices
-        return {}
-
-    async def deploy(self, instance, spec):
-        await self.start_gate.wait()
-
-    async def create_training(self, instance, training, request):
-        assert instance.instance_id in self.allocations
-        assert training.training_id not in self.users
-        self.users[training.training_id] = {'instance': instance.instance_id, 'label': training.adapter_label, 'steps': 0}
-
-    async def release_training(self, instance, training):
-        self.users.pop(training.training_id, None)
-
-    async def shutdown(self, instance):
-        if self.fail_shutdown:
-            raise RuntimeError('cannot confirm process death')
-        self.allocations.pop(instance.instance_id, None)
-        self.users = {key: value for key, value in self.users.items() if value['instance'] != instance.instance_id}
-        self.stopped.append(instance.instance_id)
-
-    async def verify_operation(self, instance, request_id):
-        return {'state': 'pending'}
-
-    async def recover_orphans(self):
-        pass
 
 
 @pytest.mark.asyncio
@@ -241,34 +186,6 @@ async def test_legacy_session_and_max_lifetime_bounds_keep_their_original_meanin
     await controller.sweep()
     await controller.wait_for_jobs()
     assert controller.trainings[second].state == 'EXPIRED'
-
-
-async def setup(*, devices=16, min_replicas=0, max_replicas=None, quota=100, backend=None):
-    mode = {'num_devices': 2, 'device_mesh': {'fsdp_size': 2}, 'max_loras': 5,
-            'idle_timeout_s': 10, 'min_replicas': min_replicas, 'max_replicas': max_replicas}
-    config = TrainingConfig(models=[{
-        'name': 'small', 'model_id': 'ms://small', 'backend': 'mock', 'device_type': 'cuda',
-        'modes': {'lora': mode, 'full': {'num_devices': 2, 'device_mesh': {'fsdp_size': 2}, 'idle_timeout_s': 10}},
-    }])
-    state = ServerState(backend=backend or RayActorBackend(), per_token_model_limit=quota)
-    await state.create_session({'session_id': 'session'})
-    runtime, clock = Runtime(devices), Clock()
-    controller = TrainingController(config, state.create_training_store('unit'), runtime, clock=clock)
-    await controller.initialize()
-    return controller, state, runtime, clock
-
-
-def request(key, *, mode='lora', label='same', token='owner'):
-    return CreateTraining(base_model='small', mode=mode, token=token, session_id='session', create_key=str(key),
-                          client_type='twinkle', payload={}, adapter_label=label)
-
-
-async def create(controller, state, key, **kwargs):
-    ref = await controller.create(request(key, **kwargs))
-    await controller.wait_for_jobs()
-    future = await state.get_future(ref['request_id'])
-    assert future['status'] == 'completed', future
-    return future['result']['training_id']
 
 
 @pytest.mark.asyncio

@@ -7,8 +7,8 @@ from unittest.mock import AsyncMock
 import pytest
 
 from tests.server.state.fake_backend import FakeBackend
-from tests.server.training.test_controller import create, request, setup
-from tests.server.training.test_runtime_queue import RPC, RuntimeQueue, settle
+from tests.server.training.helpers import create, request, setup
+from tests.server.training.helpers import RPC, RuntimeQueue, settle
 from twinkle.protocol.types.errors import ErrorCategory
 from twinkle.server.exceptions import ResourceExhaustedError, ResourceNotFoundError
 from twinkle.server.state.models import FAILURE_REASON_CODES, FutureFailureRecord
