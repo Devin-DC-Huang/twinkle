@@ -349,6 +349,13 @@ def main():
         elif args.full_cycle_only:
             filenames = ['test_full_cycle_e2e.py']
         for filename in filenames:
+            collection = subprocess.run([
+                sys.executable, '-m', 'pytest', '--noconftest', '--collect-only', '-q',
+                str(root / 'tests/server/integration' / filename),
+            ], capture_output=True, text=True, env=os.environ.copy(), timeout=180)
+            (run_dir / (filename + '.collect.log')).write_text(collection.stdout + collection.stderr)
+            expected = sum('::test_' in line for line in collection.stdout.splitlines())
+            assert collection.returncode == 0 and expected > 0, collection.stdout + collection.stderr
             start = time.monotonic()
             with (run_dir / (filename + '.log')).open('w') as output:
                 result = subprocess.run([
@@ -377,7 +384,8 @@ def main():
             })
             (run_dir / 'results.json').write_text(json.dumps(evidence, indent=2))
             assert result.returncode == 0, f'{filename} failed; see {run_dir / (filename + ".log")}'
-            assert len(cases) == (1 if filename == 'test_full_cycle_e2e.py' else 2) and skipped == 0
+            assert len(cases) == expected and skipped == 0
+            assert not any(case.find('failure') is not None or case.find('error') is not None for case in cases)
         base_url = f'http://127.0.0.1:{port}'
         model_name = config.training_config.models[0].name
         evidence['recovery'] = []
