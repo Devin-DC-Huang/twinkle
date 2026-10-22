@@ -11,7 +11,8 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Coroutine
-from dataclasses import dataclass
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from enum import Enum
 
 # Ray_Get_Timeout is classified the same as asyncio.TimeoutError: 504/Server.
@@ -59,6 +60,19 @@ class QueueState(Enum):
 
 
 @dataclass
+class ExecutionScope:
+    """Completion witnesses for an operation, independent of its client future."""
+    jobs: set[asyncio.Task] = field(default_factory=set)
+    request_ids: set[str] = field(default_factory=set)
+
+    async def wait(self):
+        await asyncio.gather(*tuple(self.jobs), return_exceptions=True)
+
+
+execution_scope = ContextVar('execution_scope', default=None)
+
+
+@dataclass
 class QueuedTask:
     """Dataclass representing a task waiting in the compute queue."""
     request_id: str
@@ -69,4 +83,3 @@ class QueuedTask:
     task_type: str | None
     created_at: float
     on_finished: Callable[[bool, bool], Coroutine] | None = None
-    on_enqueued: Callable[[], Coroutine] | None = None

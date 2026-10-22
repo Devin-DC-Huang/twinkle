@@ -47,9 +47,8 @@ class TaskQueueMixin:
        concurrent requests itself, such as vLLM sampling.
 
     3. Background task (schedule_background_task):
-       asyncio.create_task, runs concurrently with compute queue. Use for I/O
-       or an engine that provides its own safe concurrency and batching.
-       Status is still tracked; clients can poll the same status endpoints.
+       Reuses the supervised concurrent path for pure I/O. Status, capacity
+       and shutdown are owned by the same worker as concurrent compute.
 
     Requirements
     ------------
@@ -248,7 +247,7 @@ class TaskQueueMixin:
             await self._enqueue_prepared_task(task)
         except BaseException:
             if task.on_finished is not None and await self.state.get_future(request_id) is None:
-                await task.on_finished(False, False)
+                await self._compute_worker.finish_task(task, False)
             raise
         return {'request_id': request_id, 'model_id': model_id}
 
@@ -280,8 +279,7 @@ class TaskQueueMixin:
                         attribution='server',
                         message='Replica stopped before the task could be enqueued.'))
             finally:
-                if task.on_finished is not None:
-                    await task.on_finished(False, False)
+                await self._compute_worker.finish_task(task, False)
             raise
         queue_key = self._queue_key(model_id=model_id, token=task.token)
         self._compute_worker.ensure_queue_registered(queue_key)
@@ -289,8 +287,6 @@ class TaskQueueMixin:
         self._compute_worker.track_task(request_id)
         await q.put(task)
         try:
-            if task.on_enqueued is not None:
-                await task.on_enqueued()
             await self.state.store_future_status(
                 request_id,
                 TaskStatus.QUEUED.value,

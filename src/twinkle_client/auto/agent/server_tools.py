@@ -368,6 +368,8 @@ class _ServerTools:
         sampler_list = samplers or []
         if backend not in ('transformers', 'megatron'):
             raise ValueError(f'Unsupported training backend: {backend!r}')
+        if backend == 'megatron' and train_gpus < 2:
+            raise ValueError('megatron training instances require at least 2 devices')
 
         # Sanitize model name for use in route/names
         def _short(mid: str) -> str:
@@ -424,21 +426,28 @@ class _ServerTools:
                 'env_vars': {
                     'TWINKLE_TRUST_REMOTE_CODE': '1'
                 },
-                'modes': {
-                    'lora': {
-                        'num_devices': train_gpus,
-                        'device_mesh': {
-                            'device_type': 'cuda',
-                            'dp_size': train_gpus
-                        },
-                        'max_length': 500000,
-                        'idle_timeout_s': 600,
-                        'queue_config': {
-                            'rps_limit': 100,
-                            'tps_limit': 100000,
-                            'max_input_tokens': 500000
-                        },
-                    }
+                'train_mode': 'lora',
+                'nproc_per_node': train_gpus,
+                'device_group': {
+                    'name': 'model',
+                    'ranks': train_gpus,
+                    'device_type': 'cuda'
+                },
+                'device_mesh': {
+                    'device_type': 'cuda',
+                    'dp_size': train_gpus
+                },
+                'min_replicas': 0,
+                'max_replicas': 1,
+                'max_length': 500000,
+                'idle_timeout_s': 600,
+                'adapter_config': {
+                    'adapter_timeout': 600
+                },
+                'queue_config': {
+                    'rps_limit': 100,
+                    'tps_limit': 100000,
+                    'max_input_tokens': 500000
                 },
             },
         })

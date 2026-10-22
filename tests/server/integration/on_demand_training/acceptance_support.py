@@ -146,7 +146,8 @@ def assert_released(controller, namespace, redis_url=None, prefix=None):
     from ray.util.placement_group import placement_group_table
     diagnostic = ray.get(controller.diagnostics.remote(), timeout=30)
     assert all(row['state'] == 'STOPPED' for row in diagnostic['instances']), diagnostic
-    owned_prefix = 'resources-' + namespace + '-'
+    # Training teardown must not require a healthy sampling pool to disappear.
+    owned_prefix = 'resources-' + namespace + '-controller_'
     assert not [name for name in serve.status().applications if name.startswith(owned_prefix)]
     assert not [row for row in placement_group_table().values()
                 if row.get('name', '').startswith(owned_prefix) and row.get('state') != 'REMOVED']

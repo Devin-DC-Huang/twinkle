@@ -35,8 +35,6 @@ class TrainingControllerActor:
         self.core = TrainingController(self.config, self.store, self.driver)
         self._metrics = get_training_metrics()
         self._monitors = []
-        self._unreachable_since = {}
-        self._failures: dict[str, asyncio.Task] = {}
         self._initialization = asyncio.get_event_loop().create_task(self._initialize())
 
     async def initialize(self):
@@ -74,35 +72,21 @@ class TrainingControllerActor:
             await asyncio.sleep(5)
 
     async def _check_instance_health(self, instance):
-        try:
+
+        async def probe():
             identity = await self.driver.health(instance)
-            if identity['unhealthy']:
-                self._fail_unhealthy(instance, 'Training runtime reported a failed worker')
-                return
-            await self.store.state.touch_replica_last_seen(instance.instance_id)
-            self._unreachable_since.pop(instance.instance_id, None)
-        except Exception:
-            since = self._unreachable_since.setdefault(instance.instance_id, time.monotonic())
-            if time.monotonic() - since >= 30:
-                self._fail_unhealthy(instance, 'Training runtime became unavailable')
+            if not identity['unhealthy']:
+                await self.store.state.touch_replica_last_seen(instance.instance_id)
+            return identity
+
+        healthy = await self.core.lifecycle.health(instance.instance_id, probe)
+        if healthy is False:
+            self._fail_unhealthy(instance, 'Training runtime became unavailable or reported a failed worker')
 
     def _fail_unhealthy(self, instance, message):
-        identity = instance.instance_id
-        if identity in self._failures:
-            return
-        task = asyncio.create_task(
-            self.core.fail_instance(
-                identity, FutureFailureRecord(reason_code='orphaned_replica', attribution='server', message=message)))
-        self._failures[identity] = task
-
-        def done(completed):
-            self._failures.pop(identity, None)
-            if not completed.cancelled():
-                error = completed.exception()
-                if error is not None:
-                    logger.error('Unhealthy runtime cleanup failed', exc_info=(type(error), error, error.__traceback__))
-
-        task.add_done_callback(done)
+        self.core.lifecycle.spawn_once(('health', instance.instance_id), lambda: self.core.fail_instance(
+            instance.instance_id,
+            FutureFailureRecord(reason_code='orphaned_replica', attribution='server', message=message)))
 
     async def _sweep(self):
         while True:
@@ -151,9 +135,6 @@ class TrainingControllerActor:
         await self.initialize()
         return await self.core.admit(*args, **kwargs)
 
-    async def commit_operation(self, *args):
-        return await self.core.commit_operation(*args)
-
     async def finish_operation(self, *args, **kwargs):
         return await self.core.finish_operation(*args, **kwargs)
 
@@ -190,6 +171,5 @@ class TrainingControllerActor:
             task.cancel()
         await asyncio.gather(*self._monitors, return_exceptions=True)
         await self.core.shutdown()
-        await asyncio.gather(*self._failures.values(), return_exceptions=True)
         await self.core.wait_for_jobs()
-        await self.driver.wait_for_cleanup()
+        await self.driver.runtime.wait_for_cleanup()

@@ -17,10 +17,20 @@ def stream_to_queue(sampler, queue, inputs, sampling_params=None, adapter_name='
 
     Works with any object that exposes a ``sample_stream`` iterator.
     """
+    generation = sampler.sample_stream(inputs, sampling_params, adapter_name, adapter_path)
     try:
-        for delta, reason in sampler.sample_stream(inputs, sampling_params, adapter_name, adapter_path):
+        for delta, reason in generation:
             queue.put((delta, reason))
     except Exception as e:
-        queue.put(e)
+        try:
+            queue.put(e)
+        except Exception:
+            pass  # The HTTP consumer may already have closed its queue.
     finally:
-        queue.put(STREAM_SENTINEL)
+        close = getattr(generation, 'close', None)
+        if close is not None:
+            close()
+        try:
+            queue.put(STREAM_SENTINEL)
+        except Exception:
+            pass

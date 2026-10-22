@@ -13,9 +13,10 @@ _ROOT_COMPONENT = '__root__'
 # the same layer are independent and therefore may not import one another.
 _LAYERS = (
     frozenset({'exceptions'}),
-    frozenset({'config', 'middleware', 'resources', 'runtime', 'task_errors', 'utils', 'validation'}),
+    frozenset({'config', 'middleware', 'runtime', 'task_errors', 'utils', 'validation'}),
     frozenset({'telemetry'}),
     frozenset({'env_propagation', 'service_proxy', 'state'}),
+    frozenset({'resources'}),
     frozenset({'deployment', 'lifecycle', 'session_resource'}),
     frozenset({'task_queue'}),
     frozenset({'checkpoint', 'data_plane'}),

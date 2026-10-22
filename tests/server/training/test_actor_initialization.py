@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from twinkle.server.resources.instances import InstanceLifecycle
 from twinkle.server.training.actor import TrainingControllerActor
 
 
@@ -49,13 +50,13 @@ async def test_shutdown_cancels_pending_restart():
     restart = asyncio.create_task(wait.wait())
     initialization = asyncio.get_running_loop().create_future()
     initialization.set_result(None)
-    actor = SimpleNamespace(driver=SimpleNamespace(wait_for_cleanup=AsyncMock()),
+    actor = SimpleNamespace(driver=SimpleNamespace(runtime=SimpleNamespace(wait_for_cleanup=AsyncMock())),
                                 core=SimpleNamespace(shutdown=AsyncMock(), wait_for_jobs=AsyncMock()),
                             _monitors=[], _restart_task=restart, _initialization=initialization, _failures={})
     await cls.shutdown(actor)
     assert restart.cancelled()
     actor.core.shutdown.assert_awaited_once()
-    actor.driver.wait_for_cleanup.assert_awaited_once()
+    actor.driver.runtime.wait_for_cleanup.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -81,7 +82,8 @@ async def test_heartbeat_keeps_healthy_peer_alive_while_probe_and_close_block():
     actor = SimpleNamespace(
         store=SimpleNamespace(backend=SimpleNamespace(get=AsyncMock(return_value='active')),
                               key=lambda *args: 'active', state=SimpleNamespace(touch_replica_last_seen=touch)),
-        core=SimpleNamespace(epoch='controller', instances={'bad': bad, 'good': good}, fail_instance=fail),
+        core=SimpleNamespace(epoch='controller', instances={'bad': bad, 'good': good}, fail_instance=fail,
+                             lifecycle=InstanceLifecycle('Training')),
         driver=SimpleNamespace(health=health), _unreachable_since={}, _failures={})
     actor._check_instance_health = lambda instance: cls._check_instance_health(actor, instance)
     actor._fail_unhealthy = lambda instance, message: cls._fail_unhealthy(actor, instance, message)
@@ -96,13 +98,13 @@ async def test_heartbeat_keeps_healthy_peer_alive_while_probe_and_close_block():
         await cls._check_instance_health(actor, good)
         assert healthy_seen.is_set()
         cls._fail_unhealthy(actor, bad, 'duplicate')
-        assert len(actor._failures) == 1
+        assert len(actor.core.lifecycle.named_jobs) == 1
     finally:
         probe_gate.set()
         close_gate.set()
         monitor.cancel()
-        await asyncio.gather(monitor, *actor._failures.values(), return_exceptions=True)
-    assert not actor._failures
+        await asyncio.gather(monitor, *actor.core.lifecycle.named_jobs.values(), return_exceptions=True)
+    assert not actor.core.lifecycle.named_jobs
 
 
 @pytest.mark.asyncio
@@ -119,7 +121,7 @@ async def test_shutdown_cancels_and_joins_initialization_before_closing_core():
 
     initialization = asyncio.create_task(initialize())
     await started.wait()
-    actor = SimpleNamespace(driver=SimpleNamespace(wait_for_cleanup=AsyncMock()),
+    actor = SimpleNamespace(driver=SimpleNamespace(runtime=SimpleNamespace(wait_for_cleanup=AsyncMock())),
                                 core=SimpleNamespace(shutdown=AsyncMock(), wait_for_jobs=AsyncMock()),
                             _initialization=initialization, _monitors=[], _failures={})
     await cls.shutdown(actor)

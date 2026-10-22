@@ -211,6 +211,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--backend', required=True, choices=['transformers', 'megatron'])
     parser.add_argument('--model', required=True)
+    parser.add_argument('--training-devices', type=int, default=2)
+    parser.add_argument('--training-pp-size', type=int, default=1)
     parser.add_argument('--run-dir', required=True)
     parser.add_argument('--persistence', choices=['memory', 'redis'], default='memory')
     parser.add_argument('--managed-redis', action='store_true', help='Start an owned Redis for restart injection')
@@ -231,6 +233,12 @@ def main():
     if any(not math.isfinite(value) or value <= 0
            for value in (args.startup_timeout_s, args.shutdown_timeout_s)):
         parser.error('startup and shutdown timeouts must be finite and positive')
+    if args.training_devices < 1:
+        parser.error('--training-devices must be positive')
+    if args.backend == 'megatron' and args.training_devices < 2:
+        parser.error('megatron training instances require at least 2 devices')
+    if args.training_pp_size < 1 or args.training_devices % args.training_pp_size:
+        parser.error('--training-pp-size must be positive and divide --training-devices')
     if args.recovery_rounds < 0 or args.stress_iterations < 0 or args.soak_seconds < 0:
         parser.error('validation budgets must be non-negative')
     root = Path(__file__).resolve().parents[4]
@@ -267,7 +275,9 @@ def main():
         params = app['args']
         if app['import_path'] == 'model':
             common = {
-                'num_devices': 2, 'device_mesh': {'device_type': 'cuda', 'dp_size': 2},
+                'num_devices': args.training_devices,
+                'device_mesh': {'device_type': 'cuda', 'dp_size': args.training_devices // args.training_pp_size,
+                                                'pp_size': args.training_pp_size},
                 'min_replicas': 0, 'max_replicas': 1, 'idle_timeout_s': 3600,
                 'max_length': params.get('max_length'),
                 'queue_config': {**params.get('queue_config', {}), 'execution_timeout': 600},
@@ -320,7 +330,7 @@ def main():
         address='local',
         namespace=namespace,
         num_cpus=24,
-        num_gpus=2 if args.recovery_only else 3,
+        num_gpus=args.training_devices + (0 if args.recovery_only else 1),
         _temp_dir='/tmp/twm-' + namespace[-8:],
         include_dashboard=False)
     launcher = ServerLauncher(config)
@@ -373,6 +383,10 @@ def main():
         evidence['recovery'] = []
         for _ in range(args.recovery_rounds):
             recovery = validate_controller_restart(base_url, launcher._training_controller, model_name)
+            for sampler in launcher._sampler_controllers:
+                assert ray.get(sampler.diagnostics.remote(), timeout=30)['ready'], 'Training restart disturbed sampler'
+            if launcher._sampler_controllers:
+                recovery['sampler_remained_ready'] = True
             evidence['recovery'].append(recovery)
             evidence['restart_epoch'] = recovery['epoch']
             evidence['worker_fault_recovered'] = recovery['worker_fault_recovered']

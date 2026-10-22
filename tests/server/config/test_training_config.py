@@ -142,7 +142,11 @@ def test_existing_yaml_examples_keep_their_model_entries(monkeypatch):
         assert model.model_id == models[0].args.model_id
         assert model.route_prefix == models[0].route_prefix
         mode = model.modes.full or model.modes.lora
-        assert mode.min_replicas == 1
+        original = models[0]
+        expected_min = original.args.min_replicas
+        if expected_min is None:
+            expected_min = original.deployments[0]['autoscaling_config']['min_replicas']
+        assert mode.min_replicas == expected_min
         assert ServerConfig.model_validate(config.to_yaml_dict()).training_config == config.training_config
 
 
@@ -259,7 +263,7 @@ async def test_legacy_options_reach_runtime_with_one_controller_owned_replica(mo
     assert captured['max_length'] == 128
     assert captured['nproc_per_node'] == 2
     assert captured['queue_config'] == model.modes.lora.queue_config
-    assert not driver._deployments
+    assert not driver.runtime.deployments
 
 
 def test_mutated_configuration_does_not_reuse_a_stale_catalog():
@@ -274,3 +278,44 @@ def test_unsupported_adapter_parameters_are_not_silently_ignored():
     app['args']['adapter_config']['misspelled_timeout'] = 12
     with pytest.raises(ValidationError, match='misspelled_timeout'):
         ServerConfig(applications=[app])
+
+
+def test_l20d_candidate_is_lora_only_and_bounds_total_devices():
+    config = ServerConfig.from_yaml('cookbook/client/server/megatron/server_config.yaml')
+    model = config.training_config.models[0]
+    mode = model.modes.lora
+    assert model.modes.full is None
+    assert (mode.num_devices, mode.min_replicas, mode.max_replicas, mode.max_loras) == (2, 0, 2, 3)
+    assert mode.device_mesh.world_size() == 2 and mode.device_mesh.pp_size == 2 and mode.idle_timeout_s == 600
+    sampler = next(app for app in config.applications if app.import_path == 'sampler')
+    assert sampler.args.device_group['ranks'] == 1
+    assert sampler.args.device_mesh['dp_size'] == 1 and 'tp_size' not in sampler.args.device_mesh
+    assert 'tensor_parallel_size' not in sampler.args.engine_args
+    assert (sampler.args.min_replicas, sampler.args.max_replicas, sampler.args.target_ongoing_requests) == (2, 4, 16)
+    assert mode.num_devices * mode.max_replicas + sampler.args.device_group['ranks'] * sampler.args.max_replicas == 8
+    assert mode.max_loras * mode.max_replicas == 6
+    assert config.applications[-1].args.modes is None
+    with pytest.raises(RequestRejectedError, match='does not provide full'):
+        TrainingCatalog(config.training_config).get(model.name, 'full')
+
+
+@pytest.mark.parametrize('mode', ['lora', 'full'])
+@pytest.mark.parametrize('legacy', [False, True])
+def test_single_device_megatron_is_rejected_before_allocation(mode, legacy):
+    if legacy:
+        app = legacy_application()
+        app['args'].update(backend='megatron', train_mode=mode, device_group={'ranks': 1, 'device_type': 'cuda'},
+                           device_mesh={'dp_size': 1})
+    else:
+        model = model_config()
+        model['backend'] = 'megatron'
+        model['modes'] = {mode: {'num_devices': 1, 'device_mesh': {'dp_size': 1}}}
+        app = model_application(model)
+    with pytest.raises(ValidationError, match='at least 2 devices'):
+        ServerConfig(applications=[app])
+
+
+def test_transformers_still_accepts_single_device():
+    model = model_config()
+    model['modes'] = {'lora': {'num_devices': 1, 'device_mesh': {'dp_size': 1}}}
+    assert ServerConfig(applications=[model_application(model)]).training_config.models[0].modes.lora.num_devices == 1

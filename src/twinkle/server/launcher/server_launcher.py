@@ -63,6 +63,7 @@ class ServerLauncher:
         self._builders: dict[str, Callable] = {}
         self._ray_initialized = False
         self._serve_started = False
+        self._sampler_controllers = []
 
     def _get_builders(self) -> dict[str, Callable]:
         """Get (and cache) the builder functions for all app types."""
@@ -151,6 +152,16 @@ class ServerLauncher:
             # Model applications are specifications. _deploy_training creates
             # their CPU routes and the controller owns all device instances.
             return
+        if import_path == 'sampler':
+            from twinkle.server.sampler.router import deploy_sampler_pool
+            namespace = self.ray_namespace or self.config.ray_namespace or 'twinkle_cluster'
+            env = build_propagated_env_vars()
+            for key in ('PYTHONPATH', 'TWINKLE_DEFAULT_SAVE_DIR', 'TMPDIR', 'OMP_NUM_THREADS'):
+                if key in os.environ:
+                    env.setdefault(key, os.environ[key])
+            controller = deploy_sampler_pool(app_spec, namespace, self.config.training.model_dump(), env)
+            self._sampler_controllers.append(controller)
+            return
         # Shallow-dump the typed args to a kwargs dict WITHOUT recursing into
         # nested models: ``dict(model)`` yields top-level (field, value) pairs
         # with nested models left as instances, so ``queue_config`` stays a
@@ -213,7 +224,7 @@ class ServerLauncher:
         """
         # Apply Ray Serve patches before initializing Ray
         apply_ray_serve_patches()
-        if self.config.training_config.models:
+        if self.config.training_config.models or any(app.import_path == 'sampler' for app in self.config.applications):
             os.environ['TWINKLE_STATE_RAY_NAMESPACE'] = (
                 self.ray_namespace or self.config.ray_namespace or 'twinkle_cluster')
 
@@ -305,7 +316,12 @@ class ServerLauncher:
         Telemetry flush runs AFTER ``serve.shutdown()`` and is wrapped so a
         telemetry-shutdown failure cannot mask the user-facing shutdown path.
         """
+        import ray
         from ray import serve
+        for controller in self._sampler_controllers:
+            ray.get(controller.shutdown.remote())
+            ray.kill(controller, no_restart=True)
+        self._sampler_controllers.clear()
         if getattr(self, '_training_controller', None) is not None:
             import ray
             ray.get(self._training_controller.shutdown.remote())

@@ -55,7 +55,9 @@ def test_duration_is_not_truncated_by_iterations(monkeypatch):
 
 
 def test_failed_training_never_reports_success(monkeypatch):
+
     class Broken(FakeHandle):
+
         def step(self):
             raise RuntimeError('injected failure')
 
@@ -82,3 +84,29 @@ def test_owned_redis_restart_preserves_state(tmp_path):
     finally:
         client.close()
         managed.stop()
+
+
+def test_training_release_assertion_excludes_but_does_not_remove_sampling(monkeypatch):
+    import importlib
+    import ray
+    from ray import serve
+    from types import SimpleNamespace
+    from tests.server.integration.on_demand_training.acceptance_support import assert_released
+    namespace = 'owned'
+    sampling_name = 'resources-owned-sampling_pool_epoch-sampler_id'
+    applications = {sampling_name: object()}
+    groups = {'sampler': {'name': sampling_name, 'state': 'CREATED'}}
+    controller = SimpleNamespace(diagnostics=SimpleNamespace(remote=lambda: {'instances': [{'state': 'STOPPED'}]}))
+    monkeypatch.setattr(ray, 'get', lambda value, **kwargs: value)
+    monkeypatch.setattr(serve, 'status', lambda: SimpleNamespace(applications=applications))
+    monkeypatch.setattr(importlib.import_module('ray.util.placement_group'), 'placement_group_table', lambda: groups)
+    assert assert_released(controller, namespace)
+    assert sampling_name in applications and groups['sampler']['state'] == 'CREATED'
+    training_name = 'resources-owned-controller_epoch-instance_id'
+    applications[training_name] = object()
+    with pytest.raises(AssertionError):
+        assert_released(controller, namespace)
+    applications.pop(training_name)
+    groups['training'] = {'name': training_name, 'state': 'CREATED'}
+    with pytest.raises(AssertionError):
+        assert_released(controller, namespace)

@@ -22,14 +22,18 @@ class ResourceManager:
 
     @classmethod
     def from_allocation(cls, group: DeviceGroup, placement_group, devices: list[str]):
-        """Use an allocation owned by the training controller, without reserving again.
+        """Use an allocation owned by a lifecycle controller, without reserving again.
 
         Ranks are local to this allocation; devices are the actual Ray-selected IDs.
         The controller owns removal, so this view's destroy method is a no-op.
         """
         import ray
         manager = cls.__new__(cls)
-        ranks = list(range(len(devices)))
+        width = group.gpus_per_worker
+        if len(devices) % width:
+            raise ValueError('Allocation device count must be divisible by gpus_per_worker')
+        chunks = [devices[index:index + width] for index in range(0, len(devices), width)]
+        ranks = list(range(len(chunks)))
         group.ranks = ranks
         manager.group_configs = [group]
         manager.placement_groups = [placement_group]
@@ -37,10 +41,10 @@ class ResourceManager:
         manager._external_allocation = True
         manager.device_groups = {
             group.name: [{
-                'gpu_rank': [device],
+                'gpu_rank': chunk,
                 'placement_group': placement_group,
                 'ray_address': str(ray.get_runtime_context().gcs_address)
-            } for device in devices]
+            } for chunk in chunks]
         }
         if (group.device_type or '').upper() == 'CPU':
             manager.device_groups[group.name] = [{

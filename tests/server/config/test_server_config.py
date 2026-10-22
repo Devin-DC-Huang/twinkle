@@ -39,7 +39,7 @@ _TRAINING_MODEL = st.fixed_dictionaries({
         'model_id': st.just('model-id'),
         'backend': st.sampled_from(['mock', 'transformers', 'megatron']),
         'device_type': st.just('cuda'),
-        'modes': st.just({'lora': {'num_devices': 1, 'device_mesh': {'dp_size': 1}}}),
+        'modes': st.just({'lora': {'num_devices': 2, 'device_mesh': {'dp_size': 2}}}),
     }),
 })
 

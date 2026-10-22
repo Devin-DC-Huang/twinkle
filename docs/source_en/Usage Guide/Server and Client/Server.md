@@ -487,3 +487,51 @@ Existing `applications` entries with `import_path: model` remain valid. Set `arg
 `modes` is optional: single-mode training does not require rewriting existing YAML. Model `deployments` options configure the CPU router; autoscaling request targets apply to router replicas. The Controller owns training-instance minimums/limits, and each compute instance has exactly one Serve replica. Non-autoscaling request limits, health/shutdown settings, and `ray_actor_options.runtime_env` also reach compute instances. `args.env_vars` overrides matching deployment environment variables. Unsupported `adapter_config` fields fail validation instead of being silently ignored.
 
 To offer both LoRA and full training for one model, configure `num_devices`, `device_mesh`, `min_replicas`, and `idle_timeout_s` separately under `args.modes.lora/full`. LoRA users share compatible instances; each full-training handle owns an instance. Sampling configuration stays the same. See `cookbook/client/server/on_demand_training.yaml` in the repository.
+
+### Single-node, eight-GPU LoRA capacity
+
+`cookbook/client/server/megatron/server_config.yaml` is a candidate for large-memory L20D GPUs. It retains single-mode YAML: two preloaded single-GPU sampling instances (DP=1, no TP setting), scaling up to four, plus up to two two-GPU training instances (PP=2, DP=1). Megatron configurations require at least two devices per instance before allocation; single-device Megatron is not supported. Only `train_mode: lora` is configured; full training remains available in other framework configurations. Key model args:
+
+```yaml
+train_mode: lora
+nproc_per_node: 2
+device_group: {name: model, ranks: 2, device_type: cuda}
+device_mesh: {device_type: cuda, dp_size: 1, pp_size: 2}
+max_loras: 3
+min_replicas: 0
+max_replicas: 2
+idle_timeout_s: 600
+```
+
+- `max_replicas × max_loras = 6` bounds training handles, not throughput. Creation fills existing compatible LoRA slots before starting another instance; active training is not migrated for load balancing. Stateful operations are serial within an instance, with at most two independent training queues. `per_token_model_limit: 3` remains a server-wide per-token quota, not a total-user cap. Clients sharing one token share those three slots; independent users need independent tokens, or a deliberately increased shared-token quota. Set it to 1 separately if the service requires one handle per independent token.
+- PP=2 shards each model over two devices; removing DP replication from the original PP=2/DP=2 instance leaves room for two independent instances. Account for 32K activations, LoRA optimizers, communication and temporary workspaces. Smaller-model or different-hardware E2E tests do not certify L20D/27B/32K peak memory or throughput.
+- Save checkpoints during training and explicitly call `remove_adapter()` or unload the Tinker model when finished. Heartbeats and polling do not renew business idle. Expired handles require a new create and explicit checkpoint resume; old training is not resumed automatically.
+- `min_replicas: 0` permits reclaiming every empty training instance at the cost of cold startup. Both pools use the same device-allocation and instance-lifecycle implementation with independent state. Reclaiming training devices does not directly scale sampling; sampling grows according to its own in-flight load. Lowering vLLM `gpu_memory_utilization` does not release Ray's whole-device reservation. No fractional-GPU or training/sampling colocation is enabled.
+
+Before rollout, validate the actual 27B model on L20D: a two-GPU PP=2/DP=1 32K workload at the maximum business batch, three resident rank-32 LoRAs, two instances/six handles alongside sampling, optimizer save/resume, tenant isolation and confirmed device reclamation. Measure peak memory, training tokens/s, sampling output tokens/s, queue wait and P95 latency against the original four-GPU PP=2/DP=2 layout using the same work. If the two-GPU layout does not meet business requirements, restore four GPUs per instance (PP=2, DP=2, at most one instance); do not infer throughput from an idle memory snapshot.
+
+### On-demand sampling instances and dispatch
+
+A stable CPU Router selects the ready instance with the fewest actual in-flight operations for ordinary sampling, DataRefs and streaming. Clients do not supply an instance ID, and users/LoRAs are not pinned to a device. Per-instance DP/TP describes an engine's parallel shape, not pool replicas. The production candidate uses one GPU and DP=1 per instance, without TP configuration.
+
+```yaml
+nproc_per_node: 1
+device_group: {name: sampler, ranks: 1, device_type: cuda}
+device_mesh: {device_type: cuda, dp_size: 1}
+min_replicas: 2
+max_replicas: 4
+target_ongoing_requests: 16
+idle_timeout_s: 600
+```
+
+Both minimum instances must finish loading before readiness. Demand is `ceil((in-flight requests + 1) / 16)`, capped at four. Starting and quarantined instances count against that cap. Existing ready instances serve during expansion; only idle extras with no actual generation are reclaimed after 600 seconds, down to two. Neither pool preempts or colocates on a GPU; four sampling plus four training GPUs fit the eight-device maximum.
+
+New instances load only the base model and default template. LoRAs load from each request's `adapter_uri`, `model_path` or persistent sampling-session checkpoint path, into independent disposable caches. No cache synchronization or new cache database is introduced. `engine_args.max_loras: 5` bounds active engine LoRAs, not training handles. Custom templates, named adapter settings and patches are broadcast under pool-wide exclusive protection and replayed before new instances become ready. Partial broadcast failure fences all participating replicas. Controller restart clears the old pool and dynamic control settings; clients must reapply them, while existing sampling-session/checkpoint paths remain unchanged.
+
+HTTP disconnect and future timeout do not certify generation exit. Completion handles and weight guards remain held until actual exit; unconfirmed death remains `QUARANTINED` without early capacity release. Full-checkpoint sampling retains pool-wide exclusive weight changes. L20D/27B single-GPU 32K memory, four-engine concurrency, output tokens/s and P95 latency require controlled same-hardware validation; local PPU/4B tests cannot certify them.
+
+### Rollout compatibility and safe states
+
+Keeping YAML syntax does not keep the old SDK wire unchanged. The Twinkle SDK performs the `training_handles` handshake, generates `client_create_id` and supplies `training_id`; upgrade it together with the server. Tinker keeps its own model-handle wire.
+
+Ray 2.55 is the minimum dependency: Serve ingress must await asynchronous user constructors; do not use the old CI Ray 2.48 pin. Startup, business idle, task execution and confirmed shutdown have separate budgets. Atomic create start and cancel are mutually exclusive; an unknown state-backend acknowledgement must not authorize execution. `QUARANTINED` means device death is unconfirmed and still counts toward the instance limit; release must not report unconfirmed reclamation as success. Only an actually executed operation renews business idle, not a queue failure or unknown start acknowledgement.

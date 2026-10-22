@@ -27,7 +27,7 @@ class RuntimeQueue(ManagedTrainingRuntime, TaskQueueMixin):
         self._model_unhealthy = False
         self._training_controller = SimpleNamespace(**{
             name: RPC(getattr(controller, name))
-            for name in ('admit', 'commit_operation', 'finish_operation', 'fail_instance')
+            for name in ('admit', 'finish_operation', 'fail_instance')
         })
         self._init_task_queue(TaskQueueConfig(execution_timeout=0.1, inline_fast_path_timeout=0.01),
                               enable_admission_gate=True)
@@ -103,7 +103,11 @@ async def test_tinker_seq_retry_runs_once_and_different_operations_do_not_collid
 
 
 @pytest.mark.asyncio
-async def test_cancelled_queued_operation_releases_ticket_without_business_renewal():
+async def test_cancelled_queued_operation_releases_ticket_without_business_renewal(monkeypatch):
+    import time
+    # Freeze wall time as well as the injected business clock; RPC latency is not activity.
+    now = time.time()
+    monkeypatch.setattr('twinkle.server.task_queue.worker.time.time', lambda: now)
     controller, state, runtime, clock = await setup()
     identity = await create(controller, state, 1)
     instance = controller.instances[controller.trainings[identity].instance_id]
@@ -186,6 +190,147 @@ async def test_lost_finish_notification_is_reconciled_without_stopping_compute()
         await controller.sweep()
         await controller.wait_for_jobs()
         assert not runtime.allocations
+    finally:
+        await queue.shutdown_task_queue()
+        await controller.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('fault,executed', [('queue_timeout', False), ('unknown_start_ack', False),
+                                         ('backend_error', True)])
+async def test_lost_failure_notification_uses_actual_execution_facts(fault, executed, monkeypatch):
+    from tests.server.state.fake_backend import FakeBackend
+    controller, state, runtime, clock = await setup(backend=FakeBackend())
+    identity = await create(controller, state, fault)
+    instance = controller.instances[controller.trainings[identity].instance_id]
+    queue = RuntimeQueue(controller, state, instance)
+
+    async def lost(*args, **kwargs):
+        raise ConnectionError('Completion RPC lost')
+
+    queue._training_controller.finish_operation = RPC(lost)
+    runtime.verify_operation = lambda instance, request_id: queue.verify_operation(request_id)
+    ran = []
+
+    async def operation():
+        ran.append(True)
+        raise ValueError('executed backend error')
+
+    if fault == 'queue_timeout':
+        queue._compute_worker._config = TaskQueueConfig(queue_timeout=0)
+    elif fault == 'unknown_start_ack':
+        start = state.try_start_future
+
+        async def lose_ack(request_id):
+            assert await start(request_id)
+            raise ConnectionError('start acknowledgement lost')
+
+        monkeypatch.setattr(state, 'try_start_future', lose_ack)
+    try:
+        clock.now = 7
+        ref = await queue.schedule_task(operation, model_id=identity, token='owner', task_type='step')
+        assert (await settle(state, ref['request_id']))['status'] == 'failed'
+        for _ in range(100):
+            if not queue._compute_worker.has_task(ref['request_id']):
+                break
+            await asyncio.sleep(0.01)
+        outcome = await queue.verify_operation(ref['request_id'])
+        assert outcome['state'] == 'finished' and outcome['executed'] is executed
+        assert bool(ran) is executed
+        assert controller.trainings[identity].pending_operation_ids
+        clock.now = 13  # Admission at 7 must age past the five-second reconciliation interval.
+        await controller.sweep()
+        await controller.wait_for_jobs()
+        training = controller.trainings[identity]
+        assert not training.pending_operation_ids
+        assert (training.last_activity_at > 6) is executed
+        if not executed:
+            clock.now = 14
+            await controller.sweep()
+            await controller.wait_for_jobs()
+            assert training.state == 'EXPIRED'
+    finally:
+        await queue.shutdown_task_queue()
+        await controller.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_execution_facts_expire_without_future_status_guessing(monkeypatch):
+    from tests.server.state.fake_backend import FakeBackend
+    controller, state, runtime, _ = await setup(backend=FakeBackend())
+    identity = await create(controller, state, 'facts-expire')
+    instance = controller.instances[controller.trainings[identity].instance_id]
+    queue = RuntimeQueue(controller, state, instance)
+
+    async def lost(*args, **kwargs):
+        raise ConnectionError('Completion RPC lost')
+
+    queue._training_controller.finish_operation = RPC(lost)
+    try:
+        ref = await queue.schedule_task(lambda: asyncio.sleep(0), model_id=identity, token='owner', task_type='step')
+        await settle(state, ref['request_id'])
+        worker = queue._compute_worker
+        for _ in range(100):
+            if not worker.has_task(ref['request_id']):
+                break
+            await asyncio.sleep(0.01)
+        outcome = worker.get_task_outcome(ref['request_id'])
+        assert outcome['executed']
+        monkeypatch.setattr('twinkle.server.task_queue.worker.time.time',
+                            lambda: outcome['finished_at'] + worker._config.absolute_future_ttl(1) + 1)
+        assert (await queue.verify_operation(ref['request_id']))['state'] == 'missing'
+        assert not worker._task_outcomes
+    finally:
+        await queue.shutdown_task_queue()
+        await controller.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_completion_write_failure_retains_ticket_and_execution_fact(monkeypatch):
+    from tests.server.state.fake_backend import FakeBackend
+    controller, state, runtime, clock = await setup(backend=FakeBackend())
+    identity = await create(controller, state, 'finish-write')
+    instance = controller.instances[controller.trainings[identity].instance_id]
+    queue = RuntimeQueue(controller, state, instance)
+    runtime.verify_operation = lambda instance, request_id: queue.verify_operation(request_id)
+    save = controller.store.save_training
+    failed = False
+
+    async def fail_completion(record):
+        nonlocal failed
+        if record.state == 'ACTIVE' and not record.pending_operation_ids and not failed:
+            failed = True
+            raise ConnectionError('completion write failed')
+        await save(record)
+
+    monkeypatch.setattr(controller.store, 'save_training', fail_completion)
+    try:
+        clock.now = 7
+        ref = await queue.schedule_task(lambda: asyncio.sleep(0), model_id=identity, token='owner', task_type='step')
+        await settle(state, ref['request_id'])
+        for _ in range(100):
+            if not queue._compute_worker.has_task(ref['request_id']):
+                break
+            await asyncio.sleep(0.01)
+        for _ in range(100):
+            if failed:
+                break
+            await asyncio.sleep(0.01)
+        training = controller.trainings[identity]
+        assert failed and ref['request_id'] in training.pending_operation_ids
+        assert training.last_activity_at == 0
+        assert queue._compute_worker.get_task_outcome(ref['request_id'])['executed']
+        clock.now = 13
+        await controller.sweep()
+        await controller.wait_for_jobs()
+        assert not training.pending_operation_ids and 6 < training.last_activity_at <= 13
+        followup = await queue.schedule_task(lambda: asyncio.sleep(0), model_id=identity, token='owner', task_type='step')
+        await settle(state, followup['request_id'])
+        for _ in range(100):
+            if queue._compute_worker.get_task_outcome(followup['request_id']) is None:
+                break
+            await asyncio.sleep(0.01)
+        assert queue._compute_worker.get_task_outcome(followup['request_id']) is None
     finally:
         await queue.shutdown_task_queue()
         await controller.shutdown()

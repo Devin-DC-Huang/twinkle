@@ -6,7 +6,6 @@ import asyncio
 import os
 import uuid
 from contextvars import ContextVar
-from datetime import datetime
 
 from twinkle.protocol.serialize import deserialize_object
 from twinkle.protocol.types import model as native
@@ -89,13 +88,6 @@ class ManagedTrainingRuntime:
             task.request_id,
             renew=task.task_type not in ('get_info', 'get_train_configs'))
 
-        async def enqueued():
-            try:
-                await self._training_controller.commit_operation.remote(task.model_id, task.request_id,
-                                                                        context['epoch'])
-            except Exception:
-                logger.exception('Training enqueue notification failed for %s', task.request_id)
-
         async def finished(executed, unsafe):
             if unsafe:
                 self._model_unhealthy = True
@@ -107,12 +99,18 @@ class ManagedTrainingRuntime:
                         message='Backend execution timed out; runtime is being terminated.'))
             else:
                 try:
+                    outcome = self._compute_worker.get_task_outcome(task.request_id)
                     await self._training_controller.finish_operation.remote(
-                        task.model_id, task.request_id, context['epoch'], executed=executed)
+                        task.model_id,
+                        task.request_id,
+                        context['epoch'],
+                        executed=executed,
+                        finished_at=outcome['finished_at'])
+                    return True
                 except Exception:
                     logger.exception('Training completion notification failed for %s', task.request_id)
 
-        task.on_enqueued, task.on_finished = enqueued, finished
+        task.on_finished = finished
         if task.task_type == 'apply_patch':
             await self._training_controller.mark_dirty.remote(context['instance_id'], context['epoch'])
 
@@ -210,11 +208,4 @@ class ManagedTrainingRuntime:
             return {'state': 'unsafe'}
         if self._compute_worker.has_task(request_id):
             return {'state': 'pending'}
-        future = await self.state.get_future(request_id)
-        if future and future['status'] in ('completed', 'failed', 'cancelled'):
-            return {
-                'state': 'finished',
-                'executed': future['status'] != 'cancelled',
-                'finished_at': datetime.fromisoformat(future['updated_at']).timestamp()
-            }
-        return {'state': 'missing'}
+        return self._compute_worker.get_task_outcome(request_id) or {'state': 'missing'}

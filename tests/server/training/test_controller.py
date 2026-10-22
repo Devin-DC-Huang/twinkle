@@ -199,7 +199,6 @@ async def test_reconciliation_of_committed_completion_does_not_extend_idle_time(
     controller, state, runtime, clock = await setup(backend=FakeBackend())
     identity = await create(controller, state, 'active')
     await controller.admit(identity, 'owner', 'session', 'lost-finish')
-    await controller.commit_operation(identity, 'lost-finish', controller.epoch)
     async def finished(instance, request_id):
         return {'state': 'finished', 'executed': True, 'finished_at': time.time() - 31}
     runtime.verify_operation = finished
@@ -362,7 +361,6 @@ async def test_heartbeat_does_not_prevent_idle_expiry_or_affect_busy_user():
     idle = await create(controller, state, 1)
     busy = await create(controller, state, 2)
     await controller.admit(busy, 'owner', 'session', 'op')
-    await controller.commit_operation(busy, 'op', controller.epoch)
     clock.now = 11
     await state.touch_session('session')
     await controller.sweep()
@@ -387,7 +385,6 @@ async def test_release_drains_accepted_operation_before_cleanup():
     controller, state, runtime, _ = await setup()
     identity = await create(controller, state, 1)
     await controller.admit(identity, 'owner', 'session', 'op')
-    await controller.commit_operation(identity, 'op', controller.epoch)
     releasing = asyncio.create_task(controller.release(identity, 'owner'))
     while controller.trainings[identity].state == 'ACTIVE':
         await asyncio.sleep(0)
@@ -485,7 +482,6 @@ async def test_unconfirmed_worker_shutdown_holds_devices_and_quota_until_retry()
     identity = await create(controller, state, 1, mode='full')
     instance = controller.instances[controller.trainings[identity].instance_id]
     await controller.admit(identity, 'owner', 'session', 'running')
-    await controller.commit_operation(identity, 'running', controller.epoch)
     runtime.fail_shutdown = True
     await controller.fail_instance(instance.instance_id, FutureFailureRecord(
         reason_code='execution_timeout', message='RPC timed out', attribution='server'))
@@ -651,7 +647,7 @@ async def test_retired_diagnostics_are_bounded_without_discarding_live_training(
     await controller.sweep()
     await controller.wait_for_jobs()
     assert old not in controller.trainings and retired_instance not in controller.instances
-    assert retired_instance not in controller._startup
+    assert retired_instance not in controller.lifecycle.startups
     assert (await controller.route(live, 'owner', 'session'))['instance_id'] in runtime.allocations
     await controller.shutdown()
 
@@ -677,3 +673,124 @@ async def test_creation_record_write_failure_closes_new_empty_instance(monkeypat
     assert (await state.get_future(ref['request_id']))['status'] == 'failed'
     assert not runtime.allocations
     assert await state._backend.get('token_count::owner') == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('fault', ['cancel_after_read', 'unknown_start_ack'])
+async def test_create_requires_its_own_atomic_start_ack(fault, monkeypatch):
+    from tests.server.state.fake_backend import FakeBackend
+    controller, state, runtime, _ = await setup(backend=FakeBackend())
+    initialized = []
+    original_create = runtime.create_training
+
+    async def initialize(*args):
+        initialized.append(True)
+        await original_create(*args)
+
+    runtime.create_training = initialize
+    if fault == 'cancel_after_read':
+        save = controller.store.save_training
+
+        async def cancel_during_save(record):
+            await save(record)
+            instance = controller.instances.get(record.instance_id)
+            if record.state == 'PENDING' and instance is not None and instance.state == 'READY':
+                assert (await state.cancel_future(record.create_request_id))['cancelled']
+
+        monkeypatch.setattr(controller.store, 'save_training', cancel_during_save)
+    else:
+        start = state.try_start_future
+
+        async def lose_ack(request_id):
+            assert await start(request_id)
+            raise ConnectionError('start acknowledgement lost')
+
+        monkeypatch.setattr(state, 'try_start_future', lose_ack)
+    try:
+        ref = await controller.create(request(fault))
+        await controller.wait_for_jobs()
+        future = await state.get_future(ref['request_id'])
+        assert future['status'] == ('cancelled' if fault == 'cancel_after_read' else 'failed')
+        assert not initialized and not runtime.users and not runtime.allocations
+        assert (await state._backend.get('token_count::owner') or 0) == 0
+    finally:
+        await controller.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_quarantined_resident_counts_towards_maximum_until_death_confirmed():
+    from tests.server.state.fake_backend import FakeBackend
+    from twinkle.server.state.models import FutureFailureRecord
+    controller, _, runtime, _ = await setup(backend=FakeBackend(), min_replicas=1, max_replicas=1)
+    old = next(iter(controller.instances.values()))
+    runtime.fail_shutdown = True
+    try:
+        await controller.fail_instance(old.instance_id, FutureFailureRecord(
+            reason_code='orphaned_replica', attribution='server', message='worker lost'))
+        for _ in range(3):
+            await controller.sweep()
+            await controller.wait_for_jobs()
+        assert old.state == 'QUARANTINED'
+        assert runtime.starts == 1 and list(runtime.allocations) == [old.instance_id]
+        runtime.fail_shutdown = False
+        await controller.sweep()
+        await controller.wait_for_jobs()
+        await controller.sweep()
+        await controller.wait_for_jobs()
+        live = [instance for instance in controller.instances.values() if instance.state != 'STOPPED']
+        assert old.state == 'STOPPED' and len(live) == 1
+        assert live[0].resident and live[0].state == 'READY'
+        assert live[0].instance_id != old.instance_id
+    finally:
+        runtime.fail_shutdown = False
+        await controller.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_last_lora_release_does_not_report_unconfirmed_device_release():
+    from tests.server.state.fake_backend import FakeBackend
+    controller, state, runtime, _ = await setup(backend=FakeBackend())
+    identity = await create(controller, state, 'last-user')
+    instance = controller.instances[controller.trainings[identity].instance_id]
+    runtime.fail_shutdown = True
+    try:
+        with pytest.raises(RuntimeError, match='quarantined'):
+            await controller.release(identity, 'owner', 'session')
+        assert instance.state == 'QUARANTINED' and runtime.allocations
+        runtime.fail_shutdown = False
+        await controller.sweep()
+        await controller.wait_for_jobs()
+        assert instance.state == 'STOPPED' and not runtime.allocations
+    finally:
+        runtime.fail_shutdown = False
+        await controller.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_two_device_lora_capacity_shares_two_instances_and_releases_them():
+    from tests.server.state.fake_backend import FakeBackend
+    from twinkle.server.config import ServerConfig
+    from twinkle.server.training.catalog import TrainingCatalog
+    controller, state, runtime, _ = await setup(backend=FakeBackend(), devices=4, quota=3)
+    controller.config = ServerConfig.from_yaml('cookbook/client/server/megatron/server_config.yaml').training_config
+    controller.catalog = TrainingCatalog(controller.config)
+    name = controller.config.models[0].name
+    try:
+        requests = [request(index, token=f'owner-{index // 3}').model_copy(update={'base_model': name})
+                    for index in range(6)]
+        refs = await asyncio.gather(*(controller.create(incoming) for incoming in requests))
+        await controller.wait_for_jobs()
+        futures = [await state.get_future(ref['request_id']) for ref in refs]
+        assert all(future['status'] == 'completed' for future in futures)
+        assert len(controller.instances) == 2
+        assert all(len(instance.training_ids) == 3 for instance in controller.instances.values())
+        assert sum(runtime.allocations.values()) == 4 and set(runtime.allocations.values()) == {2}
+        excess = request('excess', token='new-owner').model_copy(update={'base_model': name})
+        refused = await controller.create(excess)
+        assert (await state.get_future(refused['request_id']))['failure']['reason_code'] == 'capacity_unavailable'
+        for incoming, future in zip(requests, futures):
+            await controller.release(future['result']['training_id'], incoming.token, incoming.session_id)
+        assert not runtime.allocations and not runtime.users
+        assert all(instance.state == 'STOPPED' for instance in controller.instances.values())
+    finally:
+        await controller.shutdown()

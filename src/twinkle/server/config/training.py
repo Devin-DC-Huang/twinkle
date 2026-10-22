@@ -99,6 +99,8 @@ class TrainingModelConfig(_TrainingConfig):
         for mode in (self.modes.lora, self.modes.full):
             if mode is None:
                 continue
+            if self.backend == 'megatron' and mode.num_devices < 2:
+                raise ValueError('megatron training instances require at least 2 devices')
             if mode.device_mesh.device_type not in (None, self.device_type):
                 raise ValueError('device_mesh.device_type must match device_type')
             if mode.strategy is not None and self.backend != 'transformers':

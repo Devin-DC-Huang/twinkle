@@ -25,8 +25,7 @@ async def wait_idle(queue):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('fault', ['commit', 'queued_status'])
-async def test_warm_idle_worker_wakes_after_enqueue_failure(fault, monkeypatch):
+async def test_warm_idle_worker_wakes_after_enqueue_failure(monkeypatch):
     controller, state, _, _ = await setup(backend=FakeBackend())
     identity = await create(controller, state, 'queue-failure')
     instance = controller.instances[controller.trainings[identity].instance_id]
@@ -42,24 +41,18 @@ async def test_warm_idle_worker_wakes_after_enqueue_failure(fault, monkeypatch):
         await settle(state, warmup['request_id'])
         await wait_idle(queue)
         executed.clear()
-        if fault == 'commit':
-            async def broken(*args):
-                raise RuntimeError('injected commit failure')
-            queue._training_controller.commit_operation = RPC(broken)
-            ref = await queue.schedule_task(operation, model_id=identity, token='owner', task_type='step')
-        else:
-            previous = state.store_future_status
+        previous = state.store_future_status
 
-            async def broken(request_id, status, *args, **kwargs):
-                if status == 'queued':
-                    raise RuntimeError('injected queued write failure')
-                return await previous(request_id, status, *args, **kwargs)
+        async def broken(request_id, status, *args, **kwargs):
+            if status == 'queued':
+                raise RuntimeError('injected queued write failure')
+            return await previous(request_id, status, *args, **kwargs)
 
-            monkeypatch.setattr(state, 'store_future_status', broken)
-            with pytest.raises(RuntimeError, match='queued write'):
-                await queue.schedule_task(operation, model_id=identity, token='owner', task_type='step',
-                                          request_id='queued-failure')
-            ref = {'request_id': 'queued-failure'}
+        monkeypatch.setattr(state, 'store_future_status', broken)
+        with pytest.raises(RuntimeError, match='queued write'):
+            await queue.schedule_task(operation, model_id=identity, token='owner', task_type='step',
+                                      request_id='queued-failure')
+        ref = {'request_id': 'queued-failure'}
         assert (await settle(state, ref['request_id']))['status'] == 'completed'
         await wait_idle(queue)
         assert executed == [True]
@@ -107,7 +100,7 @@ async def test_cleanup_storage_failure_is_retryable(fault, mode, monkeypatch):
         await controller.release(identity, 'owner', 'session')
     assert failed
     assert identity not in controller._cleaning
-    assert instance.instance_id not in controller._closing
+    assert instance.instance_id not in controller.lifecycle.closing
     assert training.state == 'CLOSING'
     assert instance.state != 'STOPPED'
     for _ in range(3):
@@ -218,7 +211,7 @@ async def test_shutdown_waits_for_an_in_flight_instance_close():
     resume.set()
     await asyncio.gather(closing, shutdown)
     assert instance.state == 'STOPPED'
-    assert instance.instance_id not in controller._closing
+    assert instance.instance_id not in controller.lifecycle.closing
 
 
 @pytest.mark.asyncio
@@ -255,11 +248,11 @@ async def test_spawn_logs_exception_with_traceback(caplog, monkeypatch):
         raise RuntimeError('background sentinel')
 
     with caplog.at_level(logging.ERROR):
-        controller._spawn(broken())
+        controller.lifecycle.spawn(broken())
         await controller.wait_for_jobs()
-    records = [record for record in caplog.records if record.message == 'Training background job failed']
+    records = [record for record in caplog.records if record.getMessage() == 'Training background job failed']
     assert records and records[0].exc_info[1].args == ('background sentinel',)
-    assert not controller._jobs
+    assert not controller.lifecycle.jobs
     await controller.shutdown()
 
 
@@ -336,7 +329,7 @@ async def test_shutdown_waits_for_late_serve_deployment_before_confirming_releas
     monkeypatch.setattr('ray.util.list_named_actors', lambda **kwargs: [])
     monkeypatch.setattr(serve, 'run', deploy)
     monkeypatch.setattr(serve, 'delete', lambda name: None)
-    monkeypatch.setattr(driver.pool, 'remove', remove)
+    monkeypatch.setattr(driver.runtime.pool, 'remove', remove)
     deploying = asyncio.create_task(driver.deploy(instance, driver._catalog.get('small', 'lora')))
     closing = None
     try:
@@ -353,8 +346,8 @@ async def test_shutdown_waits_for_late_serve_deployment_before_confirming_releas
         await asyncio.gather(deploying, return_exceptions=True)
         if closing is not None:
             await closing
-        await driver.wait_for_cleanup()
-    assert not driver._deployments and not driver._cleanup_tasks
+        await driver.runtime.wait_for_cleanup()
+    assert not driver.runtime.deployments and not driver.runtime.cleanup_tasks
     store.state.unregister_replica_capacity.assert_awaited()
 
 

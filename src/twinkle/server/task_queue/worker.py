@@ -27,7 +27,8 @@ from twinkle.server.state.models import FutureFailureRecord
 from twinkle.server.telemetry.correlation import MODEL_ID, TOKEN_ID
 from twinkle.server.telemetry.tracing import traced_operation
 from twinkle.utils.logger import get_logger
-from .types import BACKEND_TIMEOUT_EXCEPTIONS, BackendBusyError, QueuedTask, QueueState, TaskStatus, UserTaskError
+from .types import (BACKEND_TIMEOUT_EXCEPTIONS, BackendBusyError, QueuedTask, QueueState, TaskStatus, UserTaskError,
+                    execution_scope)
 
 if TYPE_CHECKING:
     from twinkle.server.state import ServerState
@@ -108,6 +109,7 @@ class ComputeWorker:
 
         self.task_queues: dict[str, asyncio.Queue] = {}
         self._request_ids: set[str] = set()
+        self._task_outcomes: dict[str, dict[str, Any]] = {}
         self.queue_order: Deque[str] = deque()
         self.new_task_event: asyncio.Event = asyncio.Event()
 
@@ -184,6 +186,33 @@ class ComputeWorker:
     def has_task(self, request_id: str) -> bool:
         """True while a task is queued or executing, including a terminal-future race."""
         return request_id in self._request_ids
+
+    def get_task_outcome(self, request_id: str) -> dict[str, Any] | None:
+        """Read bounded local execution facts, never infer them from a future status."""
+        cutoff = time.time() - self._config.absolute_future_ttl(1)
+        for identity, outcome in list(self._task_outcomes.items()):
+            if outcome['finished_at'] <= cutoff:
+                self._task_outcomes.pop(identity)
+        outcome = self._task_outcomes.get(request_id)
+        return dict(outcome) if outcome is not None else None
+
+    async def finish_task(self,
+                          task: QueuedTask,
+                          executed: bool,
+                          unsafe: bool = False,
+                          finished_at: float | None = None) -> None:
+        if task.on_finished is not None:
+            self.get_task_outcome(task.request_id)
+            self._task_outcomes[task.request_id] = {
+                'state': 'unsafe' if unsafe else 'finished',
+                'executed': executed,
+                'finished_at': time.time() if finished_at is None else finished_at,
+            }
+        self._request_ids.discard(task.request_id)
+        if task.on_finished is not None:
+            acknowledged = await task.on_finished(executed, unsafe)
+            if acknowledged is True:
+                self._task_outcomes.pop(task.request_id, None)
 
     def total_queued(self) -> int:
         """Total number of pending tasks across all per-key queues."""
@@ -282,9 +311,7 @@ class ComputeWorker:
         for task in drained:
             await self._store_task_failed(task, reason, QueueState.UNKNOWN.value, queue_state_reason=reason)
             q.task_done()
-            self._request_ids.discard(task.request_id)
-            if task.on_finished is not None:
-                await task.on_finished(False, False)
+            await self.finish_task(task, False)
 
         self.task_queues.pop(queue_key, None)
         try:
@@ -311,9 +338,7 @@ class ComputeWorker:
         await self._store_task_failed(task, error, QueueState.PAUSED_CAPACITY.value, queue_state_reason=error)
         self._record_tasks_total(task.task_type or 'unknown', 'timeout')
         q.task_done()
-        self._request_ids.discard(task.request_id)
-        if task.on_finished is not None:
-            await task.on_finished(False, False)
+        await self.finish_task(task, False)
 
     async def _execute_task(self, task: QueuedTask, queue_key: str, q: asyncio.Queue) -> None:
         """Execute a dequeued task, then release its queue slot."""
@@ -396,6 +421,10 @@ class ComputeWorker:
 
         running = asyncio.create_task(run())
         self._detached_tasks[running] = task
+        scope = execution_scope.get()
+        if scope is not None:
+            scope.jobs.add(running)
+            scope.request_ids.add(task.request_id)
 
         def done(completed: asyncio.Task) -> None:
             self._detached_tasks.pop(completed, None)
@@ -417,6 +446,7 @@ class ComputeWorker:
         task_status = 'completed'
         exec_time = 0.0
         executed = False
+        finished_at = None
         # One span per queued task execution, tagged `<deployment>.<task_type>`
         # (e.g. `model.forward`, `sampler.sample`).
         queue_attrs = {
@@ -442,6 +472,7 @@ class ComputeWorker:
                     # effective_execution_timeout is always positive (0 -> finite fallback),
                     # so wait_for is always in effect.
                     result = await asyncio.wait_for(coro, timeout=self._config.effective_execution_timeout)
+                    finished_at = time.time()
             exec_time = time.monotonic() - exec_start
             logger.info(f'[ComputeWorker] Task {task.request_id} completed in {exec_time:.2f}s, type={task_type}')
             await self._state.store_future_status(
@@ -531,9 +562,7 @@ class ComputeWorker:
                 traceback_text=traceback.format_exc(),
             )
         finally:
-            self._request_ids.discard(task.request_id)
-            if task.on_finished is not None:
-                await task.on_finished(executed, executed and task_status in ('timeout', 'cancelled'))
+            await self.finish_task(task, executed, executed and task_status in ('timeout', 'cancelled'), finished_at)
             self._record_execution_time(task_type, exec_time)
             self._record_tasks_total(task_type, task_status)
 

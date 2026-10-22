@@ -122,6 +122,27 @@ class SamplerArgs(_ArgsBase):
     engine_args: dict[str, Any] | None = None
     queue_config: TaskQueueConfig = Field(default_factory=TaskQueueConfig)
     data_plane_url: str | None = None
+    min_replicas: int = Field(default=1, ge=0, strict=True)
+    max_replicas: int = Field(default=1, gt=0, strict=True)
+    idle_timeout_s: float = Field(default=600, gt=0, allow_inf_nan=False)
+    target_ongoing_requests: int = Field(default=16, gt=0, strict=True)
+
+    @model_validator(mode='after')
+    def _validate_pool(self):
+        if self.min_replicas > self.max_replicas:
+            raise ValueError('sampler min_replicas must not exceed max_replicas')
+        ranks = self.device_group.get('ranks', self.nproc_per_node)
+        width = self.device_group.get('gpus_per_worker', 1)
+        if type(ranks) is not int or ranks <= 0 or type(width) is not int or width <= 0 or ranks % width:
+            raise ValueError('sampler device_group requires a positive device count divisible by gpus_per_worker')
+        if self.sampler_type != 'mock':
+            from twinkle.utils.device_mesh import DeviceMesh
+            if DeviceMesh.from_sizes(**self.device_mesh).world_size != ranks:
+                raise ValueError('sampler device_mesh world_size must equal its device count')
+            tp = (self.engine_args or {}).get('tensor_parallel_size', width)
+            if tp != width:
+                raise ValueError('sampler tensor_parallel_size must equal gpus_per_worker')
+        return self
 
 
 class ServerStateArgs(_ArgsBase):

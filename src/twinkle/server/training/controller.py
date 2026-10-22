@@ -15,6 +15,7 @@ from twinkle.server.config.training import TrainingConfig
 from twinkle.server.exceptions import (RequestRejectedError, ResourceExhaustedError, ResourceNotFoundError,
                                        ResourceQuotaExceededError)
 from twinkle.server.resources.allocation import CapacityUnavailableError
+from twinkle.server.resources.instances import InstanceLifecycle
 from twinkle.server.state.models import FutureFailureRecord
 from twinkle.server.state.training_records import (LIVE_INSTANCES, TERMINAL_TRAINING, CreateTraining, InstanceRecord,
                                                    TrainingRecord)
@@ -85,10 +86,8 @@ class TrainingController:
         self.epoch = 'controller_' + uuid.uuid4().hex
         self.instances: dict[str, InstanceRecord] = {}
         self.trainings: dict[str, TrainingRecord] = {}
-        self._startup: dict[str, asyncio.Task] = {}
-        self._jobs: set[asyncio.Task] = set()
+        self.lifecycle = InstanceLifecycle('Training')
         self._cleaning: set[str] = set()
-        self._closing: dict[str, asyncio.Task] = {}
         self._reconciling: set[str] = set()
         self._failed_instances: dict[str, FutureFailureRecord] = {}
         self._lock = asyncio.Lock()
@@ -141,21 +140,6 @@ class TrainingController:
             return 'pg_removal'
         return 'other'
 
-    def _spawn(self, coroutine) -> asyncio.Task:
-        task = asyncio.create_task(coroutine)
-        self._jobs.add(task)
-
-        def done(completed):
-            self._jobs.discard(completed)
-            if completed.cancelled():
-                return
-            exc = completed.exception()
-            if exc is not None:
-                logger.error('Training background job failed', exc_info=(type(exc), exc, exc.__traceback__))
-
-        task.add_done_callback(done)
-        return task
-
     async def initialize(self) -> None:
         """Discard old state only after owned compute has been confirmed dead."""
         old_instances = await self.store.instances()
@@ -191,7 +175,7 @@ class TrainingController:
                 for _ in range(spec.config.min_replicas):
                     async with self._lock:
                         instance = await self._new_instance(spec, resident=True)
-                    await asyncio.shield(self._startup[instance.instance_id])
+                    await asyncio.shield(self.lifecycle.startups[instance.instance_id])
         except Exception:
             await self.shutdown()
             raise
@@ -234,6 +218,9 @@ class TrainingController:
             raise ResourceNotFoundError('Training controller epoch is no longer active')
 
     async def _new_instance(self, spec: TrainingSpec, *, resident: bool = False) -> InstanceRecord:
+        matching = [item for item in self.instances.values() if (item.base_model, item.mode) == spec.key]
+        if not self.lifecycle.headroom(matching, spec.config.max_replicas):
+            raise CapacityUnavailableError('Training replica limit reached')
         instance = InstanceRecord(
             instance_id='instance_' + uuid.uuid4().hex,
             controller_epoch=self.epoch,
@@ -244,7 +231,7 @@ class TrainingController:
         await self.store.save_instance(instance)
         self.instances[instance.instance_id] = instance
         self._report_instance_metrics()
-        self._startup[instance.instance_id] = self._spawn(self._start_instance(instance))
+        self.lifecycle.start(instance.instance_id, lambda: self._start_instance(instance))
         return instance
 
     async def _start_instance(self, instance: InstanceRecord) -> None:
@@ -346,9 +333,8 @@ class TrainingController:
                     if not self.residents_ready_for(spec):
                         raise CapacityUnavailableError(
                             'Resident training capacity is recovering; retry a new create later.')
-                    count = sum((item.base_model, item.mode) == spec.key and item.state != 'STOPPED'
-                                for item in self.instances.values())
-                    if spec.config.max_replicas is not None and count >= spec.config.max_replicas:
+                    matching = [item for item in self.instances.values() if (item.base_model, item.mode) == spec.key]
+                    if not self.lifecycle.headroom(matching, spec.config.max_replicas):
                         raise CapacityUnavailableError('Training replica limit reached; retry a new create later.')
                     instance = await self._new_instance(spec)
                 training.instance_id = instance.instance_id
@@ -357,7 +343,7 @@ class TrainingController:
                 self.trainings[training_id] = training
                 await self.store.save_training(training)
                 await self.store.save_instance(instance)
-                self._spawn(self._create_user(training, request))
+                self.lifecycle.spawn(self._create_user(training, request))
             except Exception as exc:
                 if training is not None:
                     self.trainings.pop(training_id, None)
@@ -367,7 +353,7 @@ class TrainingController:
                             instance.training_ids.remove(training_id)
                         await self.store.save_instance(instance)
                         if not instance.training_ids and not instance.resident:
-                            self._spawn(self.fail_instance(instance.instance_id, failure_for(exc)))
+                            self.lifecycle.spawn(self.fail_instance(instance.instance_id, failure_for(exc)))
                     training.state = 'FAILED'
                     training.terminal_reason = failure_for(exc).reason_code
                     await self.store.retire(training)
@@ -377,7 +363,7 @@ class TrainingController:
     async def _create_user(self, training: TrainingRecord, request: CreateTraining) -> None:
         instance = self.instances[training.instance_id]
         try:
-            await asyncio.shield(self._startup[instance.instance_id])
+            await asyncio.shield(self.lifecycle.startups[instance.instance_id])
             async with self._lock:
                 future = await self.store.state.get_future(training.create_request_id)
                 if future and future['status'] == 'cancelled':
@@ -387,7 +373,11 @@ class TrainingController:
                     raise RequestRejectedError('Training creation is no longer pending')
                 training.creation_deadline = self.clock() + self.config.startup_timeout_s
                 await self.store.save_training(training)
-                await self.store.future(training.create_request_id, 'running', training.training_id)
+                if not await self.store.state.try_start_future(training.create_request_id):
+                    future = await self.store.state.get_future(training.create_request_id)
+                    if future and future['status'] == 'cancelled':
+                        training.terminal_reason = 'cancelled'
+                    raise RequestRejectedError('Training creation did not acquire execution')
             remaining = training.creation_deadline - self.clock()
             await asyncio.wait_for(self.driver.create_training(instance, training, request), max(0, remaining))
             # Driver includes training-run metadata commit, before public success.
@@ -464,37 +454,17 @@ class TrainingController:
                 training.state = 'CLOSING'
                 training.terminal_reason = 'expired'
                 await self.store.save_training(training)
-                self._spawn(self._cleanup_user(training))
+                self.lifecycle.spawn(self._cleanup_user(training))
                 raise TrainingExpiredError(
                     'Training handle expired; create a new handle and explicitly load a checkpoint.')
             instance = self.instances[training.instance_id]
             if instance.state != 'READY':
                 raise ResourceNotFoundError('Training runtime is unavailable')
             if request_id not in training.pending_operation_ids:
-                training.pending_operation_ids[request_id] = {
-                    'accepted_at': self.clock(),
-                    'committed': False,
-                    'renew': renew
-                }
+                training.pending_operation_ids[request_id] = {'accepted_at': self.clock(), 'renew': renew}
                 await self.store.save_training(training)
                 await self.store.own_future(request_id, token)
             return {'instance_id': instance.instance_id, 'epoch': self.epoch}
-
-    async def commit_operation(self, training_id: str, request_id: str, epoch: str) -> None:
-        async with self._lock:
-            await self._assert_epoch()
-            training = self.trainings.get(training_id)
-            if epoch != self.epoch or training is None:
-                raise ResourceNotFoundError('Operation admission no longer exists')
-            if request_id not in training.pending_operation_ids:
-                # A very short task can finish while the enqueue acknowledgment
-                # is in flight. Its original terminal future is conclusive.
-                future = await self.store.state.get_future(request_id)
-                if future and future['status'] in ('completed', 'failed', 'cancelled'):
-                    return
-                raise ResourceNotFoundError('Operation admission no longer exists')
-            training.pending_operation_ids[request_id]['committed'] = True
-            await self.store.save_training(training)
 
     async def finish_operation(self,
                                training_id: str,
@@ -511,16 +481,21 @@ class TrainingController:
             training = self.trainings.get(training_id)
             if epoch != self.epoch or training is None:
                 return
-            ticket = training.pending_operation_ids.pop(request_id, None)
+            ticket = training.pending_operation_ids.get(request_id)
             if ticket is None:
                 return
+            updated = training.model_copy(deep=True)
+            updated.pending_operation_ids.pop(request_id)
             if executed and ticket['renew']:
                 age = max(0, time.time() - finished_at) if finished_at is not None else 0
-                training.last_activity_at = max(training.last_activity_at, self.clock() - age)
-            await self.store.save_training(training)
+                updated.last_activity_at = max(training.last_activity_at, self.clock() - age)
+            # A failed completion write must leave the original ticket retryable.
+            await self.store.save_training(updated)
+            training.pending_operation_ids = updated.pending_operation_ids
+            training.last_activity_at = updated.last_activity_at
             cleanup = training.state == 'CLOSING' and not training.pending_operation_ids
         if cleanup:
-            self._spawn(self._cleanup_user(training))
+            self.lifecycle.spawn(self._cleanup_user(training))
 
     async def route(self, training_id: str, token: str, session_id: str | None = None) -> dict[str, str]:
         async with self._lock:
@@ -538,7 +513,7 @@ class TrainingController:
             await self._cleanup_user(training)
         config = self.catalog.get(training.base_model, training.mode).config.queue_config
         deadline = asyncio.get_running_loop().time() + config.absolute_future_ttl(1) + self.config.shutdown_timeout_s
-        while training.state == 'CLOSING' or self.instances[training.instance_id].state == 'DRAINING':
+        while training.state == 'CLOSING' or self.instances[training.instance_id].state in ('DRAINING', 'QUARANTINED'):
             if self.instances[training.instance_id].state == 'QUARANTINED':
                 raise RuntimeError('Runtime cleanup is quarantined; device release is not confirmed')
             if asyncio.get_running_loop().time() >= deadline:
@@ -628,25 +603,11 @@ class TrainingController:
                 self._cleaning.discard(training.training_id)
 
     async def _close_instance(self, instance: InstanceRecord) -> None:
-        close_task = self._closing.get(instance.instance_id)
-        if close_task is None:
-            close_task = self._spawn(self._close_instance_once(instance))
-            self._closing[instance.instance_id] = close_task
-
-            def clear(completed: asyncio.Task) -> None:
-                if self._closing.get(instance.instance_id) is completed:
-                    self._closing.pop(instance.instance_id, None)
-
-            close_task.add_done_callback(clear)
-        await asyncio.shield(close_task)
-
-    async def _close_instance_once(self, instance: InstanceRecord) -> None:
         started = time.monotonic()
         tags = self._instance_metric_tags(instance)
         timing_tags = {'backend': tags['backend'], 'mode': tags['mode']}
-        try:
-            await asyncio.wait_for(self.driver.shutdown(instance), self.config.shutdown_timeout_s)
-        except Exception as exc:
+
+        async def quarantined(exc):
             async with self._lock:
                 quarantined = instance.model_copy(update={'state': 'QUARANTINED', 'failure': str(exc)})
                 await self.store.save_instance(quarantined)
@@ -660,8 +621,18 @@ class TrainingController:
                     'reason': self._quarantine_reason(exc),
                 })
             self._metrics.shutdown_seconds.observe(time.monotonic() - started, tags={**timing_tags, 'status': 'error'})
-            return
-        self._metrics.shutdown_seconds.observe(time.monotonic() - started, tags={**timing_tags, 'status': 'success'})
+
+        async def stopped():
+            self._metrics.shutdown_seconds.observe(
+                time.monotonic() - started, tags={
+                    **timing_tags, 'status': 'success'
+                })
+            await self._retire_instance(instance)
+
+        await self.lifecycle.close(instance.instance_id, lambda: self.driver.shutdown(instance),
+                                   self.config.shutdown_timeout_s, stopped, quarantined)
+
+    async def _retire_instance(self, instance):
         async with self._lock:
             terminal_records = []
             terminal_at = time.time()
@@ -729,10 +700,7 @@ class TrainingController:
                     training.terminal_reason = failure.reason_code
                     for request_id in (training.create_request_id, *training.pending_operation_ids):
                         await self.store.future(request_id, 'failed', training_id, failure=failure)
-            startup = self._startup.get(instance_id)
-            if startup is not None and startup is not asyncio.current_task() and not startup.done():
-                startup.cancel()
-                await asyncio.gather(startup, return_exceptions=True)
+            await self.lifecycle.cancel_start(instance_id)
         finally:
             # Once DRAINING is durable, shutdown must be attempted even if a
             # later training/future write fails. Sweep will retry if this fails.
@@ -766,24 +734,24 @@ class TrainingController:
                 and not training.pending_operation_ids and training.training_id not in self._cleaning
             ]
         for training in closing:
-            self._spawn(self._cleanup_user(training))
+            self.lifecycle.spawn(self._cleanup_user(training))
         for training, request_id in uncertain:
-            self._spawn(self._reconcile_operation(training, request_id))
+            self.lifecycle.spawn(self._reconcile_operation(training, request_id))
         for instance in list(self.instances.values()):
             failure = self._failed_instances.get(instance.instance_id)
             if failure is not None:
-                self._spawn(self.fail_instance(instance.instance_id, failure))
+                self.lifecycle.spawn(self.fail_instance(instance.instance_id, failure))
             elif instance.state in ('DRAINING', 'QUARANTINED'):
-                self._spawn(self._close_instance(instance))
+                self.lifecycle.spawn(self._close_instance(instance))
         # Rebuilding one specification must not stop expiry or other models.
         for spec in self.catalog.specs():
-            residents = sum(
-                instance.resident and instance.instance_id not in self._failed_instances and (
-                    instance.base_model, instance.mode) == spec.key and instance.state in LIVE_INSTANCES
-                for instance in self.instances.values())
-            for _ in range(spec.config.min_replicas - residents):
-                async with self._lock:
-                    instance = await self._new_instance(spec, resident=True)
+            async with self._lock:
+                matching = [item for item in self.instances.values() if (item.base_model, item.mode) == spec.key]
+                missing = self.lifecycle.missing(
+                    matching, spec.config.min_replicas, spec.config.max_replicas, lambda instance: instance.resident and
+                    instance.instance_id not in self._failed_instances and instance.state in LIVE_INSTANCES)
+                for _ in range(missing):
+                    await self._new_instance(spec, resident=True)
         await self.store.cleanup_receipts()
         # Terminal diagnostics expire like their backend tombstones. Repeated
         # model creation must not grow controller memory for the server lifetime.
@@ -797,7 +765,7 @@ class TrainingController:
                 if (instance.state == 'STOPPED' and instance.stopped_at is not None and instance.stopped_at <= cutoff
                         and not instance.training_ids):
                     self.instances.pop(identity)
-                    self._startup.pop(identity, None)
+                    self.lifecycle.startups.pop(identity, None)
             self._report_instance_metrics()
 
     async def _reconcile_operation(self, training: TrainingRecord, request_id: str) -> None:
@@ -807,9 +775,7 @@ class TrainingController:
                 return
             result = await asyncio.wait_for(
                 self.driver.verify_operation(instance, request_id), self.config.shutdown_timeout_s)
-            if result['state'] == 'pending':
-                await self.commit_operation(training.training_id, request_id, self.epoch)
-            elif result['state'] == 'finished':
+            if result['state'] == 'finished':
                 await self.finish_operation(
                     training.training_id,
                     request_id,
@@ -833,10 +799,7 @@ class TrainingController:
             self._reconciling.discard(request_id)
 
     async def wait_for_jobs(self) -> None:
-        while self._jobs:
-            jobs = tuple(self._jobs)
-            await asyncio.gather(*jobs, return_exceptions=True)
-            self._jobs.difference_update(task for task in jobs if task.done())
+        await self.lifecycle.join()
 
     async def shutdown(self) -> None:
         self._ready = False
