@@ -7,7 +7,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Sequence
 
-from twinkle_agentic.async_rl.types import PartitionAdmission, RLContext
+from twinkle_agentic.async_rl.legacy.types import RLContext
+from twinkle_agentic.async_rl.types import PartitionAdmission
 
 
 class ContextSchedulePolicy(StrEnum):

@@ -8,10 +8,17 @@ import threading
 import time
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
-from .context_manager import RLContextManager
-from .types import PartitionAdmission, RLContext, RolloutPolicy
+from .types import PartitionAdmission, RolloutPolicy
+
+if TYPE_CHECKING:
+    # Type-only imports (the annotations below are never evaluated at runtime): the seams speak the
+    # rollout domain's vocabulary and the collaborators are twinkle's own classes.
+    from .cluster_adapter import ClusterAdapter
+    from .score_worker import ScoreWorker
+    from ..rollout import MultiTurnRollout, RolloutSample, SampleHandle
+    from twinkle.model.base import TrainableModel
 
 #: One in-flight trajectory: the sampler handle to poll/collect it by, the policy it was pinned to
 #: (released once collected or cancelled, so its adapter path can then be pruned), and the training
@@ -61,6 +68,10 @@ class BufferRecord:
     sample: Any
     version: int
     group_key: str
+    #: The in-flight score reference from the poll-batch submission: ``(outcome, index, prm)`` -- the
+    #: shared lazy outcome, this record's position in the submitted batch, and whether the PRM channel
+    #: rides it. ``None`` once reaped (or never submitted: no remote score shape).
+    score_ref: Any = None
 
 
 @dataclass
@@ -83,6 +94,10 @@ class DriverStats:
     #: Wall-clock seconds spent in the idle ``sleep`` branch: trajectories in flight, none completed this
     #: pass, buffer not yet trainable -- i.e. the trainer starved for ready work (the trainer bubble).
     idle_time: float = 0.0
+    #: Wall-clock seconds trajectories spent in flight (admit -> collect), driver-side bookkeeping
+    #: with NO RPC. It includes engine queueing, so it measures the generation channel's OCCUPANCY
+    #: (the resource adapter's elasticity signal), not the sampler's pure service time.
+    generation_time: float = 0.0
     #: The previous pull's trainer-bubble ratio, folded BY THE DRIVER at each batch boundary:
     #: ``idle_delta / (train_delta + idle_delta)`` where the deltas are taken exactly at the pull
     #: return (train time is accumulated only AFTER a pull returns, so the train delta here is the
@@ -119,117 +134,9 @@ def _prompt_ordinal_key(ref: PromptRef) -> str:
 
 
 #: The single policy token a driver with NO control plane (infer) pins every trajectory to: version 0, no
-#: adapter path, a context key that never collides with a real one. ``_NullLedger.acquire`` hands this out and
-#: ``release`` ignores it, so the run loop's acquire/release pair is a no-op without branching on the regime.
-_NULL_POLICY = RolloutPolicy('__null__', None, 0, None)
-
-
-class _ContextLedger:
-    """Version / admission-window / pin accounting backed by a real :class:`RLContextManager` (the RL regime).
-
-    The driver talks to this instead of ``ctx_mgr`` directly, so ONE run loop drives both the RL regime (a real
-    control plane: the version bumps on publish, windows gate admission by ``max_staleness``, pins guard adapter
-    paths against pruning) and the infer regime (:class:`_NullLedger`) without branching. Every method is a thin
-    delegation to the injected control plane, scoped to this driver's single ``ctx``.
-    """
-
-    def __init__(self, ctx_mgr: RLContextManager, ctx: RLContext, *, groups_per_partition: int,
-                 num_generations: int) -> None:
-        self._ctx_mgr = ctx_mgr
-        self._ctx = ctx
-        self._groups_per_partition = groups_per_partition
-        self._num_generations = num_generations
-
-    def register(self, initial_adapter_path: Optional[str]) -> None:
-        """Pin the version-0 policy so the first admissions reference a real version, never an unpinned base."""
-        self._ctx_mgr.register_context(self._ctx, adapter_path=initial_adapter_path, policy_version=0)
-
-    def acquire(self) -> RolloutPolicy:
-        """Pin the current policy while one sampler request uses it (refcount++ on its adapter path)."""
-        return self._ctx_mgr.acquire_rollout_policy(self._ctx)
-
-    def release(self, policy: RolloutPolicy) -> None:
-        """Release a pin from :meth:`acquire` (refcount--; a collected/cancelled trajectory's ONLY release)."""
-        self._ctx_mgr.release_rollout_policy(policy)
-
-    def open_window(self) -> bool:
-        """Open one fresh admission window if the staleness gate allows (bounded by ``max_staleness``)."""
-        admission = self._ctx_mgr.request_rollout_partition(
-            self._ctx, target_groups=self._groups_per_partition, num_generations=self._num_generations)
-        return admission is not None
-
-    def current_version(self) -> int:
-        return self._ctx_mgr.get_rollout_policy(self._ctx).version
-
-    def live_windows(self) -> List[PartitionAdmission]:
-        """This context's live admission windows, oldest step first (the FIFO publish order)."""
-        return sorted(
-            (a for a in self._ctx_mgr.list_live_partitions() if a.context.key == self._ctx.key),
-            key=lambda a: a.step)
-
-    def begin_publish(self, window: PartitionAdmission) -> None:
-        """Mark the oldest live window as training (the control plane enforces it IS the oldest -- FIFO)."""
-        self._ctx_mgr.on_partition_training_started(window)
-
-    def finish_publish(self, window: PartitionAdmission, new_path: Optional[str]) -> None:
-        """Bump the tracked version to the just-published policy (``new_path``) and retire the window."""
-        self._ctx_mgr.on_partition_trained(window, adapter_path=new_path)
-        self._ctx_mgr.on_partition_cleared(window)
-
-    def clear_window(self, window: PartitionAdmission) -> None:
-        """Retire a still-live window at teardown (no version bump -- the run is ending)."""
-        self._ctx_mgr.on_partition_cleared(window)
-
-    def on_exhausted(self) -> None:
-        """Bookkeeping: the prompt stream drained, so no further partition is requested after this point."""
-        self._ctx_mgr.on_dataset_exhausted(self._ctx)
-
-    def adapter_paths_to_keep(self) -> set:
-        """Paths a live version, an in-flight pin or a buffered sample still references."""
-        return self._ctx_mgr.adapter_paths_to_keep()
-
-
-class _NullLedger:
-    """Degenerate accounting for a driver with NO control plane (infer): the pure-rollout regime.
-
-    The version is pinned at 0 (nothing publishes), windows are unbounded (admission is gated only by the
-    driver's ``buffer_depth`` backpressure, never a staleness gate), and pins are no-ops (no adapter path to
-    guard). This is what lets ``run_infer`` reuse the SAME driver without carrying RL scaffolding or injecting
-    no-op stubs: the driver constructs this internally when ``ctx_mgr`` is ``None``.
-    """
-
-    def register(self, initial_adapter_path: Optional[str]) -> None:
-        return None
-
-    def acquire(self) -> RolloutPolicy:
-        return _NULL_POLICY
-
-    def release(self, policy: RolloutPolicy) -> None:
-        return None
-
-    def open_window(self) -> bool:
-        return True
-
-    def current_version(self) -> int:
-        return 0
-
-    def adapter_paths_to_keep(self) -> set:
-        return set()
-
-    def live_windows(self) -> List[PartitionAdmission]:
-        return []
-
-    def begin_publish(self, window: PartitionAdmission) -> None:
-        return None
-
-    def finish_publish(self, window: PartitionAdmission, new_path: Optional[str]) -> None:
-        return None
-
-    def clear_window(self, window: PartitionAdmission) -> None:
-        return None
-
-    def on_exhausted(self) -> None:
-        return None
+#: adapter path. ``_acquire_policy`` hands this out and ``_release_pin`` ignores it, so the run loop's
+#: acquire/release pair is a no-op without branching on the regime.
+_NULL_POLICY = RolloutPolicy(None, 0, None)
 
 
 class StreamingDriver:
@@ -241,8 +148,8 @@ class StreamingDriver:
     = the groups one publish cycle is expected to train, used as the window's sizing declaration;
     ``buffer_depth`` = the in-flight + ready backpressure cap in samples), and the data-plane seams.
     ``version_control=True`` selects the RL regime (the driver builds its own version ledger); False
-    is the infer regime: the driver then runs on an internal null ledger (version pinned at 0, no
-    windows, no pins) and never publishes, so it carries no RL scaffolding.
+    is the infer regime: the driver then pins the version at 0 with no windows and no pins, and
+    never publishes, so it carries no RL scaffolding.
 
     The driver owns NO weight/model control and NO publish cadence: publication is an external signal
     (:meth:`request_publish`) carrying the caller's own push callable, which the driver brackets with its
@@ -258,32 +165,31 @@ class StreamingDriver:
                  num_generations: int,
                  groups_per_partition: int,
                  buffer_depth: int,
-                 submit: Optional[Callable[[Any, int, RolloutPolicy], Any]] = None,
-                 poll: Optional[Callable[[Sequence[Any]], Sequence[Any]]] = None,
-                 collect: Optional[Callable[[Any], Any]] = None,
+                 submit: Optional[Callable[[PromptRef, int, RolloutPolicy], SampleHandle]] = None,
+                 poll: Optional[Callable[[Sequence[SampleHandle]], Sequence[SampleHandle]]] = None,
+                 collect: Optional[Callable[[SampleHandle], RolloutSample]] = None,
                  assembly_ready: Optional[Callable[[List[BufferRecord]], Optional[List[BufferRecord]]]] = None,
-                 rollout: Optional[Any] = None,
+                 rollout: Optional[MultiTurnRollout] = None,
                  group_pull: Optional[bool] = None,
                  need_rows: Optional[int] = None,
                  version_control: bool = False,
                  consume: Optional[Callable[[List[BufferRecord]], Optional[int]]] = None,
                  group_key: Optional[Callable[[Any], str]] = None,
-                 score: Optional[Callable[[Any], Any]] = None,
+                 score: Optional[Union[Callable[[RolloutSample], Optional[RolloutSample]], ScoreWorker]] = None,
                  max_group_regenerations: int = 0,
                  regenerate: Optional[Callable[[str, List[Any]], bool]] = None,
                  baseline_fn: Optional[Callable[[str, List[Any]], Optional[float]]] = None,
                  prune: Optional[Callable[[], None]] = None,
                  initial_adapter_path: Optional[Callable[[], Optional[str]]] = None,
-                 snapshot_model: Optional[Any] = None,
+                 snapshot_model: Optional[TrainableModel] = None,
                  snapshot_dir: Optional[str] = None,
                  adapter_name: Optional[str] = None,
                  max_steps: Optional[int] = None,
-                 score_worker: Optional[Any] = None,
-                 resource_adapter: Optional[Any] = None,
+                 resource_adapter: Optional[ClusterAdapter] = None,
                  sleep: Optional[Callable[[float], None]] = None) -> None:
         # Fail loudly on a mis-wired seam: a non-callable injected here would otherwise surface deep
         # inside the run loop (or silently skip a lifecycle step), far from the construction that caused it.
-        # The group-barrier algorithm hooks: PRM scoring is the ``score_worker`` collaborator's own channel,
+        # The group-barrier algorithm hooks: PRM scoring is the remote ``score`` shape's own channel,
         # the variance-style verdict is ``regenerate`` and the remax-style baseline is ``baseline_fn``. All
         # three are optional and stack freely.
         self._regenerate = regenerate
@@ -317,18 +223,20 @@ class StreamingDriver:
             assembly_ready = self._make_group_pull_rule(num_generations, need_rows)
         if assembly_ready is None and group_pull is False:
             assembly_ready = self._make_no_group_pull_rule(need_rows)
-        # Two more defaulted collaborators, same duck-typed style as ``rollout``: ``score_worker``
-        # (protocol: ``score_group(samples) -> [N][n_scorers]`` rows) default-binds the ORM scoring
-        # -- group_pull=True runs it at the group barrier, False at the pull boundary on the whole
-        # batch, so a per-sample consumer batches instead of one round-trip per sample; ``resource_adapter``
-        # (protocol: ``observe/decide/register_decision``) is fed at every pull boundary and inside
-        # the publish bracket BEFORE the push, so its scaling decision is produced and consumed in
-        # the same publication.
-        self._group_pull = group_pull
-        self._score_worker = score_worker
-        if score_worker is not None and not callable(getattr(score_worker, 'score_group', None)):
-            raise TypeError(f'StreamingDriver score_worker needs a score_group(samples) method, '
-                            f'got {type(score_worker).__name__}')
+        # The scoring collaborator takes ONE parameter with two mutually-exclusive shapes: a LOCAL
+        # callable (single sample in, replacement sample or None out -- the lightweight rule channel,
+        # applied per trajectory inside the collection loop) or a remote score worker handle (batch in,
+        # [N][n_scorers] matrix out, submitted per poll batch and reaped non-blockingly, so scoring
+        # overlaps generation and training instead of blocking a barrier). ``callable()`` picks the
+        # local shape; anything else must carry ``score_group``. ``resource_adapter`` (protocol:
+        # ``observe/decide/register_decision``) is fed at every pull boundary and inside the publish
+        # bracket BEFORE the push, so its scaling decision is produced and consumed in the same
+        # publication.
+        self._score = score if callable(score) else None
+        self._score_worker = None if callable(score) else score
+        if self._score_worker is not None and not callable(getattr(score, 'score_group', None)):
+            raise TypeError(f'StreamingDriver score needs to be a callable (local seam) or carry a '
+                            f'score_group(samples) method (score worker), got {type(score).__name__}')
         self._resource_adapter = resource_adapter
         if resource_adapter is not None:
             missing = [name for name in ('observe', 'decide', 'register_decision')
@@ -351,17 +259,12 @@ class StreamingDriver:
                                 f'got {type(fn).__name__}')
         if max_group_regenerations < 0:
             raise ValueError(f'max_group_regenerations must be non-negative, got {max_group_regenerations}')
-        # The control plane is OPTIONAL: version_control=True is the RL regime with an internally built
-        # version ledger; False is the infer regime (an internal _NullLedger: version pinned at 0, no
-        # staleness gate, no pins, nothing publishes).
+        # The control plane is OPTIONAL: version_control=True is the RL regime; False is the infer regime
+        # (version pinned at 0, no windows, no pins, nothing publishes).
         if not isinstance(version_control, bool):
             raise TypeError(f'version_control must be a bool, got {type(version_control).__name__}')
         if max_staleness < 0:
             raise ValueError(f'max_staleness must be non-negative, got {max_staleness}')
-        if version_control:
-            ctx_mgr = RLContextManager(max_staleness=max_staleness)
-            ctx = RLContext(tenant_id='default', training_run_id='default', base_model_id='policy',
-                            adapter_name=adapter_name)
         if num_generations <= 0:
             raise ValueError(f'num_generations must be positive, got {num_generations}')
         if groups_per_partition <= 0:
@@ -370,13 +273,17 @@ class StreamingDriver:
             raise ValueError(f'buffer_depth must be positive, got {buffer_depth}')
         if num_train_epochs <= 0:
             raise ValueError(f'num_train_epochs must be > 0, got {num_train_epochs}')
-        # The version/window/pin accounting the run loop drives -- a real control plane (RL) or the internal
-        # null ledger (infer). The driver no longer stores weight_sync or the publish cadence: publication is
-        # an EXTERNAL, per-call request (see :meth:`request_publish`), so the ledger is the only control-plane
-        # state the driver holds, and the weight push itself never lives here.
-        self._ledger = (_ContextLedger(ctx_mgr, ctx, groups_per_partition=groups_per_partition,
-                                       num_generations=num_generations)
-                        if version_control else _NullLedger())
+        # The version/window/pin accounting the run loop drives, inlined as plain fields: version_control=False
+        # pins everything to _NULL_POLICY (version 0, no windows, no pins) so the infer regime runs the same loop
+        # with no branching. The driver no longer stores the weight push or the publish cadence: publication is an
+        # EXTERNAL, per-call request (see :meth:`request_publish`), and the weight push itself never lives here.
+        self._version_control = version_control
+        self._policy = _NULL_POLICY
+        self._policy_pins: dict = {}
+        self._windows: List[PartitionAdmission] = []
+        self._next_step = 0
+        self._training_partition_id: Optional[str] = None
+        self._registered = False
         self._prompt_stream = prompt_stream
         #: Passes over ``prompt_stream`` before it counts as exhausted (a fractional epoch still runs one
         #: truncated pass, ceil). The driver loops them itself because a dataloader reads one pass per
@@ -393,14 +300,13 @@ class StreamingDriver:
         self._collect = collect
         self._assembly_ready = assembly_ready
         self._consume = consume
-        self._score = score
         self._max_group_regenerations = max_group_regenerations
         # The PRM pass at the group barrier runs whenever the worker carries a wired channel -- its
         # consumer may be a hook here (regenerate / baseline_fn) OR
         # the training half reading ``sample.prm_process`` downstream (advantage fusion); the
         # channel's own wiring is the signal, probed on the worker once (a Ray proxy shell exposes
         # no fields, so this cannot be a driver-side attribute read).
-        self._prm_ready = (score_worker is not None and bool(score_worker.prm_ready()))
+        self._prm_ready = (self._score_worker is not None and bool(self._score_worker.prm_ready()))
         self._group_key = group_key if group_key is not None else _prompt_ordinal_key
         # Snapshot lifecycle, defaulted from snapshot_model: a publish push that saves the next adapter
         # version, a v0 pin, and a prune of paths no pin references. Explicit callables override all three.
@@ -458,6 +364,7 @@ class StreamingDriver:
 
         def _rule(buffer: List[BufferRecord]) -> Optional[List[BufferRecord]]:
             counts: Dict[Any, int] = {}
+            pending: Dict[Any, bool] = {}
             order: List[Any] = []
             for record in buffer:
                 key = record.group_key
@@ -465,7 +372,11 @@ class StreamingDriver:
                     counts[key] = 0
                     order.append(key)
                 counts[key] += 1
-            complete = [key for key in order if counts[key] >= num_generations]
+                if record.score_ref is not None:
+                    pending[key] = True
+            # A group is complete only when its siblings are all present AND all scored: an unscored
+            # group stays buffered (the re-probe re-enters the group barrier the pass after landing).
+            complete = [key for key in order if counts[key] >= num_generations and not pending.get(key)]
             groups_per_pull = need_rows // math.gcd(num_generations, need_rows)
             n_pull = groups_per_pull * (len(complete) // groups_per_pull)
             if n_pull < 1:
@@ -518,7 +429,7 @@ class StreamingDriver:
         """Drop tracked snapshot paths no live version or in-flight pin references."""
         if not self._snapshot_paths:
             return
-        keep = self._ledger.adapter_paths_to_keep()
+        keep = self._adapter_paths_to_keep()
         for path in list(self._snapshot_paths):
             if path not in keep:
                 shutil.rmtree(path, ignore_errors=True)
@@ -548,7 +459,7 @@ class StreamingDriver:
         sample = self._rollout.collect(handle)
         if getattr(handle, 'adapter_path', None) is None:
             # in_place: the episode may have been aborted-and-resumed across publishes. A pinned
-            # adapter path (adapter_snapshot) spans nothing; the null ledger keeps version 0.
+            # adapter path (adapter_snapshot) spans nothing; without version control the version stays 0.
             sample.version_span = max(0, self._current_version() - sample.policy_version)
         return sample
 
@@ -580,9 +491,9 @@ class StreamingDriver:
         nor a sampler submission nor a partition.
         """
         # Version 0: pin the initial (pre-training) policy so the first admissions reference a real version
-        # and the sampler generates from it, never an unpinned base model (None for in-place; a no-op under
-        # the null ledger, where the version is pinned at 0 and nothing publishes).
-        self._ledger.register(self._initial_adapter_path())
+        # and the sampler generates from it, never an unpinned base model (None for in-place; a no-op
+        # without version control, where the version is pinned at 0 and nothing publishes).
+        self._register_initial_policy()
         # A second run() on the same driver must not inherit the previous run's fold snapshots.
         self.stats.last_pull_idle_ratio = 0.0
         self._train_at_pull = 0.0
@@ -607,7 +518,6 @@ class StreamingDriver:
         ready: List[BufferRecord] = []
         stream_done = pending is None
         exhausted = False
-        exhausted_notified = False
         # Group-completion bookkeeping (only load-bearing when a group-barrier hook is wired; the
         # counters are cheap and stay correct regardless). ``group_counts`` is the per-group collected count
         # in the ready buffer (the intra-group barrier reads it); ``group_prompt`` maps a group_key to the
@@ -643,11 +553,11 @@ class StreamingDriver:
                                 step=self.stats.optimizer_steps, publish_boundary=True)
                             self._resource_adapter.register_decision(
                                 decision, step=self.stats.optimizer_steps)
-                        self._ledger.begin_publish(window)
+                        self._begin_publish(window)
                         _t = time.perf_counter()
                         new_path = push(window)
                         self.stats.publish_time += time.perf_counter() - _t
-                        self._ledger.finish_publish(window, new_path)
+                        self._finish_publish(window, new_path)
                         self.stats.publishes += 1
                         self._drop_stale(ready, group_counts)
                         # Drop published artifacts no live version, in-flight pin or buffered sample still
@@ -684,32 +594,27 @@ class StreamingDriver:
                                 partial = (pending, 0, group_key)
                                 pending = self._draw(prompts)
                         prompt_ref, trajectory_idx, group_key = partial
-                        policy = self._ledger.acquire()
+                        policy = self._acquire_policy()
                         try:
                             _t = time.perf_counter()
                             handle = self._submit(prompt_ref, trajectory_idx, policy)
                             self.stats.submit_time += time.perf_counter() - _t
                         except BaseException:
                             # A failed submit must not leak the pin it just acquired.
-                            self._ledger.release(policy)
+                            self._release_pin(policy)
                             raise
-                        handles[handle] = (handle, policy, group_key)
+                        handles[handle] = (handle, policy, group_key, _t)
                         self.stats.admitted += 1
                         capacity -= 1
                         trajectory_idx += 1
                         partial = ((prompt_ref, trajectory_idx, group_key)
                                    if trajectory_idx < self._num_generations else None)
-                    if stream_done and not exhausted_notified:
-                        # Bookkeeping only (no partition is requested after this point), but it keeps the
-                        # control-plane status honest for an introspecting consumer. Guarded so a regeneration
-                        # re-admission after the stream drained does not re-notify.
-                        self._ledger.on_exhausted()
-                        exhausted_notified = True
 
                 # (3) Collection: one non-blocking poll; every completion is fetched, its pin released,
                 #     and -- unless it is already too stale to train -- moved into the ready buffer.
                 progressed = False
                 if handles:
+                    fresh: List[BufferRecord] = []
                     # The version cannot change during collection (a publish is phase (1), never here),
                     # so read it once for the whole poll's staleness decision.
                     current = self._current_version()
@@ -720,7 +625,7 @@ class StreamingDriver:
                         entry = handles.pop(handle, None)
                         if entry is None:
                             continue  # a handle this driver does not know: ignore, never double-collect
-                        _, policy, group_key = entry
+                        _, policy, group_key, admitted_at = entry
                         try:
                             _t = time.perf_counter()
                             sample = self._collect(handle)
@@ -733,8 +638,9 @@ class StreamingDriver:
                             # is the pin's ONLY release on the collected path -- releasing again when the
                             # record leaves the buffer would double-release and raise. In a finally so a
                             # collect failure leaks no pin either.
-                            self._ledger.release(policy)
+                            self._release_pin(policy)
                         self.stats.collected += 1
+                        self.stats.generation_time += time.perf_counter() - admitted_at
                         progressed = True
                         # A straggler can stay in flight across MORE than ``max_staleness`` publishes -- the
                         # post-publish stale scan (phase (1)) only sees the BUFFER, never the in-flight set
@@ -747,11 +653,12 @@ class StreamingDriver:
                         if current - policy.version > self._max_staleness:
                             self.stats.dropped_stale += 1
                             continue
-                        # Per-sample scoring seam (PRM/ORM): applied to each trajectory the instant it is
-                        # collected, BEFORE it enters the ready buffer, so the group barrier and the
-                        # assembler both see a scored sample. A returned value replaces the sample (a seam
-                        # that mutates in place and returns None keeps the original). This is per-SAMPLE, not
-                        # per-group -- group-relative advantage is the assembler's job, not this seam's.
+                        # Per-sample scoring seam: the LOCAL ``score`` shape, applied to each trajectory
+                        # the instant it is collected, BEFORE it enters the ready buffer. The REMOTE score
+                        # shape is separate bookkeeping: it is submitted per poll batch after this loop and
+                        # reaped onto the samples non-blockingly (score_ref). A returned value replaces
+                        # the sample (one that mutates in place and returns None keeps the original). This
+                        # is per-SAMPLE, not per-group -- group-relative advantage is the assembler's job.
                         if self._score is not None:
                             _t = time.perf_counter()
                             scored = self._score(sample)
@@ -762,30 +669,35 @@ class StreamingDriver:
                         # key) so the fixed-format batch is self-describing; positions, not this field,
                         # are the training contract.
                         sample.group_key = group_key
-                        ready.append(BufferRecord(sample=sample, version=policy.version, group_key=group_key))
+                        record = BufferRecord(sample=sample, version=policy.version, group_key=group_key)
+                        ready.append(record)
+                        fresh.append(record)
                         group_counts[group_key] = group_counts.get(group_key, 0) + 1
                         self._maybe_group_complete(group_key, ready, group_counts, group_prompt,
                                                    resolved_groups, regen_queue, regen_counts)
+                    # Submit this poll's survivors as ONE batched scoring call (lazy: the call returns
+                    # a reference, the actors keep scoring while the driver moves on) and probe the
+                    # whole buffer non-blockingly: whatever landed re-enters the group barrier.
+                    if fresh and self._score_worker is not None:
+                        outcome = (self._score_worker.score_group_prm([r.sample for r in fresh])
+                                   if self._prm_ready else self._score_worker.score_group([r.sample for r in fresh]))
+                        for index, record in enumerate(fresh):
+                            record.score_ref = (outcome, index, self._prm_ready)
+                        for key in self._reap_scores(ready, blocking=False):
+                            self._maybe_group_complete(key, ready, group_counts, group_prompt,
+                                                       resolved_groups, regen_queue, regen_counts)
 
                 # (4) Consumption: train whatever the assembly rule says is ready (exact-global-batch
                 #     pulls only; the remainder stays buffered for the next batch).
                 records = self._assembly_ready(ready) if ready else None
                 if records:
-                    if self._score_worker is not None and self._group_pull is False:
-                        # A per-sample consumer scores at the PULL boundary: one batched pass over
-                        # the whole pulled batch (no group barrier ever fires when group_pull is
-                        # False), timed into score_time exactly like the group barrier's pass.
-                        pulled = [record.sample for record in records]
-                        _t = time.perf_counter()
-                        if self._prm_ready:
-                            rows, prm_refs = self._score_worker.score_group_prm(pulled)
-                            for sample, ref in zip(pulled, prm_refs):
-                                sample.prm_process = ref
-                        else:
-                            rows = self._score_worker.score_group(pulled)
-                        self.stats.score_time += time.perf_counter() - _t
-                        for sample, row in zip(pulled, rows):
-                            sample.orm_reward = row
+                    if self._score_worker is not None:
+                        # The pull-boundary TAIL wait: scores were submitted at collection time, so this
+                        # only resolves the stragglers still in flight -- the batch about to be trained
+                        # must carry its scores. Under a group pull rule the score-ready condition has
+                        # already kept unscored groups buffered, so this is a no-op guard; under the
+                        # per-sample rule it is the guarantee that the pulled prefix is fully scored.
+                        self._reap_scores(records, blocking=True)
                     _t = time.perf_counter()
                     self._train_pull(records, ready, group_counts)
                     train_now = time.perf_counter()
@@ -811,8 +723,7 @@ class StreamingDriver:
                     # that live here -- the adapter itself only decides at publish boundaries.
                     if self._resource_adapter is not None:
                         self._resource_adapter.observe(
-                            step=self.stats.optimizer_steps, driver_stats=self.stats,
-                            score_time=self.stats.score_time)
+                            step=self.stats.optimizer_steps, driver_stats=self.stats)
                     progressed = True
                 elif (stream_done and partial is None and pending is None and not handles
                       and not regen_queue):
@@ -836,16 +747,16 @@ class StreamingDriver:
             # remainder, and clear every live window so the control plane ends empty. stop (abort +
             # settle) actually ends the engine work instead of merely dropping the reference, so no
             # generation keeps burning sampler GPU past the driver's lifetime.
-            for handle, (_, policy, _) in list(handles.items()):
+            for handle, (_, policy, _, _) in list(handles.items()):
                 if self._rollout is not None:
                     self._rollout.stop(handle.submission_id)
-                self._ledger.release(policy)
+                self._release_pin(policy)
             handles.clear()
             # Buffered records were collected, so their pins are already released; only count the drop.
             self.stats.dropped_incomplete += len(ready)
             ready.clear()
             for window in self._live_windows():
-                self._ledger.clear_window(window)
+                self._clear_window(window)
             # Drop any publication request that never reached a pass boundary (drain / budget hit / error).
             with self._publish_lock:
                 self._pending_push = None
@@ -881,9 +792,68 @@ class StreamingDriver:
                 if current - record.version > 0:
                     self.stats.off_policy_consumed += 1
 
+    def _register_initial_policy(self) -> None:
+        """Pin the version-0 policy so the first admissions reference a real version, never an unpinned base.
+
+        Idempotent across re-runs of run(): the second run inherits the bookkeeping, matching the old
+        control plane's register idempotence. A no-op without version control.
+        """
+        if not self._version_control or self._registered:
+            return
+        self._registered = True
+        self._policy = RolloutPolicy(None, 0, self._initial_adapter_path())
+
+    def _acquire_policy(self) -> RolloutPolicy:
+        """Pin the current policy while one sampler request uses it (refcount++ on its adapter path)."""
+        if self._policy.adapter_path is not None:
+            pins = self._policy_pins
+            pins[self._policy.adapter_path] = pins.get(self._policy.adapter_path, 0) + 1
+        return self._policy
+
+    def _release_pin(self, policy: RolloutPolicy) -> None:
+        """Release a pin from :meth:`_acquire_policy` (a collected/cancelled trajectory's ONLY release)."""
+        if policy.adapter_path is None:
+            return
+        count = self._policy_pins.get(policy.adapter_path, 0)
+        if count <= 0:
+            raise RuntimeError(f'rollout policy was not acquired: {policy.adapter_path}')
+        if count == 1:
+            self._policy_pins.pop(policy.adapter_path)
+        else:
+            self._policy_pins[policy.adapter_path] = count - 1
+
+    def _begin_publish(self, window: PartitionAdmission) -> None:
+        """Mark the oldest live window as training (FIFO: only the oldest window may publish)."""
+        if self._training_partition_id not in (None, window.partition_id):
+            raise RuntimeError(f'already training {self._training_partition_id}')
+        if not any(w.partition_id == window.partition_id for w in self._windows):
+            raise KeyError(f'unknown live partition {window.partition_id}')
+        oldest = min(self._windows, key=lambda w: w.step)
+        if oldest.partition_id != window.partition_id:
+            raise RuntimeError(f'{window.partition_id} cannot train before {oldest.partition_id}')
+        self._training_partition_id = window.partition_id
+
+    def _finish_publish(self, window: PartitionAdmission, new_path: Optional[str]) -> None:
+        """Bump the tracked version to the just-published policy (``new_path``) and retire the window."""
+        self._policy = RolloutPolicy(None, self._policy.version + 1, new_path)
+        self._clear_window(window)
+
+    def _clear_window(self, window: PartitionAdmission) -> None:
+        """Retire a live window (teardown uses this without a version bump)."""
+        self._windows = [w for w in self._windows if w.partition_id != window.partition_id]
+        if self._training_partition_id == window.partition_id:
+            self._training_partition_id = None
+
+    def _adapter_paths_to_keep(self) -> set:
+        """Paths a live version, an in-flight pin or a buffered sample still references."""
+        paths = set(self._policy_pins)
+        if self._policy.adapter_path is not None:
+            paths.add(self._policy.adapter_path)
+        return paths
+
     def _live_windows(self) -> List[PartitionAdmission]:
-        """The live admission windows (partitions) of this context, oldest step first (FIFO publish)."""
-        return self._ledger.live_windows()
+        """The live admission windows (partitions), oldest step first (the FIFO publish order)."""
+        return list(self._windows)
 
     def _open_window(self) -> bool:
         """Open one fresh admission window if the staleness gate allows (bounded by ``max_staleness``).
@@ -891,13 +861,23 @@ class StreamingDriver:
         ``target_groups`` is the window's sizing DECLARATION (the groups one publish cycle trains,
         ``groups_per_partition``); membership is not fixed -- the ready buffer fills it in completion
         order, which is why a straggler never blocks a window and the FIFO publish order never waits on
-        a specific sample. A no-op under the null ledger (infer: no windows, admission gated only by
+        a specific sample. A no-op without version control (infer: no windows, admission gated only by
         ``buffer_depth``).
         """
-        return self._ledger.open_window()
+        if not self._version_control:
+            return True
+        oldest_step = self._windows[0].step if self._windows else self._next_step
+        if self._next_step - oldest_step > self._max_staleness:
+            return False
+        admission = PartitionAdmission(
+            partition_id=f'train_{self._next_step}', step=self._next_step,
+            target_groups=self._groups_per_partition, num_generations=self._num_generations)
+        self._next_step += 1
+        self._windows.append(admission)
+        return True
 
     def _current_version(self) -> int:
-        return self._ledger.current_version()
+        return self._policy.version
 
     def _iter_rows(self) -> Iterator[Any]:
         """Flatten ``prompt_stream``'s batches into one row stream spanning ``num_train_epochs`` passes.
@@ -964,16 +944,16 @@ class StreamingDriver:
     def _maybe_group_complete(self, group_key: str, ready: List[BufferRecord], group_counts: Dict[str, int],
                               group_prompt: Dict[str, Any], resolved_groups: set,
                               regen_queue: List[Tuple[Any, str]], regen_counts: Dict[str, int]) -> None:
-        """Run the kernel's group-barrier scoring pipeline once a group is fully collected.
+        """Run the kernel's group-barrier verdict pipeline once a group is fully collected AND scored.
 
-        Intra-group barrier (never a batch barrier): fires when ``group_key`` has ``num_generations`` records
-        in the ready buffer, at most once per group (``resolved_groups``), while every other group keeps
-        streaming and overlapping. No-op when nothing is wired (the infer / PPO / blocking path). The
-        pipeline, in order: the scoring pass (``score_worker.score_group`` -> ``sample.orm_reward``, or
-        the merged ``score_group_prm`` -> both fields at once when a PRM channel is wired), the
-        optional ``regenerate`` verdict, then -- once the group is final (accepted, or a regeneration
-        verdict past the cap accepted as-is) -- the optional ``baseline_fn`` write. Everything is timed
-        into ``stats.score_time`` HERE, not inside any hook. On a ``True`` regenerate verdict
+        Intra-group barrier (never a batch barrier): fires when ``group_key`` has ``num_generations``
+        records in the ready buffer with no score still in flight (scoring itself was submitted per
+        poll batch at collection time; the non-blocking reap loop re-enters this barrier the pass
+        after the scores land), at most once per group (``resolved_groups``), while every other
+        group keeps streaming and overlapping. No-op when nothing is wired (the infer / PPO /
+        blocking path). What runs here is the verdict half only: the optional ``regenerate``
+        verdict, then -- once the group is final (accepted, or a regeneration verdict past the cap
+        accepted as-is) -- the optional ``baseline_fn`` write. On a ``True`` regenerate verdict
         within the attempt cap the group's records are dropped from the buffer and its prompt
         re-queued for admission under the current policy version (the conservative staleness
         anchor); the group_key is reused so the retried siblings are counted and barrier-checked
@@ -988,24 +968,12 @@ class StreamingDriver:
         if group_counts.get(group_key, 0) < self._num_generations:
             return
         group_records = [record for record in ready if record.group_key == group_key]
+        # Score guard: a submitted-but-unreaped score (score_ref) means the verdict hooks would read a
+        # scoreless sample. Return and wait: the non-blocking re-probe re-enters this barrier the pass
+        # after the scores land (the reap loop above drives it), so no group is ever resolved unscored.
+        if any(record.score_ref is not None for record in group_records):
+            return
         samples = [record.sample for record in group_records]
-        # The kernel-defaulted scoring: one scoring pass per channel that writes its results onto
-        # the samples themselves, so whatever runs next (the algorithm's verdict hooks, the pull,
-        # the assembled batch) reads them off the samples. A group_pull=False consumer never reaches
-        # here (no group ever completes at num_generations > 1); under num_generations == 1 this barrier
-        # would degenerate to one score_group call PER SAMPLE -- the pull-boundary batch pass below
-        # is the one that serves it.
-        if self._score_worker is not None and self._group_pull is not False:
-            _t = time.perf_counter()
-            if self._prm_ready:
-                rows, prm_refs = self._score_worker.score_group_prm(samples)
-                for sample, ref in zip(samples, prm_refs):
-                    sample.prm_process = ref
-            else:
-                rows = self._score_worker.score_group(samples)
-            self.stats.score_time += time.perf_counter() - _t
-            for sample, row in zip(samples, rows):
-                sample.orm_reward = row
         if (self._regenerate is not None and self._regenerate(group_key, samples)
                 and regen_counts.get(group_key, 0) < self._max_group_regenerations):
             for record in group_records:
@@ -1024,6 +992,49 @@ class StreamingDriver:
                     for sample in samples:
                         sample.baseline = baseline
             resolved_groups.add(group_key)
+
+    def _reap_scores(self, records: List[BufferRecord], *, blocking: bool) -> set:
+        """Reap submitted scores onto their samples; returns the group keys whose scores landed.
+
+        ``blocking=True`` is the pull-boundary tail wait: the batch about to be trained must carry
+        its scores, so unfinished references are resolved here (this wait is the real score cost the
+        trainer pays -- ``stats.score_time`` counts exactly this). ``blocking=False`` (the every-pass
+        probe) skips records whose score is not ready yet; the next pass re-probes them, and the keys
+        returned here re-enter the group barrier from the collection phase.
+        """
+        landed: set = set()
+        if not records:
+            return landed
+        _t = time.perf_counter()
+        for record in records:
+            ref = record.score_ref
+            if ref is None:
+                continue
+            outcome, index, prm = ref
+            if not blocking and not self._score_ready(outcome):
+                continue
+            result = self._score_deref(outcome)
+            if prm:
+                matrix, process = result
+                record.sample.orm_reward = matrix[index]
+                record.sample.prm_process = process[index]
+            else:
+                record.sample.orm_reward = result[index]
+            record.score_ref = None
+            landed.add(record.group_key)
+        self.stats.score_time += time.perf_counter() - _t
+        return landed
+
+    @staticmethod
+    def _score_ready(outcome: Any) -> bool:
+        """Non-materialising readiness probe: ``LazyCollect.ready()`` when available, values pass through."""
+        ready = getattr(outcome, 'ready', None)
+        return bool(ready()) if callable(ready) else True
+
+    @staticmethod
+    def _score_deref(outcome: Any) -> Any:
+        """Resolve a ``LazyCollect`` (call it) or pass a plain value through (the local-mode shape)."""
+        return outcome() if callable(outcome) and getattr(outcome, '_is_lazy_collect', False) else outcome
 
     def _consume_batch(self, records: List[BufferRecord]) -> Optional[int]:
         """Train one pulled batch: the injected blocking ``consume`` seam, or the iterator bridge.
@@ -1129,8 +1140,7 @@ class StreamingDriver:
     def request_publish(self, push: Optional[Callable[[Any], Optional[str]]] = None) -> None:
         """Signal that the just-trained weights should be published at the next pass boundary.
 
-        ``push(window) -> Optional[str]`` is the CALLER's weight sync (the same
-        :class:`~twinkle_agentic.async_rl.weight_sync.WeightSyncStrategy.publish` signature): it aborts any
+        ``push(window) -> Optional[str]`` is the CALLER's weight sync: it aborts any
         in-flight generation and overwrites the sampler's weights (in-place, returning ``None``), or saves a
         new adapter snapshot (returning its path). Omitting ``push`` selects the default built from
         ``snapshot_model`` (:meth:`_default_publish_push`); :attr:`no_push` is the explicit no-op for a

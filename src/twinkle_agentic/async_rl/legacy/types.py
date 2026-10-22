@@ -1,8 +1,9 @@
 # Copyright (c) Model Scope Contributors. All rights reserved.
-"""Archived TQ data-plane vocabulary: partition/group/batch descriptors and the rollout-output row.
+"""Archived TQ control-plane vocabulary: the run descriptor and partition/group/batch descriptors.
 
 Moved with the TransferQueue runtime that consumes them; the live control plane keeps only
-``RLContext`` / ``RolloutPolicy`` / ``PartitionAdmission`` in ``async_rl/types.py``.
+``RolloutPolicy`` / ``PartitionAdmission`` in ``async_rl/types.py`` -- the multi-tenant run
+identity (``RLContext`` below) has no live consumer and lives here with its archived callers.
 """
 
 from __future__ import annotations
@@ -10,7 +11,36 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, TypedDict
 
-from twinkle_agentic.async_rl.types import PartitionAdmission, RLContext
+from twinkle_agentic.async_rl.types import PartitionAdmission
+
+
+@dataclass(frozen=True)
+class RLContext:
+    """What one archived TQ run trains: a single LoRA adapter, or the whole model."""
+
+    tenant_id: str
+    training_run_id: str
+    base_model_id: str
+    adapter_name: str | None = None
+    tool_profile: str = 'default'
+
+    def __post_init__(self) -> None:
+        if self.adapter_name is not None and not (isinstance(self.adapter_name, str) and self.adapter_name):
+            raise ValueError(
+                f'adapter_name must be None (full-param) or a non-empty string, got {self.adapter_name!r}')
+
+    @property
+    def policy_slot(self) -> str:
+        """The key/path component identifying the trained policy: the adapter name, or ``full_param``."""
+        return self.adapter_name or 'full_param'
+
+    @property
+    def key(self) -> str:
+        return f'{self.tenant_id}/{self.training_run_id}/{self.policy_slot}'
+
+    def partition_id(self, step: int) -> str:
+        return f'{self.key}/train_{step}'
+
 
 # Backward-compatible alias archived with its only callers (the TQ pipeline).
 LoraContext = RLContext

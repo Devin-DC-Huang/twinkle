@@ -11,7 +11,7 @@ from pydoc import locate
 from typing import Any, Sequence
 
 from twinkle.metric import MetricRecord, MetricsReporter, create_metrics_reporter
-from twinkle_agentic.async_rl.context_manager import LoraContextManager
+from twinkle_agentic.async_rl.legacy.context_manager import LoraContextManager
 from .data_plane import TQDataPlane
 from .scheduler import ContextSchedulePolicy, SchedulerConfig
 from twinkle_agentic.async_rl.legacy.types import LoraContext

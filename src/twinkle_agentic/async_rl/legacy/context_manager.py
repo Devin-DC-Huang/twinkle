@@ -6,7 +6,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import StrEnum
 
-from .types import PartitionAdmission, RLContext, RolloutPolicy
+from twinkle_agentic.async_rl.legacy.types import RLContext
+from twinkle_agentic.async_rl.types import PartitionAdmission, RolloutPolicy
 
 
 class ContextStatus(StrEnum):
@@ -45,7 +46,6 @@ class RLContextManager:
         self.max_staleness = int(max_staleness)
         self.max_steps = max_steps
         self._contexts: dict[str, _ContextState] = {}
-        self._creation_order = 0
         self._stop_requested = max_steps == 0
 
     def register_context(self,
@@ -61,8 +61,8 @@ class RLContextManager:
             raise ValueError('max_steps must be non-negative')
         self._contexts[context.key] = _ContextState(
             context=context,
-            policy=RolloutPolicy(context.key, context.adapter_name, int(policy_version), adapter_path),
-            policy_history=[RolloutPolicy(context.key, context.adapter_name, int(policy_version), adapter_path)],
+            policy=RolloutPolicy(context.adapter_name, int(policy_version), adapter_path),
+            policy_history=[RolloutPolicy(context.adapter_name, int(policy_version), adapter_path)],
             status=status,
             max_steps=max_steps,
         )
@@ -82,7 +82,7 @@ class RLContextManager:
         state = self._state(context)
         if state.status is not ContextStatus.ADDING:
             raise RuntimeError(f'{state.context.key} cannot activate from {state.status}')
-        policy = RolloutPolicy(state.context.key, state.context.adapter_name, int(policy_version), adapter_path)
+        policy = RolloutPolicy(state.context.adapter_name, int(policy_version), adapter_path)
         state.policy = policy
         state.policy_history = [policy]
         state.status = ContextStatus.ACTIVE
@@ -180,14 +180,11 @@ class RLContextManager:
         if state.next_step - oldest_unreleased_step > self.max_staleness:
             return None
         admission = PartitionAdmission(
-            context=state.context,
             partition_id=state.context.partition_id(state.next_step),
             step=state.next_step,
             target_groups=target_groups,
             num_generations=num_generations,
-            created_order=self._creation_order,
         )
-        self._creation_order += 1
         state.next_step += 1
         state.live_partitions[admission.partition_id] = admission
         return admission
@@ -218,7 +215,7 @@ class RLContextManager:
         self._finish_if_drained(state)
 
     def on_partition_training_started(self, admission: PartitionAdmission) -> None:
-        state = self._state(admission.context)
+        state = self._state(admission.context_key)
         if state.training_partition_id not in (None, admission.partition_id):
             raise RuntimeError(f'{state.context.key} already trains {state.training_partition_id}')
         self._require_live(state, admission)
@@ -228,16 +225,16 @@ class RLContextManager:
         state.training_partition_id = admission.partition_id
 
     def on_partition_trained(self, admission: PartitionAdmission, *, adapter_path: str | None) -> RolloutPolicy:
-        state = self._state(admission.context)
+        state = self._state(admission.context_key)
         self._require_live(state, admission)
-        next_policy = RolloutPolicy(state.context.key, state.context.adapter_name, state.policy.version + 1,
+        next_policy = RolloutPolicy(state.context.adapter_name, state.policy.version + 1,
                                     adapter_path)
         state.policy = next_policy
         state.policy_history.append(next_policy)
         return next_policy
 
     def on_partition_cleared(self, admission: PartitionAdmission) -> None:
-        state = self._state(admission.context)
+        state = self._state(admission.context_key)
         self._require_live(state, admission)
         state.live_partitions.pop(admission.partition_id)
         if state.training_partition_id == admission.partition_id:

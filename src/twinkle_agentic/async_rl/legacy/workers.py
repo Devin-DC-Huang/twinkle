@@ -12,11 +12,12 @@ from collections.abc import Callable, Iterable, Sequence
 from typing import Any
 
 from twinkle.metric import MetricBuffer, MetricRecord
-from twinkle_agentic.async_rl.context_manager import ContextStatus, RLContextManager
+from twinkle_agentic.async_rl.legacy.context_manager import ContextStatus, RLContextManager
 from .data_plane import TQDataPlane
 from .metrics import advantage_signal_metrics, training_policy_metrics
 from .scheduler import ContextScheduler, ScheduleCandidate, SchedulerConfig
-from twinkle_agentic.async_rl.types import PartitionAdmission, RLContext
+from twinkle_agentic.async_rl.legacy.types import RLContext
+from twinkle_agentic.async_rl.types import PartitionAdmission
 
 
 class _Worker:

@@ -129,8 +129,8 @@ class TurnLedger:
     """Token ids, labels and logprobs for one episode, and nothing else.
 
     Not thread-safe and not meant to be: one ledger belongs to one episode, and
-    an episode runs in one thread. See :class:`LedgerBook` for the many-episode
-    case, which is a lock around this and not a change to it.
+    an episode runs in one thread. A multi-episode caller keeps one ledger per
+    episode, which is bookkeeping around this class, not a change to it.
 
     Usage is one :meth:`open`, then :meth:`record` after each generation and
     :meth:`observe` for each thing appended that the model did not write, then
@@ -589,98 +589,5 @@ class MessageLedger:
         return
 
 
-class LedgerBook:
-    """Ledgers filed under a key, for episodes whose turns arrive unannounced.
 
-    A ledger belongs to an episode, but an externally driven episode has no loop
-    here to hold one: rounds arrive one HTTP request at a time, interleaved with
-    every other episode in the batch, and the only thing tying a request to an
-    episode is the key it came in under. This keeps the accounts and does the
-    filing.
-
-    A key can end up with more than one ledger, and that is the interesting part.
-    An agent is free to compact or rewrite its own history -- summarise the first
-    twenty turns into a paragraph, drop a file it no longer needs -- and when it
-    does, the next prompt is not an extension of what is banked. There is no
-    append that expresses it and no honest way to splice the two. So the ledger in
-    hand is left exactly as it is, complete up to the last round that did fit, and
-    a fresh one takes over from the rewritten history. One episode becomes two
-    trajectories, which is what actually happened.
-
-    Thread-safe, because the requests are: one lock per key so that concurrent
-    episodes do not wait on each other, and the key registry guarded separately
-    so two first-requests cannot each create an account.
-    """
-
-    def __init__(self, template: Template, *, max_tokens: Optional[int] = None) -> None:
-        """
-        Args:
-            template: one template for every account here, for the reason
-                :class:`TurnLedger` gives: two would disagree about special tokens.
-            max_tokens: passed to each ledger as its length limit.
-        """
-        self.template = template
-        self.max_tokens = max_tokens
-        self._filed: Dict[str, List[TurnLedger]] = {}
-        self._locks: Dict[str, threading.Lock] = {}
-        self._guard = threading.Lock()
-
-    def __contains__(self, key: str) -> bool:
-        with self._guard:
-            return key in self._filed
-
-    def bank(self,
-             key: str,
-             prompt_token_ids: Sequence[int],
-             seq: SampledSequence,
-             *,
-             messages: Optional[Sequence[Dict[str, Any]]] = None) -> Optional[TurnLedger]:
-        """Record one round against ``key``, opening or splitting as needed.
-
-        A key seen for the first time gets an empty account, and the whole prompt
-        the agent sent -- its system prompt, its tool descriptions, the task -- is
-        appended masked. That is correct rather than convenient: none of it is the
-        policy's writing, and we did not compose it.
-
-        Returns the ledger the round landed in, or None when it landed nowhere:
-        the sequence no longer fits the template's length limit. The caller should
-        let the agent carry on -- it has its own reasons to stop, and killing its
-        request over our bookkeeping teaches it nothing -- while knowing that what
-        follows is not being recorded.
-        """
-        ledgers, lock = self._file(key)
-        with lock:
-            current = ledgers[-1]
-            if current.graft(prompt_token_ids, seq, messages=messages):
-                return current
-            fresh = self._ledger(key, len(ledgers))
-            if not fresh.graft(prompt_token_ids, seq, messages=messages):
-                return None
-            ledgers.append(fresh)
-            return fresh
-
-    def close(self, key: str) -> List[TurnLedger]:
-        """Take the accounts for ``key`` away, in the order they were opened.
-
-        Removed, not just read: the key is done, and a request arriving under it
-        afterwards is a new episode that reused a name, not a continuation of one
-        already handed to the trainer. Empty list for a key that never banked
-        anything -- an agent that failed to make a single call.
-        """
-        with self._guard:
-            self._locks.pop(key, None)
-            return self._filed.pop(key, [])
-
-    def _file(self, key: str) -> tuple:
-        with self._guard:
-            if key not in self._filed:
-                self._filed[key] = [self._ledger(key, 0)]
-                self._locks[key] = threading.Lock()
-            return self._filed[key], self._locks[key]
-
-    def _ledger(self, key: str, part: int) -> TurnLedger:
-        label = key if part == 0 else f'{key}#{part}'
-        return TurnLedger(self.template, label=label, max_tokens=self.max_tokens)
-
-
-__all__ = ['LedgerBook', 'MessageLedger', 'TurnLedger', 'turn_token_spans']
+__all__ = ['MessageLedger', 'TurnLedger', 'turn_token_spans']

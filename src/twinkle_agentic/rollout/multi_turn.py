@@ -370,9 +370,8 @@ class MultiTurnRollout(Rollout):
     of them absent is a single-turn sampling pass, and that is a supported way to
     use this rather than a degenerate one.
 
-    This drives the conversation itself. An agent that ships as its own program
-    cannot be driven this way and belongs in
-    :class:`~.external.ExternalRollout`.
+    This drives the conversation itself; an agent program that drives its own
+    turns against an endpoint is a different rollout shape, not this one.
 
     A supplied sampler must declare ``sample`` with ``enable_continous_work``.
     Without it, ``slice_dp`` spreads each single-request call over every worker
@@ -485,9 +484,7 @@ class MultiTurnRollout(Rollout):
         # that shapes messages each turn. The ledger still owns every token id;
         # the harness only reshapes the message view and this turn's tool
         # framing, so a framework agent (ms-agent, ...) can drive this loop
-        # locally without this class knowing which framework it is. This is the
-        # forward-tunnel alternative to ``ExternalRollout``'s reverse endpoint;
-        # both stay selectable and general.
+        # locally without this class knowing which framework it is.
         self.harness = harness
         # A LoRA directory on disk, forwarded to every sample call. Training syncs
         # its adapter into the sampler directly, but evaluating a saved one has no

@@ -10,7 +10,8 @@ from twinkle.data_format import (REQUIRED_MODEL_INPUT_FIELDS, ROLLOUT_TRAIN_FIEL
 from .native_tq import (AsyncTQClient, append_fields, batch_size_for_groups, clear_partition, fetch_ready_batch,
                         metadata_size, preallocate_partition, set_sample_tags, split_batch_meta)
 from twinkle_agentic.async_rl.legacy.types import (ClaimedBatch, PreparedPartition, PromptGroup, RolloutOutput)
-from twinkle_agentic.async_rl.types import PartitionAdmission, RLContext
+from twinkle_agentic.async_rl.legacy.types import RLContext
+from twinkle_agentic.async_rl.types import PartitionAdmission
 
 _REQUIRED_ROLLOUT_FIELDS = frozenset((*REQUIRED_MODEL_INPUT_FIELDS, 'logprobs', 'rewards'))
 

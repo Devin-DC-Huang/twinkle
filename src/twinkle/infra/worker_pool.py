@@ -25,7 +25,6 @@ class WorkerEntry:
     state: str = 'WARMING'
     inflight: int = 0
     dispatching: int = 0
-    service_time: float = 0.0
 
 
 class WorkerPool:
@@ -78,7 +77,6 @@ class WorkerPool:
         self._creating_slots = set()
         self._round_robin = 0
         self._admission_closed = False
-        self.service_time = 0.0
         for index, actor in enumerate(self._actors):
             worker_id = get_worker_id(actor)
             self._sampler_workers[worker_id] = WorkerEntry(

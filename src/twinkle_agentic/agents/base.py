@@ -5,7 +5,7 @@ An agent here is a command line, not a loop we call. What it takes to add suppor
 for one is a small, testable object: what to install, what to invoke, and which
 environment variable that particular program reads its endpoint out of. Nothing
 in this package imports a sampler, sees a trajectory, or knows a token from a
-tensor -- that is :mod:`twinkle_agentic.rollout.external`'s job, and keeping the
+tensor -- that is the rollout side's job, and keeping the
 two apart is what lets a new agent be added without reading any of it.
 """
 from abc import ABC, abstractmethod
@@ -14,10 +14,10 @@ from abc import ABC, abstractmethod
 class CliAgent(ABC):
     """How to run one agent program on one task. Nothing about training.
 
-    Subclassing is a convenience, not a requirement:
-    :class:`~twinkle_agentic.rollout.external.ExternalRollout` asks for
-    ``command``, so a plain function of the same signature is an agent too, and
-    one written outside this package is no worse off than one written here.
+    Subclassing is a convenience, not a requirement: the rollout side that
+    invokes an agent asks for ``command``, so a plain function of the same
+    signature is an agent too, and one written outside this package is no worse
+    off than one written here.
 
     An agent that does not speak the OpenAI protocol needs one more thing -- a
     translation in front of the endpoint -- but not a different rollout.

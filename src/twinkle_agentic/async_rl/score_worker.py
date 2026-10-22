@@ -106,7 +106,6 @@ class ScoreWorker:
         self.prm_scorers = list(prm_scorers)
         self.prm_step_scorer = prm_step_scorer
         self._prm_weights = list(prm_weights) if prm_weights is not None else None
-        self._global_step = 0
 
     def _one_reward(self, scorer: Any, rows: List[dict]) -> List[float]:
         """One scorer's batch over trajectory rows -- the single call shape every kind shares.
@@ -120,7 +119,7 @@ class ScoreWorker:
         values = score(rows) if callable(score) else scorer(rows)
         return [None if value is None or value != value else float(value) for value in values]
 
-    @remote_function(dispatch='all', collect='first', lazy_collect=False)
+    @remote_function(dispatch='all', collect='first', lazy_collect=True)
     def score_group(self, samples: List[Any]) -> List[List[float]]:
         """Score one group with every ORM scorer -> the ``[N][n_scorers]`` sample-major matrix.
 
@@ -138,7 +137,7 @@ class ScoreWorker:
         return [[None if value is None or value != value else float(value) for value in column]
                 for column in zip(*matrix)] if matrix else [[] for _ in samples]
 
-    @remote_function(dispatch='all', collect='first', lazy_collect=False)
+    @remote_function(dispatch='all', collect='first', lazy_collect=True)
     def score_group_prm(self, samples: List[Any]) -> Tuple[List[List[Optional[float]]], List[Any]]:
         """Both channels for one group in ONE pass: ``(the ORM matrix, per-sample process rewards)``.
 
@@ -204,8 +203,3 @@ class ScoreWorker:
                     'completion': resolved.decoded,
                     'rewards': per_func,
                 }, ensure_ascii=False) + '\n')
-
-    @remote_function(dispatch='all', collect='none', lazy_collect=False)
-    def set_global_step(self, step: int) -> None:
-        """Track the driver's optimizer step for step-indexed logs."""
-        self._global_step = int(step)
