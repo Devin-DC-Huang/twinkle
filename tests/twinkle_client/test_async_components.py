@@ -247,8 +247,9 @@ def test_old_remove_completion_does_not_clear_new_same_name_binding():
                 self.created += 1
                 return _Response(_completed({'training_id': f'training-{self.created}', 'adapter_name': 'same'}))
             if url.endswith('/remove_adapter'):
-                entered.set()
-                assert resume.wait(3)
+                if not entered.is_set():
+                    entered.set()
+                    assert resume.wait(3)
             return _Response(_completed(None))
     transport = Transport()
     model = MultiLoraTransformersModel('small', transport=transport)
@@ -261,6 +262,7 @@ def test_old_remove_completion_does_not_clear_new_same_name_binding():
     releasing.start()
     try:
         assert entered.wait(3)
+        model.remove_adapter('same')
         model.add_adapter_to_model('same', None)
     finally:
         resume.set()
@@ -270,3 +272,52 @@ def test_old_remove_completion_does_not_clear_new_same_name_binding():
     assert transport.operations[-1][1]['training_id'] == 'training-2'
     removal = next(body for endpoint, body in transport.operations if endpoint == 'remove_adapter')
     assert removal['training_id'] == 'training-1'
+
+
+def test_duplicate_adapter_is_rejected_before_rpc_and_release_allows_recreate(monkeypatch):
+    import pytest
+    from twinkle_client.model.multi_lora_transformers import MultiLoraTransformersModel
+    calls = []
+    _patch_transport(monkeypatch, calls, lambda url: _completed(None))
+    first = MultiLoraTransformersModel('base')
+    first.add_adapter_to_model('same', None)
+    count = len(calls)
+    with pytest.raises(RuntimeError, match='already'):
+        first.add_adapter_to_model('same', None)
+    assert len(calls) == count
+    second = MultiLoraTransformersModel('base')
+    second.add_adapter_to_model('same', None)
+    first.remove_adapter('same')
+    first.add_adapter_to_model('same', None)
+
+
+def test_concurrent_duplicate_and_failed_creation_leave_reusable_name(monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    import pytest
+    from twinkle_client.model.multi_lora_transformers import MultiLoraTransformersModel
+    calls = []
+    _patch_transport(monkeypatch, calls, lambda url: _completed(None))
+    model = MultiLoraTransformersModel('base')
+    original = model._submit
+    entered, resume = threading.Event(), threading.Event()
+
+    def fail(*args, **kwargs):
+        entered.set()
+        assert resume.wait(3)
+        raise RuntimeError('create failed')
+
+    monkeypatch.setattr(model, '_submit', fail)
+    with ThreadPoolExecutor(1) as executor:
+        future = executor.submit(model.add_adapter_to_model, 'same', None)
+        try:
+            assert entered.wait(3)
+            with pytest.raises(RuntimeError, match='already being created'):
+                model.add_adapter_to_model('same', None)
+        finally:
+            resume.set()
+        with pytest.raises(RuntimeError, match='create failed'):
+            future.result()
+    monkeypatch.setattr(model, '_submit', original)
+    model.add_adapter_to_model('same', None)
+    assert model._training_ids['same'] == 'training-test'

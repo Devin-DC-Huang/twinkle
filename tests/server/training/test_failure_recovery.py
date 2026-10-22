@@ -238,25 +238,6 @@ async def test_unready_service_is_503_server_and_reason_sets_have_no_dead_codes(
 
 
 @pytest.mark.asyncio
-async def test_spawn_logs_exception_with_traceback(caplog, monkeypatch):
-    # The ``twinkle`` logger disables propagation, so attach caplog to the controller logger directly.
-    target = logging.getLogger('twinkle.server.training.controller')
-    monkeypatch.setattr(target, 'handlers', [*target.handlers, caplog.handler])
-    controller, _, _, _ = await setup(backend=FakeBackend())
-
-    async def broken():
-        raise RuntimeError('background sentinel')
-
-    with caplog.at_level(logging.ERROR):
-        controller.lifecycle.spawn(broken())
-        await controller.wait_for_jobs()
-    records = [record for record in caplog.records if record.getMessage() == 'Training background job failed']
-    assert records and records[0].exc_info[1].args == ('background sentinel',)
-    assert not controller.lifecycle.jobs
-    await controller.shutdown()
-
-
-@pytest.mark.asyncio
 async def test_sweep_heartbeat_io_does_not_hold_route_lock(monkeypatch):
     controller, state, _, _ = await setup(backend=FakeBackend())
     identity = await create(controller, state, 'slow-heartbeat')

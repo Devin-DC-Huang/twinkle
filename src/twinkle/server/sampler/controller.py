@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import math
 import time
 import uuid
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 
 from twinkle.server.config.application_spec import SamplerArgs
@@ -139,6 +141,97 @@ class SamplerController:
         await self.driver.wait_operation(instance, ticket)
         return reply
 
+    @staticmethod
+    def _action_key(action):
+        if 'base_path' in action:
+            return ('base_path', )
+        endpoint = action['endpoint']
+        if endpoint == 'twinkle/set_template':
+            return (endpoint, )
+        if endpoint == 'twinkle/add_adapter_to_sampler':
+            # Adapter names are scoped by the caller's token in the handler.
+            headers = {key.lower(): value for key, value in action['headers']}
+            owner = headers.get(b'twinkle-authorization') or headers.get(b'authorization')
+            return endpoint, owner, json.loads(action['body'])['adapter_name']
+        return None
+
+    def _remember(self, action):
+        """Compact overwritten state only within the segment after the last opaque patch."""
+        key = self._action_key(action)
+        if key is not None:
+            for index in range(len(self._actions) - 1, -1, -1):
+                previous = self._actions[index]
+                if previous.get('endpoint') == 'twinkle/apply_patch':
+                    break
+                if self._action_key(previous) == key:
+                    del self._actions[index]
+        self._actions.append(deepcopy(action))
+
+    async def _release(self, instance, ticket):
+        async with self._lock:
+            # Unknown completion retains ownership until shutdown is confirmed.
+            if instance.state not in ('DRAINING', 'QUARANTINED'):
+                instance.requests.discard(ticket)
+                instance.last_finished = self.clock()
+
+    async def _fence(self, replicas):
+        async with self._lock:
+            for replica in replicas:
+                if replica.state != 'STOPPED':
+                    replica.state = 'DRAINING'
+        await asyncio.gather(*(self._close(replica) for replica in replicas))
+
+    async def _mutate(self, payload=None, full_path=None):
+        # Lock order: config -> state. Never wait for startup while holding config,
+        # because startup also replays the committed configuration under that lock.
+        seed, seed_ticket = await self._select()
+        replicas = []
+        ticket = uuid.uuid4().hex
+        try:
+            async with self._config_lock:
+                async with self._lock:
+                    if self._stopping:
+                        raise ResourceExhaustedError('Sampling pool is stopping')
+                    replicas = self._ready_instances()
+                    if not replicas:
+                        raise ResourceExhaustedError('No ready sampler for control update')
+                    for replica in replicas:
+                        replica.requests.add(ticket)
+
+                async def broadcast():
+                    response = None
+                    for replica in replicas:
+                        if full_path is not None:
+                            await self.driver.load_weights(replica, full_path)
+                        else:
+                            response = await self._invoke_finished(replica, payload)
+                            if response['status'] >= 400:
+                                return response
+                    return response
+
+                try:
+                    response = await asyncio.wait_for(broadcast(), self.args.queue_config.effective_execution_timeout)
+                    if response is not None and response['status'] >= 400:
+                        await self._fence(replicas)
+                        return response
+                    # A health probe or shutdown can invalidate a participant while
+                    # its RPC is pending. Such an ACK must not commit pool state.
+                    if any(replica.state != 'READY' for replica in replicas):
+                        raise ResourceExhaustedError('Sampler changed state during control update')
+                    if full_path is not None:
+                        self._base_path = full_path
+                        self._remember({'base_path': full_path})
+                    elif payload['endpoint'] != 'twinkle/unload_adapter_paths':
+                        self._remember(payload)
+                    return response
+                except BaseException:
+                    await self._fence(replicas)
+                    raise
+        finally:
+            for replica in replicas:
+                await self._release(replica, ticket)
+            await self._release(seed, seed_ticket)
+
     async def request(self, payload, stream_queue=None, full_path=None):
         await self.initialize()
         endpoint = payload['endpoint']
@@ -152,43 +245,10 @@ class SamplerController:
             ticket = None
             try:
                 if control:
-                    if not self._ready_instances():
-                        instance, ticket = await self._select()
-                    async with self._config_lock:
-                        replies = []
-                        replicas = self._ready_instances()
-                        try:
-                            for replica in replicas:
-                                response = await self._invoke_finished(replica, payload)
-                                if response['status'] >= 400:
-                                    await asyncio.gather(*(self._close(peer) for peer in replicas))
-                                    reply_ready.set_result(response)
-                                    return
-                                replies.append(response)
-                        except BaseException:
-                            # Even an ambiguous ACK can leave this replica mutated.
-                            # Fence every participant before allowing further routing.
-                            for peer in replicas:
-                                peer.state = 'DRAINING'
-                            await asyncio.gather(*(self._close(peer) for peer in replicas))
-                            raise
-                        if not replies:
-                            raise ResourceExhaustedError('No ready sampler for control update')
-                        if endpoint != 'twinkle/unload_adapter_paths':
-                            self._actions.append(payload)
-                        reply_ready.set_result(replies[0])
+                    reply_ready.set_result(await self._mutate(payload=payload))
                     return
                 if full_path is not None and full_path != self._base_path:
-                    async with self._config_lock:
-                        try:
-                            for replica in self._ready_instances():
-                                await self.driver.load_weights(replica, full_path)
-                            self._base_path = full_path
-                            self._actions.append({'base_path': full_path})
-                        except Exception:
-                            for replica in self._ready_instances():
-                                await self._close(replica)
-                            raise
+                    await self._mutate(full_path=full_path)
                 instance, ticket = await self._select()
                 response = await self.driver.invoke(instance, ticket, payload, stream_queue)
                 if not reply_ready.done():
@@ -204,13 +264,14 @@ class SamplerController:
                 raise
             finally:
                 if instance is not None and ticket is not None:
-                    if instance.state != 'QUARANTINED':
-                        instance.requests.discard(ticket)
-                        instance.last_finished = self.clock()
+                    await self._release(instance, ticket)
 
         async def guarded():
             try:
-                await self._guard.run(operation, exclusive=control or full_path is not None)
+                await self._guard.run(
+                    operation,
+                    exclusive=control or full_path is not None,
+                    queue_timeout=self.args.queue_config.queue_timeout)
             except BaseException as error:
                 if not reply_ready.done():
                     reply_ready.set_exception(error)

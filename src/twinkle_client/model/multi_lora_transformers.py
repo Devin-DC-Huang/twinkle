@@ -148,6 +148,8 @@ class MultiLoraTransformersModel:
         with self._training_lock:
             if adapter_name in self._creating:
                 raise RuntimeError('A training with this adapter_name is already being created on this object.')
+            if adapter_name in self._training_ids:
+                raise RuntimeError('A training with this adapter_name already exists on this object; release it first.')
             self._creating.add(adapter_name)
         try:
             result = self._submit(
