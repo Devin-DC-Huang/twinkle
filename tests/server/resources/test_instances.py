@@ -80,5 +80,3 @@ async def test_shared_health_rule_tolerates_transient_probe_timeout():
     assert not lifecycle.unreachable_since
     assert await lifecycle.health('instance', unreachable) is None
     assert await lifecycle.health('instance', failed) is False
-
-

@@ -126,27 +126,31 @@ async def exercise(model, directory, namespace, evidence):
         await target.lifecycle.join()
 
     def save():
+        snapshots = evidence.setdefault('device_snapshots', [])
+        name = f'devices-stage-{len(snapshots):02d}.txt'
+        (directory / name).write_text(subprocess.check_output(['ppu-smi'], text=True))
+        snapshots.append(name)
         (directory / 'results.json').write_text(json.dumps(evidence, indent=2))
 
     try:
         await pool.initialize()
         evidence['sizes'] = [len(pool._ready_instances())]
-        from twinkle.patch import Patch
-        from twinkle.protocol.serialize import serialize_object
-
-        class VerifyImportOrigin(Patch):
-            def __call__(self, module, expected_root):
-                import twinkle
-                from pathlib import Path
-                assert Path(twinkle.__file__).resolve().is_relative_to(expected_root), twinkle.__file__
-                return module
-
         source_root = str(Path(__file__).resolve().parents[4])
-        origin_reply = await pool.request(payload('twinkle/apply_patch', {
-            'patch_cls': serialize_object(VerifyImportOrigin), 'adapter_name': '',
-            'init_kwargs': {'expected_root': source_root}}))
-        assert origin_reply['status'] == 200, origin_reply
-        evidence['worker_import_origin_verified'] = source_root
+
+        async def verify_worker_origins():
+            workers = [row for row in list_named_actors(all_namespaces=True)
+                       if row['namespace'] == namespace and row['name'].startswith('sampler-')
+                       and not row['name'].endswith('-registry')]
+            assert len(workers) == len(pool._ready_instances())
+            origins = {}
+            for row in workers:
+                worker = ray.get_actor(row['name'], namespace=namespace)
+                origin = await worker.__ray_call__.remote(lambda _: __import__('twinkle').__file__)
+                assert Path(origin).resolve().is_relative_to(source_root), origin
+                origins[row['name']] = origin
+            evidence['worker_import_origins'] = origins
+
+        await verify_worker_origins()
         save()
         await asyncio.gather(*(sample(max_tokens=256) for _ in range(8)))
         await settled()
@@ -154,8 +158,10 @@ async def exercise(model, directory, namespace, evidence):
         devices = [device for instance in pool._ready_instances() for device in instance.devices]
         assert len(devices) == len(set(devices)) == 4
         calls.clear()
-        await asyncio.gather(*(sample(max_tokens=128) for _ in range(8)))
+        samples = await asyncio.gather(*(sample(max_tokens=128) for _ in range(8)))
         await settled()
+        await verify_worker_origins()
+        evidence['sample_result'] = samples[0]
         assert {row['instance'] for row in calls} == {i.identity for i in pool._ready_instances()}
         for instance in pool._ready_instances():
             assert not (await driver.health(instance))['unhealthy']
@@ -232,6 +238,7 @@ async def exercise(model, directory, namespace, evidence):
         assert before['tokens'] == after['tokens']
         np.testing.assert_allclose([x[0][1] for x in before['logprobs']],
                                    [x[0][1] for x in after['logprobs']], rtol=0, atol=1e-5)
+        evidence['lora_results'] = {'before_eviction': before, 'after_reload': after}
         evidence['lora_eviction_reload'] = True
         save()
 
