@@ -345,3 +345,71 @@ async def test_capacity_unregister_does_not_retire_managed_model():
     assert await state.get_model_metadata(identity) is None
     assert await state._backend.get('token_count::owner') == 0
     await controller.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mode', ['lora', 'full'])
+@pytest.mark.parametrize('failure_stage', ['stopped', 'quarantined', 'persist_draining'])
+async def test_late_release_ack_cannot_retire_a_failed_instance_user(mode, failure_stage, monkeypatch):
+    from twinkle.server.config.training import TrainingConfig
+    from twinkle.server.training.catalog import TrainingCatalog
+
+    controller, state, runtime, _ = await setup(backend=FakeBackend())
+    config = controller.config.model_dump()
+    config['models'][0]['modes'][mode].update(min_replicas=1, max_replicas=1)
+    controller.config = TrainingConfig.model_validate(config)
+    controller.catalog = TrainingCatalog(controller.config)
+    await controller.sweep()
+    await controller.wait_for_jobs()
+    identity = await create(controller, state, 'late-release', mode=mode)
+    training = controller.trainings[identity]
+    instance = controller.instances[training.instance_id]
+    entered, resume = asyncio.Event(), asyncio.Event()
+    release = runtime.release_training
+
+    async def delayed_ack(target, user):
+        await release(target, user)
+        entered.set()
+        await resume.wait()
+
+    runtime.release_training = delayed_ack
+    training.state, training.terminal_reason = 'CLOSING', 'released'
+    await controller.store.save_training(training)
+    cleanup = asyncio.create_task(controller._cleanup_user(training))
+    save_instance = controller.store.save_instance
+
+    async def unavailable(record):
+        if record.state == 'DRAINING':
+            raise ConnectionError('draining write unavailable')
+        await save_instance(record)
+
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        runtime.fail_shutdown = failure_stage == 'quarantined'
+        failure = FutureFailureRecord(reason_code='orphaned_replica', attribution='server', message='Worker died')
+        if failure_stage == 'persist_draining':
+            monkeypatch.setattr(controller.store, 'save_instance', unavailable)
+            with pytest.raises(ConnectionError):
+                await controller.fail_instance(instance.instance_id, failure)
+        else:
+            await controller.fail_instance(instance.instance_id, failure)
+        state_before_ack = instance.state
+        resume.set()
+        await asyncio.wait_for(cleanup, 1)
+        assert instance.state == state_before_ack
+        if failure_stage == 'stopped':
+            assert training.state == 'FAILED'
+            assert not runtime.allocations
+        else:
+            assert training.state == 'CLOSING'
+            assert identity in instance.training_ids
+            assert await state.get_model_metadata(identity) is not None
+            assert await state._backend.get('token_count::owner') == 1
+        with pytest.raises(ResourceNotFoundError):
+            await controller.route(identity, 'owner')
+    finally:
+        resume.set()
+        await asyncio.gather(cleanup, return_exceptions=True)
+        runtime.fail_shutdown = False
+        monkeypatch.setattr(controller.store, 'save_instance', save_instance)
+        await controller.shutdown()

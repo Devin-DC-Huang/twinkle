@@ -542,6 +542,11 @@ class TrainingController:
                             diagnostic=traceback.format_exc()))
                 return
             async with self._lock:
+                # A health failure may have taken ownership while release/reset
+                # was in flight. Its late ACK cannot retire quota or revive READY.
+                if (instance.instance_id in self._failed_instances or instance.state not in ('READY', 'RESETTING')
+                        or training.state != 'CLOSING'):
+                    return
                 terminal = training.model_copy(
                     deep=True,
                     update={
