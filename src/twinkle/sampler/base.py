@@ -14,7 +14,7 @@ from twinkle.data_format import (InputFeature, PoolingParams, PoolingResponse, S
 from twinkle.patch import Patch
 from twinkle.sampler import generation
 from twinkle.template import Template
-from twinkle.utils import construct_class
+from twinkle.template.utils import construct_template
 
 
 def _dispatch_request(worker_count: int, worker_index: int, args: tuple, kwargs: dict, **_):
@@ -172,10 +172,9 @@ class Sampler(ABC):
 
     @remote_function(dispatch='all', collect='first', lazy_collect=False, exclusive=True, replay=True)
     def set_template(self, template_cls: Union[Template, Type[Template], str], **kwargs):
-        if 'model_id' not in kwargs and hasattr(self, 'model_id'):
+        if 'template_spec' not in kwargs and 'model_id' not in kwargs and hasattr(self, 'model_id'):
             kwargs['model_id'] = self.model_id
-        template = construct_class(template_cls, Template, twinkle.template, **kwargs)
-        self.template = template
+        self.template = construct_template(template_cls, **kwargs)
 
     @remote_function(dispatch='all', collect='first', lazy_collect=False, exclusive=True, replay=True)
     def add_adapter_to_sampler(self, adapter_name: str, config: PeftConfig) -> None:

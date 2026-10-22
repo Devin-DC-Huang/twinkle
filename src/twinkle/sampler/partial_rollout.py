@@ -223,6 +223,7 @@ class PartialRolloutMixin:
                     logprobs=logprobs,
                     decoded=self.template.decode(tokens),
                     new_input_feature=final_sequence.new_input_feature,
+                    new_state=final_sequence.new_state,
                     routed_experts=final_sequence.routed_experts,
                 )
             ],
@@ -233,7 +234,8 @@ class PartialRolloutMixin:
         original_input: dict[str, Any],
         sampling_params: SamplingParams,
         *,
-        run_attempt: Callable[[Any, SamplingParams, int], Awaitable[tuple[SampleResponse, Any]]],
+        run_attempt: Callable[[Any, Any, SamplingParams, int], Awaitable[tuple[SampleResponse, Any]]],
+        original_state: Any = None,
         allow_partial_rollout: bool = False,
         max_retries: int = 0,
         retry_delay_s: float = 0.0,
@@ -250,6 +252,7 @@ class PartialRolloutMixin:
         stop ends the loop, merging any accumulated segments first.
         """
         current_input = original_input
+        current_state = original_state
         partial_responses: list[SampleResponse] = []
         partial_states: list[Any] = []
         generated_tokens = 0
@@ -270,7 +273,7 @@ class PartialRolloutMixin:
                 attempts += 1
                 handover_abort = False
                 try:
-                    response, attempt_state = await run_attempt(current_input, attempt_params, attempt)
+                    response, attempt_state = await run_attempt(current_input, current_state, attempt_params, attempt)
                     sequence = response.sequences[0]
                 except Exception as exc:
                     last_error = exc
@@ -294,12 +297,14 @@ class PartialRolloutMixin:
                         partial_states.append(attempt_state)
                         generated_tokens += len(sequence.tokens)
                         current_input = sequence.new_input_feature
+                        current_state = sequence.new_state or current_state
                         if sampling_params.max_tokens is not None and generated_tokens >= sampling_params.max_tokens:
                             return PartialRolloutOutcome(
                                 self._merge_partial_responses(partial_responses, stop_reason='length'),
                                 tuple(partial_states), attempts, was_aborted, resumed_partial_output)
                     elif not allow_partial_rollout:
                         current_input = original_input
+                        current_state = original_state
 
                 # Resource handover is not a generation failure and does not consume the ordinary retry budget.
                 if handover_abort:
