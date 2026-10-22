@@ -124,6 +124,27 @@ class MultiLora:
         else:
             self.module.set_adapter('lora_0')
 
+    @contextmanager
+    def trainable_slots(self):
+        """Register every preallocated slot with distributed gradient reducers."""
+        modules = self.module if isinstance(self.module, list) else [self.module]
+        masks = [{
+            name: param.requires_grad
+            for name, param in module.named_parameters() if 'lora_' in name
+        } for module in modules]
+        try:
+            for module, mask in zip(modules, masks):
+                for name, param in module.named_parameters():
+                    if name in mask:
+                        param.requires_grad_(True)
+            yield
+        finally:
+            # FSDP may replace Parameters while wrapping; restore by name.
+            for module, mask in zip(modules, masks):
+                for name, param in module.named_parameters():
+                    if name in mask:
+                        param.requires_grad_(mask[name])
+
     def activate_adapter(self, tenant_adapter_name: str, call_enable=False):
         if not self.has_lora(tenant_adapter_name):
             raise ValueError(f'Adapter {tenant_adapter_name} does not exist')
