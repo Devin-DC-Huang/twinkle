@@ -77,8 +77,6 @@ instance/
 # Sphinx documentation
 docs/_build/
 
-# Internal design notes and developer tools are local-only.
-
 # PyBuilder
 target/
 
