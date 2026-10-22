@@ -277,8 +277,8 @@ class TrainingController:
                 'pending',
                 training_id,
                 epoch=self.epoch,
-                deadline=time.time() + 2 * self.config.startup_timeout_s)
-            await self.store.own_future(request_id, request.token)
+                deadline=time.time() + 2 * self.config.startup_timeout_s,
+                owner_token=request.token)
             await self.store.save_create(identity, fingerprint, request_id, request.session_id)
             training = None
             try:
@@ -434,7 +434,6 @@ class TrainingController:
             if request_id not in training.pending_operation_ids:
                 training.pending_operation_ids[request_id] = {'accepted_at': self.clock(), 'renew': renew}
                 await self.store.save_training(training)
-                await self.store.own_future(request_id, token)
             return {'instance_id': instance.instance_id, 'epoch': self.epoch}
 
     async def finish_operation(self,

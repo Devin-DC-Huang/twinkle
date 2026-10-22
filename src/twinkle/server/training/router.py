@@ -165,8 +165,7 @@ class TrainingRouter(TaskQueueMixin, LazyCleanupMixin):
                     token=body.hub_token or token,
                     private=True)
 
-            ref = await self.schedule_background_task(upload, task_type=endpoint)
-            await self.store.own_future(ref['request_id'], token)
+            ref = await self.schedule_background_task(upload, task_type=endpoint, token=token)
             return envelope_from_record(ref['request_id'], await self.state.get_future(ref['request_id']))
         if not body.training_id:
             raise ProtocolMismatchError('Upgrade Twinkle SDK: training_id is required')
@@ -221,8 +220,7 @@ class TrainingRouter(TaskQueueMixin, LazyCleanupMixin):
             await self.controller.release.remote(training_id, token, session)
             return {'model_id': training_id} if client_type == 'tinker' else None
 
-        ref = await self.schedule_background_task(release, task_type='release_training')
-        await self.store.own_future(ref['request_id'], token)
+        ref = await self.schedule_background_task(release, task_type='release_training', token=token)
         if client_type == 'tinker':
             return {'request_id': ref['request_id']}
         return envelope_from_record(ref['request_id'], await self.state.get_future(ref['request_id']))

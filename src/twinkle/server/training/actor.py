@@ -116,8 +116,8 @@ class TrainingControllerActor:
             if training.state in ('PENDING', 'ACTIVE', 'CLOSING'):
                 await self.store.save_training(training)
                 for request_id in (training.create_request_id, *training.pending_operation_ids):
-                    await self.store.own_future(request_id, training.token)
-                    await self.store.future(request_id, 'failed', training.training_id, failure=failure)
+                    await self.store.future(
+                        request_id, 'failed', training.training_id, failure=failure, owner_token=training.token)
         ray.kill(ray.get_actor(controller_name(self.namespace), namespace=self.namespace), no_restart=False)
 
     async def register_runtime(self, instance_id, epoch, incarnation):

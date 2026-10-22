@@ -295,3 +295,19 @@ async def test_redis_retry_exhaustion_maps_to_http_503(redis_backend) -> None:
         'error_code': 503,
         'request_id': 'req-contention',
     }
+
+
+@pytest.mark.asyncio
+async def test_future_owner_is_shared_with_result_and_removed_with_it(backend_pair):
+    from twinkle.server.exceptions import ResourceNotFoundError
+    from twinkle.server.state import ServerState
+    first, second = (ServerState(backend=backend) for backend in backend_pair)
+    await first.store_future_status('owned', 'pending', None, owner_token='owner')
+    await second.store_future_status('owned', 'completed', None, result=42)
+    await first.assert_future_owner('owned', 'owner')
+    with pytest.raises(ResourceNotFoundError):
+        await second.assert_future_owner('owned', 'other')
+    assert (await second.get_future('owned'))['owner_token'] == 'owner'
+    await first._future_mgr.cleanup_expired(float('inf'))
+    assert await second.get_future('owned') is None
+    assert not await backend_pair[0].keys('future*')

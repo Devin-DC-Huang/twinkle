@@ -89,6 +89,7 @@ FAILURE_REASON_CODES: frozenset[str] = frozenset({
 class FutureRecord(BaseModel):
     """Represents an async task future / request status."""
 
+    owner_token: str | None = None
     status: str
     model_id: str | None = None
     reason: str | None = None

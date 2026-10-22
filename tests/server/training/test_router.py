@@ -43,7 +43,7 @@ async def test_upload_after_recycle_is_cpu_only_and_preserves_future_ownership(m
         future = await settle(router.state, response.request_id)
         assert future['status'] == 'completed'
         upload.assert_called_once_with(repo_id='owner/saved', folder_path=str(tmp_path), token='hub-token', private=True)
-        assert await router.state._backend.get('future_owner::' + response.request_id) == 'owner'
+        assert (await router.state.get_future(response.request_id))['owner_token'] == 'owner'
         assert not await router.state._backend.keys('model::*')
     finally:
         await router.shutdown_task_queue()

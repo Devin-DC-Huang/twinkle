@@ -82,12 +82,17 @@ class TrainingStore:
                      epoch: str | None = None,
                      result: Any = None,
                      failure: FutureFailureRecord | None = None,
-                     deadline: float | None = None) -> None:
+                     deadline: float | None = None,
+                     owner_token: str | None = None) -> None:
         await self.state.store_future_status(
-            request_id, status, model_id, result=result, failure=failure, replica_id=epoch, absolute_deadline=deadline)
-
-    async def own_future(self, request_id: str, token: str) -> None:
-        await self.state.set_future_owner(request_id, token)
+            request_id,
+            status,
+            model_id,
+            result=result,
+            failure=failure,
+            replica_id=epoch,
+            absolute_deadline=deadline,
+            owner_token=owner_token)
 
     async def begin_epoch(self, epoch: str) -> None:
         await self.backend.set(self.key('controller', 'active'), {'epoch': epoch, 'started_at': time.time()})

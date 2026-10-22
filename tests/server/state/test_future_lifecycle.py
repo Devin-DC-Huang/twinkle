@@ -215,3 +215,34 @@ async def test_start_and_cancel_have_one_atomic_winner(manager, cancel_first):
 async def test_concurrent_starters_only_one_obtains_execution(manager):
     await _store(manager, 'race', 'pending')
     assert sum(await asyncio.gather(*(manager.try_start('race') for _ in range(20)))) == 1
+
+
+@pytest.mark.asyncio
+async def test_future_owner_outlives_admission_retention_until_result_cleanup(monkeypatch):
+    from twinkle.server.exceptions import ResourceNotFoundError
+    from twinkle.server.state import ServerState
+    state = ServerState(backend=FakeBackend(), expiration_timeout=10)
+    await state.store_future_status('owned', 'pending', 'training_test', owner_token='owner')
+    await state.store_future_status('owned', 'completed', 'training_test', result={'value': 42})
+    now = time.time()
+    monkeypatch.setattr(time, 'time', lambda: now + 11)
+    assert await state.get_future('owned') is not None
+    await state.assert_future_owner('owned', 'owner')
+    with pytest.raises(ResourceNotFoundError):
+        await state.assert_future_owner('owned', 'other')
+    await state._future_mgr.cleanup_expired(now + 11)
+    assert await state.get_future('owned') is None
+    assert not await state._backend.keys('future*')
+
+
+@pytest.mark.asyncio
+async def test_future_owner_is_immutable_and_not_part_of_wire_envelope():
+    from twinkle.server.state import ServerState
+    from twinkle.server.lifecycle.envelope import envelope_from_record
+    state = ServerState(backend=FakeBackend())
+    await state.store_future_status('owned', 'pending', None, owner_token='secret-owner')
+    await state.store_future_status('owned', 'completed', None, result=42, owner_token='replacement')
+    record = await state.get_future('owned')
+    assert record['owner_token'] == 'secret-owner'
+    assert 'owner_token' not in envelope_from_record('owned', record).model_dump()
+    assert 'secret-owner' not in envelope_from_record('owned', record).model_dump_json()

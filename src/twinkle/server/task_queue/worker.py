@@ -359,7 +359,8 @@ class ComputeWorker:
                 task.model_id,
                 queue_state=QueueState.ACTIVE.value,
                 replica_id=replica_id,
-                absolute_deadline=absolute_deadline)
+                absolute_deadline=absolute_deadline,
+                owner_token=task.token)
             wrote_status = True
             self.run_detached(task, queue_key)
         except BaseException:

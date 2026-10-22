@@ -264,6 +264,7 @@ class TaskQueueMixin:
             queue_state=QueueState.ACTIVE.value,
             replica_id=getattr(self, 'replica_id', None),
             absolute_deadline=self._future_deadline(),
+            owner_token=task.token,
         )
 
         try:
@@ -452,13 +453,14 @@ class TaskQueueMixin:
         coro_factory: Callable[[], Coroutine],
         model_id: str | None = None,
         task_type: str | None = None,
+        token: str | None = None,
     ) -> dict[str, Any]:
         """Run pure I/O outside serial compute, with the same supervised lifecycle.
 
         Capacity, timeout, cancellation and shutdown are owned by ComputeWorker;
         background jobs must not create a second unsupervised execution path.
         """
-        return await self.schedule_concurrent_task(coro_factory, model_id=model_id, task_type=task_type)
+        return await self.schedule_concurrent_task(coro_factory, model_id=model_id, task_type=task_type, token=token)
 
     async def _fail_queue_tasks_async(self, queue_key: str, reason: str) -> None:
         await self._compute_worker.fail_queue_tasks(queue_key, reason)

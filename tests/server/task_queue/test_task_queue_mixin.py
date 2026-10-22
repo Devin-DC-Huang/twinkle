@@ -711,3 +711,33 @@ async def test_cancel_winning_running_write_race_skips_execution(make_concurrent
     assert queue.state._latest[ref['request_id']]['status'] == 'cancelled'
     assert queue._compute_worker._detached_reserved == 0
     assert not queue._compute_worker._detached_tasks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('method', ['schedule_task', 'schedule_concurrent_task', 'schedule_background_task'])
+async def test_admission_persists_future_and_owner_together(method):
+    from tests.server.state.fake_backend import FakeBackend
+    from twinkle.server.state import ServerState
+    queue = TaskQueueMixin()
+    queue.state = ServerState(backend=FakeBackend())
+    queue.replica_id = 'ownership-test'
+    queue._init_task_queue()
+    entered, finish = asyncio.Event(), asyncio.Event()
+
+    async def operation():
+        entered.set()
+        await finish.wait()
+        return 42
+
+    try:
+        ref = await getattr(queue, method)(operation, token='owner')
+        record = await queue.state.get_future(ref['request_id'])
+        assert record['owner_token'] == 'owner'
+        assert not await queue.state._backend.keys('future_owner::*')
+        await asyncio.wait_for(entered.wait(), 1)
+        from twinkle.server.exceptions import ResourceNotFoundError
+        with pytest.raises(ResourceNotFoundError):
+            await queue.state.assert_future_owner(ref['request_id'], 'other')
+    finally:
+        finish.set()
+        await queue.shutdown_task_queue()

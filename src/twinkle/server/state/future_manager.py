@@ -31,6 +31,7 @@ def _future_record_transform(
     replica_id: str | None,
     absolute_deadline: float | None,
     now: str,
+    owner_token: str | None = None,
 ) -> dict | None:
     """Atomic transform body for :meth:`FutureManager.store_status`.
 
@@ -56,6 +57,7 @@ def _future_record_transform(
 
     if existing is None:
         record = FutureRecord(
+            owner_token=owner_token,
             status=new_status,
             model_id=model_id,
             reason=reason,
@@ -140,6 +142,7 @@ class FutureManager(BaseManager[FutureRecord]):
         queue_state_reason: str | None = None,
         replica_id: str | None = None,
         absolute_deadline: float | None = None,
+        owner_token: str | None = None,
     ) -> None:
         """Create or update a future record with the latest status.
 
@@ -176,6 +179,7 @@ class FutureManager(BaseManager[FutureRecord]):
                 queue_state_reason=queue_state_reason,
                 replica_id=replica_id,
                 absolute_deadline=absolute_deadline,
+                owner_token=owner_token,
                 now=now,
             ),
         )

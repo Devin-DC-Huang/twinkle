@@ -183,9 +183,6 @@ class ServerState:
     async def get_training_records(self, namespace: str):
         return await self._model_mgr.get_training_records(namespace)
 
-    async def set_future_owner(self, request_id: str, token: str) -> None:
-        await self._backend.set(f'future_owner::{request_id}', token, ttl=max(1, int(self.expiration_timeout)))
-
     async def delete_training_sequences(self, training_id: str) -> None:
         for key in await self._backend.keys(f'seq_ledger::{training_id}::*'):
             await self._backend.delete(key)
@@ -460,7 +457,8 @@ class ServerState:
         return record.model_dump() if record is not None else None
 
     async def assert_future_owner(self, request_id: str, token: str) -> None:
-        owner = await self._backend.get(f'future_owner::{request_id}')
+        record = await self._future_mgr.get(request_id)
+        owner = record.owner_token if record is not None else None
         if owner is not None and owner != token:
             raise ResourceNotFoundError('Unknown future')
 
@@ -526,6 +524,7 @@ class ServerState:
         queue_state_reason: str | None = None,
         replica_id: str | None = None,
         absolute_deadline: float | None = None,
+        owner_token: str | None = None,
     ) -> None:
         """Store task status with either a success result or domain failure.
 
@@ -557,6 +556,7 @@ class ServerState:
             queue_state_reason=queue_state_reason,
             replica_id=replica_id,
             absolute_deadline=absolute_deadline,
+            owner_token=owner_token,
         )
 
     # ----- Resource Cleanup -----
