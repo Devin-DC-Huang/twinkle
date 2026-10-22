@@ -26,7 +26,7 @@ from typing import Any
 import pytest
 
 from twinkle.data_format import SampledSequence, SampleResponse, SamplingParams
-from twinkle.sampler.base import Sampler
+from twinkle.sampler.partial_rollout import PartialRolloutMixin
 from twinkle.template.base import Template
 from twinkle.template.contract import MediaBundle, RolloutState
 from twinkle_agentic.rollout.ledger import TurnLedger
@@ -306,16 +306,8 @@ def test_turn_ledger_advances_feature_and_engine_bridges_independently():
 
 def test_partial_rollout_carries_state_across_retries_and_merge():
 
-    class Harness(Sampler):
-        def __init__(self):
-            super().__init__()
-            self.template = type('Decoder', (), {'decode': staticmethod(str)})()
-
-        def sample(self, *args, **kwargs):
-            raise NotImplementedError
-
-        def apply_patch(self, *args, **kwargs):
-            pass
+    class Harness(PartialRolloutMixin):
+        template = type('Decoder', (), {'decode': staticmethod(str)})()
 
     def response(tokens, stop_reason, input_ids, state):
         return SampleResponse(sequences=[SampledSequence(

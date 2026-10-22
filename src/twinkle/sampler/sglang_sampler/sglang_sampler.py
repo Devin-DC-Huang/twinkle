@@ -1,31 +1,24 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""SGLang sampler, the sglang counterpart of `vllm_sampler.vLLMSampler`."""
-
 import asyncio
 import atexit
 import os
 import threading
 import uuid
 from copy import copy
-from typing import Any, Optional, Union
+from typing import Any, Dict, List, Optional, Type, Union
 
 import numpy as np
 
 from twinkle import DeviceMesh, get_logger, remote_class, remote_function, requires
 from twinkle.checkpoint_engine import CheckpointEngineMixin
-from twinkle.data_format import (
-    InputFeature,
-    PoolingParams,
-    PoolingResponse,
-    SampledSequence,
-    SampleResponse,
-    SamplingParams,
-    Trajectory,
-)
+from twinkle.data_format import (InputFeature, PoolingParams, PoolingResponse, SampledSequence, SampleResponse,
+                                 SamplingParams, Trajectory)
 from twinkle.hub import HubOperation
 from twinkle.patch import Patch, apply_patch
 from twinkle.perf import timed
 from twinkle.sampler.base import Sampler
+from twinkle.sampler.partial_rollout import PartialRolloutMixin
+from twinkle.sampler.vllm_sampler.vllm_sampler import SAMPLER_MAX_CONCURRENCY
 from twinkle.template.contract import RolloutState, feature_has_media
 from twinkle.utils import Platform
 
@@ -49,8 +42,8 @@ def _convert_ndarray_to_list(obj: Any) -> Any:
     return obj
 
 
-@remote_class()
-class SGLangSampler(Sampler, CheckpointEngineMixin):
+@remote_class(max_concurrency=SAMPLER_MAX_CONCURRENCY)
+class SGLangSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin):
     """An sglang-based sampler using :class:`SGLangEngine`.
 
     Mirrors :class:`vLLMSampler`: tensor parallelism is taken from the visible devices unless given
@@ -71,7 +64,7 @@ class SGLangSampler(Sampler, CheckpointEngineMixin):
         default ``sync_weights(merge_and_sync=True)``, which sends merged base weights.
     """
 
-    def __init__(self, model_id: str, engine_args: dict[str, Any] = None, device_mesh: DeviceMesh = None, **kwargs):
+    def __init__(self, model_id: str, engine_args: Dict[str, Any] = None, device_mesh: DeviceMesh = None, **kwargs):
         """Initialize SGLangSampler.
 
         Args:
@@ -82,13 +75,13 @@ class SGLangSampler(Sampler, CheckpointEngineMixin):
             **kwargs: Additional arguments.
         """
         super().__init__()
-        requires("sglang")
+        requires('sglang')
 
         self.model_id = model_id
         self.device_mesh = device_mesh
         # adapter path -> the name sglang knows it by. Registration is not idempotent, so this is what
         # keeps per-input adapters from re-registering the same adapter on every request.
-        self._registered_loras: dict[str, str] = {}
+        self._registered_loras: Dict[str, str] = {}
 
         # A dedicated background event loop, for the same reason vLLMSampler has one -- Ray workers run
         # uvloop, so run_until_complete/asyncio.run are unavailable on the calling thread -- plus one
@@ -96,35 +89,30 @@ class SGLangSampler(Sampler, CheckpointEngineMixin):
         # that sglang pins its tokenizer_manager handle loop to that loop. See SGLangEngine's class
         # docstring for what breaks otherwise.
         self._async_loop = asyncio.new_event_loop()
-        self._async_thread = threading.Thread(target=self._run_event_loop, daemon=True, name="SGLangSampler-EventLoop")
+        self._async_thread = threading.Thread(target=self._run_event_loop, daemon=True, name='SGLangSampler-EventLoop')
         self._async_thread.start()
 
-        # In-flight non-blocking generations keyed by submission id (the async-submission capability). Each
-        # entry is a concurrent.futures.Future scheduled on ``self._async_loop`` above.
-        self._generation_submissions: dict[str, Any] = {}
-
-        # Engine request ids currently mid-generation (the partial-rollout capability), so an in-place weight republish
+        # Engine request ids currently mid-generation (PartialRolloutMixin), so an in-place weight republish
         # can abort them and let each resume on the fresh weights. Only touched from ``self._async_loop``.
         self._inflight_request_ids: set = set()
 
         from .sglang_engine import SGLangEngine
-
         engine_kwargs = engine_args.copy() if engine_args else {}
 
-        if "tensor_parallel_size" not in engine_kwargs:
+        if 'tensor_parallel_size' not in engine_kwargs:
             tp_size = 1
-            visible_devices = os.environ.get(Platform.visible_device_env(), "")
+            visible_devices = os.environ.get(Platform.visible_device_env(), '')
             if visible_devices:
-                num_devices = len([d for d in visible_devices.split(",") if d.strip()])
+                num_devices = len([d for d in visible_devices.split(',') if d.strip()])
                 if num_devices > 0:
                     tp_size = num_devices
-            logger.info(f"sglang TP size: {tp_size}")
-            engine_kwargs["tensor_parallel_size"] = tp_size
+            logger.info(f'sglang TP size: {tp_size}')
+            engine_kwargs['tensor_parallel_size'] = tp_size
 
         # Distinct seed per DP rank, so replicas do not all sample the same continuation.
         # sglang spells this `random_seed`; user-supplied values win.
-        if "random_seed" not in engine_kwargs:
-            engine_kwargs["random_seed"] = 42 + Platform.get_rank()
+        if 'random_seed' not in engine_kwargs:
+            engine_kwargs['random_seed'] = 42 + Platform.get_rank()
 
         self.engine: SGLangEngine = self._run_in_loop(self._create_engine_async(SGLangEngine, model_id, engine_kwargs))
 
@@ -145,13 +133,14 @@ class SGLangSampler(Sampler, CheckpointEngineMixin):
         """Create the engine on the background loop, which sglang then binds its handle loop to."""
         return engine_cls(model_id=model_id, **engine_kwargs)
 
-    @remote_function(dispatch="all", collect="first", lazy_collect=False)
-    def apply_patch(self, patch_cls: Patch | type[Patch] | str, **kwargs) -> None:
+    @remote_function(dispatch='all', collect='first', lazy_collect=False, exclusive=True, replay=True)
+    def apply_patch(self, patch_cls: Union[Patch, Type[Patch], str], **kwargs) -> None:
         apply_patch(self, patch_cls, **kwargs)
 
-    def encode_trajectory_for_sglang(
-        self, trajectory: Trajectory, adapter_name: str = "", add_generation_prompt=True
-    ) -> dict[str, Any]:
+    def encode_trajectory_for_sglang(self,
+                                     trajectory: Trajectory,
+                                     adapter_name: str = '',
+                                     add_generation_prompt=True) -> Dict[str, Any]:
         """Encode trajectory for sglang.
 
         Messages should already use transformers standard format (content is List[Dict]).
@@ -167,24 +156,24 @@ class SGLangSampler(Sampler, CheckpointEngineMixin):
         return encoded
 
     @staticmethod
-    def _extract_image_data(feat: Any) -> list[Any] | None:
+    def _extract_image_data(feat: Any) -> Optional[List[Any]]:
         """Convert canonical image media to SGLang's flat request shape."""
         if not isinstance(feat, dict):
-            if getattr(feat, "videos", ()) or getattr(feat, "audios", ()):
-                raise NotImplementedError("SGLang sampler supports image media only.")
-            return list(getattr(feat, "images", ())) or None
-        images = feat.get("images")
+            if getattr(feat, 'videos', ()) or getattr(feat, 'audios', ()):
+                raise NotImplementedError('SGLang sampler supports image media only.')
+            return list(getattr(feat, 'images', ())) or None
+        images = feat.get('images')
 
         if not images:
             images = []
-            for msg in feat.get("messages", []):
-                content = msg.get("content")
+            for msg in feat.get('messages', []):
+                content = msg.get('content')
                 if not isinstance(content, list):
                     continue
                 for block in content:
-                    if not isinstance(block, dict) or block.get("type") != "image":
+                    if not isinstance(block, dict) or block.get('type') != 'image':
                         continue
-                    for key in ("image", "url", "path"):
+                    for key in ('image', 'url', 'path'):
                         if key in block and block[key] is not None:
                             images.append(block[key])
                             break
@@ -193,27 +182,27 @@ class SGLangSampler(Sampler, CheckpointEngineMixin):
 
     async def _sample_single(
         self,
-        feat: dict[str, Any],
+        feat: Dict[str, Any],
         sampling_params: SamplingParams,
         *,
-        image_data: list[Any] | None = None,
-        lora_name: str | None = None,
+        image_data: Optional[List[Any]] = None,
+        lora_name: Optional[str] = None,
         logprobs_only: bool = False,
-        request_id: str | None = None,
-        state: RolloutState | None = None,
+        request_id: Optional[str] = None,
+        state: Optional[RolloutState] = None,
     ) -> SampleResponse:
         """Sample a single input asynchronously.
 
         ``request_id`` is this generation's engine handle (sglang's ``rid``): auto-generated when not given,
         and registered as in-flight for the duration of the call so :meth:`abort_all_inflight`
-        (the partial-rollout capability) can interrupt it and let a partial rollout resume from the tokens it produced
+        (PartialRolloutMixin) can interrupt it and let a partial rollout resume from the tokens it produced
         before the abort. Mirrors ``vLLMSampler._sample_single`` so the resume loop is backend-agnostic.
         """
         if request_id is None:
             request_id = uuid.uuid4().hex
         if state is None and feature_has_media(feat):
-            raise NotImplementedError("multimodal sampling requires a Trajectory or RolloutState.")
-        prompt_ids = list(state.engine_input_ids) if state is not None else feat["input_ids"]
+            raise NotImplementedError('multimodal sampling requires a Trajectory or RolloutState.')
+        prompt_ids = list(state.engine_input_ids) if state is not None else feat['input_ids']
         response = await self._sample_engine_request(
             request_id,
             self.engine.sample(
@@ -225,9 +214,9 @@ class SGLangSampler(Sampler, CheckpointEngineMixin):
             ),
         )
 
-        if "input_ids" not in feat:
-            feat["input_ids"] = response.prompt_token_ids
-            feat["labels"] = [-100] * len(response.prompt_token_ids)
+        if 'input_ids' not in feat:
+            feat['input_ids'] = response.prompt_token_ids
+            feat['labels'] = [-100] * len(response.prompt_token_ids)
 
         sequences = []
         for seq in response.sequences:
@@ -252,91 +241,21 @@ class SGLangSampler(Sampler, CheckpointEngineMixin):
             prompt_token_ids=response.prompt_token_ids,
             sequences=sequences,
             prompt_logprobs=response.prompt_logprobs,
-            topk_prompt_logprobs=response.topk_prompt_logprobs,
-        )
+            topk_prompt_logprobs=response.topk_prompt_logprobs)
 
-    @remote_function(
-        dispatch="slice_dp",
-        collect="flatten",
-        lazy_collect=False,
-        enable_continous_work=True,
-        worker_selector="_sampling_worker_ids",
-    )
+    @remote_function(dispatch='slice_dp', collect='flatten', lazy_collect=False, enable_continous_work=True,
+                     worker_selector='_sampling_worker_ids')
     @timed
-    async def _generate_inputs(
-        self,
-        inputs: Any,
-        sampling_params: SamplingParams | dict[str, Any] | None,
-        *,
-        adapter_name: str,
-        adapter_path: str | None,
-        use_base_model: bool,
-    ) -> list[SampleResponse]:
-        """Asynchronous counterpart of ``sample``: the coroutine the submit protocol schedules.
-
-        Mirrors ``sample``'s semantics (trajectory encoding, per-input LoRA, multimodal extraction)
-        with two sglang-specific nudges: the sampled token's logprob is forced on (sglang only
-        returns generated token ids as a side effect of asking for logprobs -- without them the
-        engine re-tokenises the completion text and those ids can drift from what the model actually
-        ran), and a zero-token request asks for one token and drops it.
-        """
-        if sampling_params is None:
-            sampling_params = SamplingParams()
-        elif isinstance(sampling_params, dict):
-            sampling_params = SamplingParams.from_dict(sampling_params)
-
-        inputs_list = self._normalize_inputs(inputs)
-        if not inputs_list:
-            return []
-
-        sampling_params = copy(sampling_params)
-        if not sampling_params.logprobs:
-            sampling_params.logprobs = 1
-
-        is_trajectory = "input_ids" not in inputs_list[0]
-        logprobs_only = False
-        if sampling_params.max_tokens == 0:
-            sampling_params.max_tokens = 1
-            logprobs_only = True
-
-        image_data_list = [self._extract_image_data(feat) for feat in inputs_list]
-        if is_trajectory:
-            if self.template is None:
-                raise ValueError("Use set_template to add a template when trying to input Trajectory")
-            encoded_inputs = [
-                self.encode_trajectory_for_sglang(trajectory, adapter_name, not logprobs_only)
-                for trajectory in inputs_list
-            ]
-        else:
-            encoded_inputs = inputs_list
-
-        lora_name = None
-        if not use_base_model:
-            lora_name = await self._aregister_lora(adapter_path, adapter_name)
-
-        return await asyncio.gather(
-            *(
-                self._sample_single(
-                    feat,
-                    sampling_params,
-                    image_data=image_data,
-                    lora_name=lora_name,
-                    logprobs_only=logprobs_only,
-                )
-                for feat, image_data in zip(encoded_inputs, image_data_list, strict=False)
-            )
-        )
-
     def sample(
         self,
-        inputs: InputFeature | RolloutState | Trajectory | list[InputFeature | RolloutState | Trajectory],
-        sampling_params: SamplingParams | dict[str, Any] | None = None,
-        adapter_name: str = "",
-        adapter_path: str | None = None,
+        inputs: Union[InputFeature, RolloutState, Trajectory, List[Union[InputFeature, RolloutState, Trajectory]]],
+        sampling_params: Optional[Union[SamplingParams, Dict[str, Any]]] = None,
+        adapter_name: str = '',
+        adapter_path: Optional[str] = None,
         *,
-        adapter_paths: list[str | None] | None = None,
+        adapter_paths: Optional[List[Optional[str]]] = None,
         allow_partial_rollout: bool = False,
-    ) -> list[SampleResponse]:
+    ) -> List[SampleResponse]:
         """Sample responses for given inputs.
 
         Args:
@@ -365,8 +284,8 @@ class SGLangSampler(Sampler, CheckpointEngineMixin):
             ``adapter_paths`` is a list too and is sliced in lockstep, staying aligned with ``inputs``.
         """
         # One sampling path: the blocking sample is the async core driven to completion on the loop. The
-        # non-blocking submit_generation (the async-submission capability) schedules the SAME coroutine and
-        # collects it later, so an overlapped RL rollout and a plain blocking call cannot drift.
+        # non-blocking ``submit`` schedules the SAME coroutine on this loop and hands back a Future, so
+        # an overlapped RL rollout and a plain blocking call cannot drift.
         return self._run_in_loop(
             self._generate_inputs(
                 inputs,
@@ -374,22 +293,21 @@ class SGLangSampler(Sampler, CheckpointEngineMixin):
                 adapter_name,
                 adapter_path,
                 adapter_paths=adapter_paths,
-                allow_partial_rollout=allow_partial_rollout,
-            )
-        )
+                allow_partial_rollout=allow_partial_rollout))
 
     async def _generate_inputs(
         self,
-        inputs: InputFeature | RolloutState | Trajectory | list[InputFeature | RolloutState | Trajectory],
-        sampling_params: SamplingParams | dict[str, Any] | None = None,
-        adapter_name: str = "",
-        adapter_path: str | None = None,
+        inputs: Union[InputFeature, RolloutState, Trajectory, List[Union[InputFeature, RolloutState, Trajectory]]],
+        sampling_params: Optional[Union[SamplingParams, Dict[str, Any]]] = None,
+        adapter_name: str = '',
+        adapter_path: Optional[str] = None,
         *,
         use_base_model: bool = False,
-        adapter_paths: list[str | None] | None = None,
+        adapter_paths: Optional[List[Optional[str]]] = None,
         allow_partial_rollout: bool = False,
-    ) -> list[SampleResponse]:
-        """The async generation core shared by the blocking :meth:`sample` and :meth:`submit_generation`.
+        token_only: bool = False,
+    ) -> List[SampleResponse]:
+        """The async generation core shared by the blocking :meth:`sample` and the non-blocking ``submit``.
 
         Mirrors :meth:`vLLMSampler._generate_inputs`. Adapters are registered with the async
         ``_aregister_lora`` rather than the blocking ``_register_lora`` because this already runs inside
@@ -397,7 +315,7 @@ class SGLangSampler(Sampler, CheckpointEngineMixin):
         ``use_base_model`` drops the adapter so the base weights are sampled.
 
         With ``allow_partial_rollout`` each input is driven through
-        :meth:`~twinkle.sampler.partial_rollout.the partial-rollout capability._run_partial_rollout`, so an abort from
+        :meth:`~twinkle.sampler.partial_rollout.PartialRolloutMixin._run_partial_rollout`, so an abort from
         a concurrent in-place weight republish resumes it from its own tokens on the fresh weights instead
         of ending it truncated; otherwise each input is a single ``_sample_single`` attempt.
         """
@@ -410,24 +328,20 @@ class SGLangSampler(Sampler, CheckpointEngineMixin):
         if not raw_inputs:
             return []
         input_states = [item if isinstance(item, RolloutState) else None for item in raw_inputs]
-        inputs_list = [
-            state.feature if state is not None else item for item, state in zip(raw_inputs, input_states, strict=False)
-        ]  # noqa: E501
+        inputs_list = [state.feature if state is not None else item for item, state in zip(raw_inputs, input_states)]
 
         if adapter_paths is not None:
             if adapter_path is not None:
-                raise ValueError(
-                    "Pass either adapter_path (one adapter for the whole call) or adapter_paths "
-                    "(one per input), not both."
-                )
+                raise ValueError('Pass either adapter_path (one adapter for the whole call) or adapter_paths '
+                                 '(one per input), not both.')
             if len(adapter_paths) != len(inputs_list):
-                raise ValueError(
-                    f"adapter_paths has {len(adapter_paths)} entries but there are "
-                    f"{len(inputs_list)} inputs; they must correspond one-to-one so that DP "
-                    "slicing keeps them aligned."
-                )
+                raise ValueError(f'adapter_paths has {len(adapter_paths)} entries but there are '
+                                 f'{len(inputs_list)} inputs; they must correspond one-to-one so that DP '
+                                 'slicing keeps them aligned.')
 
-        is_trajectory = "input_ids" not in inputs_list[0]
+        is_trajectory = 'input_ids' not in inputs_list[0]
+        if token_only and is_trajectory:
+            raise ValueError('Token-only sampling requires encoded input_ids.')
         logprobs_only = False
         if sampling_params.max_tokens == 0:
             # sglang has no zero-token request, so ask for one token and drop it.
@@ -436,9 +350,10 @@ class SGLangSampler(Sampler, CheckpointEngineMixin):
             logprobs_only = True
 
         if is_trajectory:
-            assert self.template is not None, "Use set_template to add a template when trying to input Trajectory"
+            assert self.template is not None, \
+                'Use set_template to add a template when trying to input Trajectory'
             prompts = [
-                self.template.encode_prompt(traj, backend="sglang", add_generation_prompt=not logprobs_only)
+                self.template.encode_prompt(traj, backend='sglang', add_generation_prompt=not logprobs_only)
                 for traj in inputs_list
             ]
             states = [prompt.state for prompt in prompts]
@@ -449,7 +364,7 @@ class SGLangSampler(Sampler, CheckpointEngineMixin):
             states = input_states
             image_data_list = [
                 self._extract_image_data(state.media if state is not None else feat)
-                for feat, state in zip(inputs_list, states, strict=False)
+                for feat, state in zip(inputs_list, states)
             ]
 
         if use_base_model:
@@ -460,7 +375,12 @@ class SGLangSampler(Sampler, CheckpointEngineMixin):
             registered = await self._aregister_lora(adapter_path, adapter_name)
             lora_names = [registered or (adapter_name or None)] * len(encoded_inputs)
 
-        async def _generate_one(feat, state, image_data, lora_name):
+        # ``request_id`` is the caller-side handle for async control (submit/pause/stop): taken from
+        # the raw inputs before encoding (the encoder does not carry it) and handed to the engine as
+        # the request id, so an abort can address this exact generation.
+        request_ids = [input.get('request_id') for input in inputs_list]
+
+        async def _generate_one(feat, state, image_data, lora_name, request_id):
             if not allow_partial_rollout:
                 return await self._sample_single(
                     feat,
@@ -468,6 +388,7 @@ class SGLangSampler(Sampler, CheckpointEngineMixin):
                     image_data=image_data,
                     lora_name=lora_name,
                     logprobs_only=logprobs_only,
+                    request_id=request_id,
                     state=state,
                 )
 
@@ -480,6 +401,7 @@ class SGLangSampler(Sampler, CheckpointEngineMixin):
                     image_data=image_data,
                     lora_name=lora_name,
                     logprobs_only=logprobs_only,
+                    request_id=request_id,
                     state=current_state,
                 )
                 return response, None
@@ -496,39 +418,38 @@ class SGLangSampler(Sampler, CheckpointEngineMixin):
             return outcome.response
 
         return await self._gather_generation_tasks(
-            _generate_one(feat, state, image_data, lora_name)
-            for feat, state, image_data, lora_name in zip(
-                encoded_inputs, states, image_data_list, lora_names, strict=False
-            )  # noqa: E501
-        )
+            _generate_one(feat, state, image_data, lora_name, request_id)
+            for feat, state, image_data, lora_name, request_id in zip(encoded_inputs, states, image_data_list,
+                                                                      lora_names, request_ids))
 
     async def _encode_single(
         self,
-        feat: dict[str, Any],
+        feat: Dict[str, Any],
         pooling_params: PoolingParams,
         *,
-        image_data: list[Any] | None = None,
-        lora_name: str | None = None,
+        image_data: Optional[List[Any]] = None,
+        lora_name: Optional[str] = None,
     ) -> PoolingResponse:
         """Run a single pooling forward asynchronously, the counterpart of ``_sample_single``."""
         return await self.engine.encode(
-            prompt=feat["input_ids"],
+            prompt=feat['input_ids'],
             pooling_params=pooling_params,
             image_data=image_data,
             lora_name=lora_name,
         )
 
-    @remote_function(dispatch="slice_dp", collect="flatten", lazy_collect=False, worker_selector="_sampling_worker_ids")
+    @remote_function(dispatch='slice_dp', collect='flatten', lazy_collect=False,
+                     worker_selector='_sampling_worker_ids')
     @timed
     def encode(
         self,
-        inputs: InputFeature | list[InputFeature] | Trajectory | list[Trajectory],
-        pooling_params: PoolingParams | dict[str, Any] | None = None,
-        adapter_name: str = "",
-        adapter_path: str | None = None,
+        inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
+        pooling_params: Optional[Union[PoolingParams, Dict[str, Any]]] = None,
+        adapter_name: str = '',
+        adapter_path: Optional[str] = None,
         *,
-        adapter_paths: list[str | None] | None = None,
-    ) -> list[PoolingResponse]:
+        adapter_paths: Optional[List[Optional[str]]] = None,
+    ) -> List[PoolingResponse]:
         """Run a pooling forward (embedding / classify) for each input.
 
         The pooling counterpart of :meth:`sample`, sharing its dispatch, trajectory encoding, LoRA
@@ -556,24 +477,21 @@ class SGLangSampler(Sampler, CheckpointEngineMixin):
         inputs_list = self._normalize_inputs(inputs)
         if adapter_paths is not None:
             if adapter_path is not None:
-                raise ValueError(
-                    "Pass either adapter_path (one adapter for the whole call) or adapter_paths "
-                    "(one per input), not both."
-                )
+                raise ValueError('Pass either adapter_path (one adapter for the whole call) or adapter_paths '
+                                 '(one per input), not both.')
             if len(adapter_paths) != len(inputs_list):
-                raise ValueError(
-                    f"adapter_paths has {len(adapter_paths)} entries but there are "
-                    f"{len(inputs_list)} inputs; they must correspond one-to-one so that DP "
-                    "slicing keeps them aligned."
-                )
+                raise ValueError(f'adapter_paths has {len(adapter_paths)} entries but there are '
+                                 f'{len(inputs_list)} inputs; they must correspond one-to-one so that DP '
+                                 'slicing keeps them aligned.')
 
         if not inputs_list:
             return []
-        is_trajectory = "input_ids" not in inputs_list[0]
+        is_trajectory = 'input_ids' not in inputs_list[0]
         image_data_list = [self._extract_image_data(feat) for feat in inputs_list]
 
         if is_trajectory:
-            assert self.template is not None, "Use set_template to add a template when trying to input Trajectory"
+            assert self.template is not None, \
+                'Use set_template to add a template when trying to input Trajectory'
             encoded_inputs = [
                 self.encode_trajectory_for_sglang(traj, adapter_name, add_generation_prompt=False)
                 for traj in inputs_list
@@ -594,14 +512,14 @@ class SGLangSampler(Sampler, CheckpointEngineMixin):
                     pooling_params,
                     image_data=image_data,
                     lora_name=lora_name,
-                )
-                for feat, image_data, lora_name in zip(encoded_inputs, image_data_list, lora_names, strict=False)
+                ) for feat, image_data, lora_name in zip(encoded_inputs, image_data_list, lora_names)
             ]
             return await asyncio.gather(*tasks)
 
         return self._run_in_loop(_encode_all())
 
-    async def _aregister_lora(self, adapter_path: str | None, adapter_name: str | None = None) -> str | None:
+    async def _aregister_lora(self, adapter_path: Optional[str],
+                              adapter_name: Optional[str] = None) -> Optional[str]:
         """Async :meth:`_register_lora`: register an adapter on the event loop, return its ``lora_path``.
 
         Split out so the async generation core (``_generate_inputs``) can ``await`` it directly; calling
@@ -615,8 +533,8 @@ class SGLangSampler(Sampler, CheckpointEngineMixin):
             return None
         if adapter_path in self._registered_loras:
             return self._registered_loras[adapter_path]
-        lora_name = adapter_name or f"lora_{len(self._registered_loras)}"
-        logger.info(f"Loading LoRA {lora_name!r} from {adapter_path}")
+        lora_name = adapter_name or f'lora_{len(self._registered_loras)}'
+        logger.info(f'Loading LoRA {lora_name!r} from {adapter_path}')
         # Offload the (blocking) hub download off the event loop so it cannot stall other in-flight
         # generations sharing this loop.
         local_path = await asyncio.to_thread(HubOperation.download_model, model_id_or_path=adapter_path)
@@ -624,7 +542,7 @@ class SGLangSampler(Sampler, CheckpointEngineMixin):
         self._registered_loras[adapter_path] = lora_name
         return lora_name
 
-    def _register_lora(self, adapter_path: str | None, adapter_name: str | None = None) -> str | None:
+    def _register_lora(self, adapter_path: Optional[str], adapter_name: Optional[str] = None) -> Optional[str]:
         """Register an adapter with sglang and return the name to send as ``lora_path``.
 
         Blocking wrapper over :meth:`_aregister_lora` for callers outside the event loop (``encode``,
@@ -634,10 +552,10 @@ class SGLangSampler(Sampler, CheckpointEngineMixin):
 
     def sample_stream(
         self,
-        inputs: InputFeature | Trajectory | dict[str, Any],
-        sampling_params: SamplingParams | dict[str, Any] | None = None,
-        adapter_name: str = "",
-        adapter_path: str | None = None,
+        inputs: Union[InputFeature, Trajectory, Dict[str, Any]],
+        sampling_params: Optional[Union[SamplingParams, Dict[str, Any]]] = None,
+        adapter_name: str = '',
+        adapter_path: Optional[str] = None,
     ):
         """Yield ``(delta_text, finish_reason)`` for a single input, mirroring ``vLLMSampler``.
 
@@ -650,22 +568,20 @@ class SGLangSampler(Sampler, CheckpointEngineMixin):
             sampling_params = SamplingParams.from_dict(sampling_params)
 
         feat = inputs
-        if "input_ids" not in feat:
+        if 'input_ids' not in feat:
             feat = self.encode_trajectory_for_sglang(feat, adapter_name)
         lora_name = self._register_lora(adapter_path, adapter_name)
 
         yield from self._iter_in_loop(
             self.engine.generate_stream(
-                prompt=feat["input_ids"],
+                prompt=feat['input_ids'],
                 sampling_params=sampling_params,
                 lora_name=lora_name,
-            )
-        )
+            ))
 
     def _iter_in_loop(self, async_gen):
         """Drain an async generator running on the background loop into a plain iterator."""
         import queue as stdlib_queue
-
         q: stdlib_queue.Queue = stdlib_queue.Queue()
         sentinel = object()
 
@@ -687,22 +603,22 @@ class SGLangSampler(Sampler, CheckpointEngineMixin):
                 raise item
             yield item
 
-    @remote_function(dispatch="all", collect="first")
+    @remote_function(dispatch='all', collect='first')
     @timed
     def sleep(self, level: int = 1) -> None:
         """Release device memory for colocate mode. Needs ``enable_memory_saver=True``."""
         self._run_in_loop(self.engine.sleep(level))
 
-    @remote_function(dispatch="all", collect="first")
+    @remote_function(dispatch='all', collect='first')
     @timed
-    def wake_up(self, tags: list[str] = None) -> None:
+    def wake_up(self, tags: List[str] = None) -> None:
         self._run_in_loop(self.engine.wake_up(tags=tags))
 
-    @remote_function(dispatch="all", collect="first")
+    @remote_function(dispatch='all', collect='first')
     def reset_prefix_cache(self):
         self._run_in_loop(self.engine.reset_prefix_cache())
 
-    @remote_function(dispatch="all", lazy_collect=True)
+    @remote_function(dispatch='all', lazy_collect=True, exclusive=True)
     @timed
     def receive_weights(
         self,
@@ -740,7 +656,7 @@ class SGLangSampler(Sampler, CheckpointEngineMixin):
 
         self._run_in_loop(_receive_and_load())
 
-    @remote_function(dispatch="all", collect="first", lazy_collect=False)
+    @remote_function(dispatch='all', collect='first', lazy_collect=False)
     def shutdown(self):
         """Shut down the sglang engine and the background event loop.
 
@@ -752,15 +668,15 @@ class SGLangSampler(Sampler, CheckpointEngineMixin):
         self._shutdown_called = True
 
         try:
-            if getattr(self, "engine", None) is not None:
+            if getattr(self, 'engine', None) is not None:
                 self._run_in_loop(self.engine.shutdown())
         except Exception as e:
-            logger.warning(f"SGLangSampler engine shutdown error: {e}")
+            logger.warning(f'SGLangSampler engine shutdown error: {e}')
 
         try:
-            if hasattr(self, "_async_loop") and self._async_loop.is_running():
+            if hasattr(self, '_async_loop') and self._async_loop.is_running():
                 self._async_loop.call_soon_threadsafe(self._async_loop.stop)
-            if hasattr(self, "_async_thread") and self._async_thread.is_alive():
+            if hasattr(self, '_async_thread') and self._async_thread.is_alive():
                 self._async_thread.join(timeout=5)
         except Exception as e:
-            logger.warning(f"SGLangSampler event loop shutdown error: {e}")
+            logger.warning(f'SGLangSampler event loop shutdown error: {e}')

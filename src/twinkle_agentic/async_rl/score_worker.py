@@ -1,13 +1,4 @@
-"""The generic scoring worker: the ONE remote boundary that orchestrates reward scoring.
-
-Algorithm-agnostic scoring orchestration for the streaming RL driver: resolve rollout-sample
-refs where the data lives, rebuild the scoring rows, run every ORM scorer, and return small
-sample-major reward rows -- the driver never materializes token-scale data. Both scoring
-CHANNELS (ORM outcome rows, PRM per-token process rewards) are protocol here and live in this
-base; algorithm-specific halves (advantage fusion, teacher reweighting) stay in the caller's
-subclass. The PRM step SEGMENTATION is an injected plugin callable (``prm_step_scorer``):
-the caller's object, executed inside this actor.
-"""
+# Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
 
 import json
@@ -129,7 +120,7 @@ class ScoreWorker:
         values = score(rows) if callable(score) else scorer(rows)
         return [None if value is None or value != value else float(value) for value in values]
 
-    @remote_function(dispatch='all', collect='first', lazy_collect=True)
+    @remote_function(dispatch='all', collect='first', lazy_collect=False)
     def score_group(self, samples: List[Any]) -> List[List[float]]:
         """Score one group with every ORM scorer -> the ``[N][n_scorers]`` sample-major matrix.
 
@@ -147,7 +138,7 @@ class ScoreWorker:
         return [[None if value is None or value != value else float(value) for value in column]
                 for column in zip(*matrix)] if matrix else [[] for _ in samples]
 
-    @remote_function(dispatch='all', collect='first', lazy_collect=True)
+    @remote_function(dispatch='all', collect='first', lazy_collect=False)
     def score_group_prm(self, samples: List[Any]) -> Tuple[List[List[Optional[float]]], List[Any]]:
         """Both channels for one group in ONE pass: ``(the ORM matrix, per-sample process rewards)``.
 
