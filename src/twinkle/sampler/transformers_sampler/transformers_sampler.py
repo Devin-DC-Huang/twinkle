@@ -1,28 +1,4 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""A :class:`~twinkle.sampler.Sampler` on plain transformers ``generate()``.
-
-Drop-in for :class:`~twinkle.sampler.vLLMSampler`: same constructor shape
-(``model_id, engine_args, device_mesh``), same ``sample`` / ``sample_stream`` / ``shutdown`` surface,
-same synchronous-blocking convention. Swapping backends should not require touching call sites.
-
-Two capabilities exist here that the vLLM path does not have:
-
-- ``strict=False`` degrades **per input** instead of failing the batch. Offline sampling over a large
-  corpus routinely hits a handful of rows that cannot be encoded (over-length, broken media refs); the
-  legacy sampler set ``engine.strict = False`` for exactly this, and losing it would mean one bad row
-  discards a whole run's worth of work.
-- batching is explicit. transformers has no continuous batching, so inputs are grouped and padded up
-  front by the engine's ``batch_sample``.
-
-Not provided, deliberately: colocated weight sync. ``vLLMSampler`` mixes in ``CheckpointEngineMixin``
-to receive NCCL-broadcast weights mid-training; this backend is for inference, evaluation and offline
-sampling, and a half-working ``receive_weights`` would be worse than an absent one. ``update_weights``
-on the engine covers the simple in-process refresh.
-
-And not needed, in the one case where it would otherwise be: passing ``model=<TransformersModel>``
-instead of ``model_id`` makes this a facade over a model that already exists, generating inside its
-workers. Nothing is loaded and nothing is synced, because there is only ever one set of weights.
-"""
 from __future__ import annotations
 
 import asyncio
@@ -136,6 +112,7 @@ class TransformersSampler(Sampler):
                 raise item
             yield item
 
+    @remote_function(dispatch='all', collect='first', lazy_collect=False, exclusive=True, replay=True)
     def apply_patch(self, patch_cls: Union[Patch, Type[Patch], str], **kwargs) -> None:
         apply_patch(self, patch_cls, **kwargs)
 

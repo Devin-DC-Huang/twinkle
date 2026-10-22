@@ -149,8 +149,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin):
         # (including vLLM's internal background tasks) run in the same loop
         self.engine: VLLMEngine = self._run_in_loop(self._create_engine_async(VLLMEngine, model_id, engine_kwargs))
         # fix: On NPU, monkey_patch_model can trigger Triton compatibility errors and abort sampler init.
-        # fix: Explicitly skip this patch on NPU and keep it for non-NPU paths only.
-        # NPU platform may trigger triton errors with monkey_patch_model
+        # The patch is still applied unconditionally; a real NPU skip needs a platform branch here.
         self._run_in_loop(self.engine.engine.collective_rpc('monkey_patch_model'))
 
         VLLMLoraWeights()(self)

@@ -1,22 +1,4 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""The template-facing half of the transformers generation pipeline, shared by both entry points.
-
-Two callers generate through a :class:`~twinkle.sampler.transformers_sampler.TransformersEngine`:
-
-- :class:`~twinkle.sampler.TransformersSampler`, which loads its own weights from ``model_id``;
-- :meth:`TransformersModel.generate`, a facade that generates on the weights a *training* model already
-  holds, inside that model's own data-parallel workers.
-
-Around the engine's ``batch_sample`` both run the same steps that talk to a
-:class:`~twinkle.template.Template`: encode each ``Trajectory`` into a prompt ``InputFeature``, collate
-the multimodal tensors a batch needs, and stitch the generated tokens back onto the prompt feature.
-Those steps live here so the two callers cannot drift -- which matters because the facade forwards its
-inputs whole and relies on this pipeline matching the sampler's exactly.
-
-What is deliberately *not* here: left-padding, logprobs, ``num_return_sequences`` and decoding. Those
-are the engine's business (see ``transformers_engine``); this module is engine-agnostic and owns only
-the encoding contract with ``Template``.
-"""
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple

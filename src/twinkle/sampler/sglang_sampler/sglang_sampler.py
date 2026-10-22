@@ -1,5 +1,4 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""SGLang sampler, the sglang counterpart of `vllm_sampler.vLLMSampler`."""
 import asyncio
 import atexit
 import os
@@ -19,6 +18,7 @@ from twinkle.patch import Patch, apply_patch
 from twinkle.perf import timed
 from twinkle.sampler.base import Sampler
 from twinkle.sampler.partial_rollout import PartialRolloutMixin
+from twinkle.sampler.vllm_sampler.vllm_sampler import SAMPLER_MAX_CONCURRENCY
 from twinkle.utils import Platform
 
 logger = get_logger()
@@ -41,7 +41,7 @@ def _convert_ndarray_to_list(obj: Any) -> Any:
     return obj
 
 
-@remote_class()
+@remote_class(max_concurrency=SAMPLER_MAX_CONCURRENCY)
 class SGLangSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin):
     """An sglang-based sampler using :class:`SGLangEngine`.
 
@@ -299,6 +299,7 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin):
         use_base_model: bool = False,
         adapter_paths: Optional[List[Optional[str]]] = None,
         allow_partial_rollout: bool = False,
+        token_only: bool = False,
     ) -> List[SampleResponse]:
         """The async generation core shared by the blocking :meth:`sample` and the non-blocking ``submit``.
 
@@ -331,6 +332,8 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin):
                                  'slicing keeps them aligned.')
 
         is_trajectory = 'input_ids' not in inputs_list[0]
+        if token_only and is_trajectory:
+            raise ValueError('Token-only sampling requires encoded input_ids.')
         logprobs_only = False
         if sampling_params.max_tokens == 0:
             # sglang has no zero-token request, so ask for one token and drop it.
