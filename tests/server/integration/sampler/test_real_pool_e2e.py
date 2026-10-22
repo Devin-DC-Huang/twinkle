@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import time
+import traceback
 import uuid
 from pathlib import Path
 
@@ -110,11 +111,12 @@ async def exercise(model, directory, namespace, evidence):
         reply = await target.request(payload('twinkle/sample', body), full_path=full)
         assert reply['status'] == 200, reply
         result = json.loads(reply['body'])
+        request_id = result['request_id']
         deadline = time.monotonic() + 600
         while result['status'] not in ('completed', 'failed', 'cancelled'):
             assert time.monotonic() < deadline, result
             await asyncio.sleep(.05)
-            result = await state.get_future(result['request_id'])
+            result = await state.get_future(request_id)
         assert result['status'] == 'completed', result
         seq = result['result']['samples'][0]['sequences'][0]
         assert seq['tokens'] and len(seq['tokens']) == len(seq['logprobs'])
@@ -295,6 +297,10 @@ async def exercise(model, directory, namespace, evidence):
         await settled(replacement)
         evidence['controller_orphan_recovery'] = True
         save()
+    except BaseException:
+        evidence['failure'] = traceback.format_exc()
+        save()
+        raise
     finally:
         for target in reversed(pools):
             await target.shutdown()
