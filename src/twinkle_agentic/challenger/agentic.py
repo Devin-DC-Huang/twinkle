@@ -126,8 +126,8 @@ class AgenticChallenger(Challenger):
     ``solver_rollout`` decides how an attempt is *run*. Left out, attempts go
     through the same loop the proposing side uses: this class writes the opening,
     generates, dispatches the environment's tools, appends the results. Given one,
-    that whole job is handed over -- to a rollout that runs the agent program,
-    or to anything else that answers
+    that whole job is handed over -- to :class:`~..rollout.external.ExternalRollout`
+    for an agent that ships as its own program, or to anything else that answers
     ``(trajectories, env=..., tool_manager=...) -> List[Trajectory]`` and returns
     one trained episode per prompt. The proposing side never uses it: proposing is
     a training-only role, and its loop is this class's own by design.

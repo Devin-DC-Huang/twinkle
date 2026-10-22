@@ -19,10 +19,13 @@ from .collectors import collect_dp_and_flatten, collect_tensor_dict
 from .continuous_work import _cw_barrier, _cw_drop_locked, _cw_unregister, _get_workers, _select_workers, \
     get_worker_id
 from .dispatch import _collect_func, _dispatch_args, _get_device_mesh_param_name, _prepare_lazy_collect, \
-    remote_class, remote_function, remote_map
+    alive_node_ids, cluster_resources, kill_actors, node_ip, remote_class, remote_function, remote_map, \
+    resolve_all, spawn_sidecar, stash
 
 __all__ = ['collect_dp_and_flatten', 'collect_tensor_dict', 'get_device_mesh', 'get_device_placement', 'get_mode',
-           'get_worker_id', 'initialize', 'remote_class', 'remote_function', 'remote_map']
+           'get_worker_id', 'initialize', 'remote_class', 'remote_function', 'remote_map',
+           'node_ip', 'alive_node_ids', 'spawn_sidecar', 'resolve_all', 'kill_actors',
+           'cluster_resources', 'stash']
 
 logger = get_logger()
 

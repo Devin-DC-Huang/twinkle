@@ -4,7 +4,7 @@ import inspect
 import os
 import sys
 from concurrent.futures import Future
-from typing import Any, Callable, Dict, List, Literal, Optional, TypeVar, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, TypeVar, Union
 
 import numpy as np
 from twinkle.notifier import notify_exception
@@ -422,6 +422,7 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
                     # Remove potential duplicate keys from kwargs before passing
                     kwargs_for_workers = kwargs.copy()
                     kwargs_for_workers.pop('instance_id', None)
+                    kwargs_for_workers.pop('remote_group', None)
                     # create_workers takes extra_torch_kwargs explicitly, so strip it from the forwarded
                     # component kwargs to avoid a duplicate-keyword collision.
                     kwargs_for_workers.pop('extra_torch_kwargs', None)
@@ -519,6 +520,117 @@ def remote_map(func: Callable, args_list: List[tuple]) -> List[Any]:
     return ray.get([worker.remote(*args) for args in args_list])
 
 
+def node_ip() -> str:
+    """This process's node IP as Ray sees it, brackets stripped."""
+    import ray
+
+    return ray.util.get_node_ip_address().strip('[]')
+
+
+def alive_node_ids() -> Dict[str, str]:
+    """Map of alive node IP -> Ray NodeID, for pinning an actor next to a device."""
+    import ray
+
+    return {node['NodeManagerAddress']: node['NodeID'] for node in ray.nodes() if node['Alive']}
+
+
+def spawn_sidecar(cls, *, node_id: str, env_vars: Dict[str, str], args: tuple = ()) -> Any:
+    """One zero-resource actor pinned to ``node_id`` -- a sidecar holding a device context.
+
+    Unlike remote_class (the resident, device-group-bound worker pool), a sidecar is a
+    helper placed next to one specific device (``env_vars`` e.g. CUDA_VISIBLE_DEVICES) whose
+    handle the caller drives with plain ``handle.method.remote()`` calls. Lifecycle is the
+    caller's: terminate with :func:`kill_actors`.
+    """
+    import ray
+    from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+    template = ray.remote(num_cpus=0, num_gpus=0)(cls)
+    return template.options(
+        scheduling_strategy=NodeAffinitySchedulingStrategy(node_id, soft=False),
+        runtime_env={'env_vars': dict(env_vars)},
+    ).remote(*args)
+
+
+def resolve_all(handles: List[Any], timeout: Optional[float] = None) -> List[Any]:
+    """Block until every actor-method handle resolves (a bare ``get`` over a list)."""
+    import ray
+
+    return ray.get(handles, timeout=timeout)
+
+
+def kill_actors(handles: List[Any]) -> None:
+    """Terminate sidecar actors without restart; their lifecycle is the caller's."""
+    import ray
+
+    for handle in handles:
+        ray.kill(handle, no_restart=True)
+
+
+def cluster_resources() -> Dict[str, float]:
+    """The running cluster's resource labels (empty when no Ray cluster is up)."""
+    import ray
+
+    return dict(ray.cluster_resources()) if ray.is_initialized() else {}
+
+
+def stash(value: Any) -> Any:
+    """Lift ``value`` to an ObjectRef inside a remote worker; pass it through in the driver.
+
+    The return-path mirror of an actor argument: a payload a worker produces for another
+    remote consumer crosses the boundary cheaper as a ref, while a local worker shares the
+    caller's process and the value itself is the cheaper hand-off.
+    """
+    if not os.environ.get('WORKER_NAME'):
+        return value
+    import ray
+
+    return ray.put(value)
+
+
+def _stash_channel(value: Any) -> Any:
+    """One declared channel of a stashed return value, lifted at its birthplace in the worker.
+
+    A list channel is stashed element-wise: the caller's collect materialises the list itself
+    (cheap) with every element still a reference it can index or forward, which is what keeps
+    per-sample hand-off (``process[index]``) working without dragging the payloads along.
+    Anything else is stashed whole.
+    """
+    if isinstance(value, list):
+        return [stash(item) for item in value]
+    return stash(value)
+
+
+def _stash_channels(result: Any, channels: Sequence[Union[int, str]]) -> Any:
+    """Lift a remote return value's declared ``stash`` channels to ObjectRefs, in the worker.
+
+    The outgoing half of partial collect. ``lazy_collect`` keeps the WHOLE return value as one
+    reference, which is enough when the caller never opens the container; a mixed return (light
+    control scalars plus heavy payloads) whose light half the caller must read needs per-channel
+    refs instead -- ``ray.get`` resolves only top-level refs, so the caller's collect materialises
+    the light half while the stashed channels ride through as references the next remote call
+    dereferences at its worker.
+
+    A tuple channel is addressed by position and must exist (arity is the method's contract); a
+    dict channel is a key that MAY be absent (a branch-dependent return carries one signal key
+    per mode) and is skipped when it is.
+    """
+    if isinstance(result, tuple):
+        lifted = list(result)
+        for channel in channels:
+            if not isinstance(channel, int):
+                raise TypeError(f'stash channel {channel!r} does not address a tuple return value')
+            lifted[channel] = _stash_channel(lifted[channel])
+        return tuple(lifted)
+    if isinstance(result, dict):
+        for channel in channels:
+            if channel not in result:
+                continue
+            result[channel] = _stash_channel(result[channel])
+        return result
+    raise TypeError(f'stash requires a tuple or dict return value, got {type(result).__name__}')
+
+
 def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp_first'], Callable] = 'slice',
                     execute: Literal['first', 'peer', 'all'] = 'all',
                     collect: Union[Literal['none', 'flatten', 'mean', 'sum', 'first', 'last_pp'], Callable] = 'none',
@@ -531,7 +643,8 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                     exclusive: bool = False,
                     control: bool = False,
                     replay: bool = False,
-                    worker_selector: Optional[str] = None):
+                    worker_selector: Optional[str] = None,
+                    stash: Optional[Sequence[Union[int, str]]] = None):
     """Patch each method called from remote(which class should be decorated with `remote_class`) with this decorator.
 
     Args:
@@ -589,6 +702,13 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
             (configuration replay: template/adapter/patch setup).
         worker_selector: optional instance-method name returning the stable actor-ID subset for this
             call; the internal ``_worker_ids`` parameter, when passed explicitly, takes precedence.
+        stash: Return-value channels that stay references through the caller's collect -- the
+            standard mechanism for a mixed (light + heavy) multi-part return whose light half the
+            caller must read. Tuple channels are addressed by position (must exist), dict channels
+            by key (skipped when absent); a list channel is lifted element-wise, anything else
+            whole. The caller's collect then materialises only the rest of the container, and the
+            next remote call dereferences the stashed references at its worker. Local mode has no
+            remote path, so the natural value passes through untouched.
     """ # noqa
     if sticky and sticky_key is None:
         raise ValueError('remote_function(sticky=True) requires sticky_key (a field-path string or a callable).')
@@ -673,6 +793,12 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                             # call its Future semantics; in local mode the same return goes to the
                             # caller as-is, so both modes speak one contract with no probing.
                             result = result.result()
+                        if stash is not None:
+                            # Partial collect: lift the declared heavy channels to refs here, at the
+                            # value's birthplace, so the caller's collect materialises only the
+                            # light half. This branch exists solely on the worker path -- local
+                            # mode never reaches it, so no environment probing anywhere.
+                            result = _stash_channels(result, stash)
                         return result
                     else:
                         # This is the driver

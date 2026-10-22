@@ -154,8 +154,8 @@ class RLResourceEstimator:
     @staticmethod
     def _cluster_min_gpu_memory_gib() -> float:
         try:
-            import ray
-            resources = ray.cluster_resources() if ray.is_initialized() else {}
+            from twinkle.infra import cluster_resources
+            resources = cluster_resources()
             for key, value in resources.items():
                 if key.startswith('accelerator_memory_gib_'):
                     return float(value)

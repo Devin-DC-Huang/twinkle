@@ -8,15 +8,12 @@ sampler only drives vLLM's lifecycle RPCs.
 from __future__ import annotations
 
 import asyncio
-from typing import Any, TYPE_CHECKING
+from typing import Any
 
-from twinkle import Platform, remote_function
+from twinkle import Platform, alive_node_ids, kill_actors, remote_function, resolve_all, spawn_sidecar
 from ..config import (DeltaReceiverPlacement, DeltaSyncConfig, DeltaTransportEndpoint,
                      DeltaWorkerCapabilities, DeltaWorkerMetadata)
 from .cuda_receiver import CudaDeltaReceiver
-
-if TYPE_CHECKING:
-    from ray.actor import ActorHandle
 
 
 class DeltaSamplerMixin:
@@ -24,7 +21,7 @@ class DeltaSamplerMixin:
     _delta_config: DeltaSyncConfig
     _delta_job_failed: bool = False
     _delta_weight_transfer_initialized: bool = False
-    _delta_receivers: list[ActorHandle]
+    _delta_receivers: list[Any]
     _delta_device: str | None = None  # 'cuda' / 'npu', remembered by validate_delta_sampler
     _delta_tp: int | None = None  # NPU: TP size of this replica
     _delta_replica_rank: int | None = None  # NPU: this actor's data-parallel replica index
@@ -118,30 +115,16 @@ class DeltaSamplerMixin:
     def _delta_receiver_placements(
         self, metadata: list[DeltaWorkerMetadata], endpoint: DeltaTransportEndpoint,
     ) -> list[DeltaReceiverPlacement]:
-        import ray
-
         workers = endpoint['rollout_workers']
         ranks = {(item['node_ip'], item['device_uuid']): rank for rank, item in enumerate(workers, start=1)}
         if not metadata or any(item not in workers for item in metadata):
             raise ValueError('local vLLM workers are missing from the delta topology')
-        nodes = {node['NodeManagerAddress']: node['NodeID'] for node in ray.nodes() if node['Alive']}
+        nodes = alive_node_ids()
         return [dict(rank=ranks[item['node_ip'], item['device_uuid']], node_id=nodes[item['node_ip']],
                      device_uuid=item['device_uuid'],
                      cuda_visible_device=item.get('cuda_visible_device', item['device_uuid']),
                      zmq_handle=item['zmq_handle'])
                 for item in metadata]
-
-    def _spawn_delta_receiver(
-        self, actor, endpoint: DeltaTransportEndpoint, placement: DeltaReceiverPlacement,
-    ) -> ActorHandle:
-        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
-
-        return actor.options(
-            scheduling_strategy=NodeAffinitySchedulingStrategy(placement['node_id'], soft=False),
-            runtime_env={'env_vars': {
-                'CUDA_VISIBLE_DEVICES': placement.get('cuda_visible_device', placement['device_uuid']),
-                'RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES': '1',
-            }}).remote(self._delta_config, endpoint, placement)
 
     @remote_function(dispatch='all', lazy_collect=True)
     def init_delta_sampler_transport(self, endpoint: DeltaTransportEndpoint) -> None:
@@ -150,16 +133,19 @@ class DeltaSamplerMixin:
             self._delta_endpoint = endpoint
             self._delta_weight_transfer_initialized = False
             return
-        import ray
-
         metadata = self._run_in_loop(self._delta_rpc('delta_receiver_metadata'))
         placements = self._delta_receiver_placements(metadata, endpoint)
-        actor = ray.remote(num_cpus=0, num_gpus=0)(CudaDeltaReceiver)
-        self._delta_receivers = []
-        for placement in placements:
-            self._delta_receivers.append(self._spawn_delta_receiver(actor, endpoint, placement))
-        ray.get([receiver.ready.remote() for receiver in self._delta_receivers],
-                timeout=self._delta_config.timeout_seconds)
+        # One zero-resource sidecar per rollout device, pinned to its node with the device's
+        # CUDA context; the handle is driven below with plain .method.remote() calls.
+        self._delta_receivers = [
+            spawn_sidecar(
+                CudaDeltaReceiver, node_id=placement['node_id'],
+                env_vars={'CUDA_VISIBLE_DEVICES': placement.get('cuda_visible_device', placement['device_uuid']),
+                          'RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES': '1'},
+                args=(self._delta_config, endpoint, placement))
+            for placement in placements]
+        resolve_all([receiver.ready.remote() for receiver in self._delta_receivers],
+                    timeout=self._delta_config.timeout_seconds)
         self._delta_weight_transfer_initialized = False
 
     async def _next_delta_flush(self) -> dict[str, bool] | None:
@@ -240,8 +226,6 @@ class DeltaSamplerMixin:
 
     @remote_function(dispatch='all', lazy_collect=False)
     def close_delta_sampler(self) -> None:
-        import ray
-
         self.engine._delta_unavailable = True
         self._run_in_loop(self.engine.pause_delta_generation(self._delta_config.timeout_seconds))
         if self._delta_is_npu:
@@ -253,8 +237,8 @@ class DeltaSamplerMixin:
             return
         receivers = getattr(self, '_delta_receivers', [])
         try:
-            ray.get([receiver.close.remote() for receiver in receivers], timeout=self._delta_config.timeout_seconds)
+            resolve_all([receiver.close.remote() for receiver in receivers],
+                        timeout=self._delta_config.timeout_seconds)
         finally:
-            for receiver in receivers:
-                ray.kill(receiver, no_restart=True)
+            kill_actors(receivers)
             self._delta_receivers = []

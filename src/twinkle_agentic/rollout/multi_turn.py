@@ -367,8 +367,9 @@ class MultiTurnRollout(Rollout):
     of them absent is a single-turn sampling pass, and that is a supported way to
     use this rather than a degenerate one.
 
-    This drives the conversation itself; an agent program that drives its own
-    turns against an endpoint is a different rollout shape, not this one.
+    This drives the conversation itself. An agent that ships as its own program
+    cannot be driven this way and belongs in
+    :class:`~.external.ExternalRollout`.
 
     A supplied sampler must declare ``sample`` with ``enable_continous_work``.
     Without it, ``slice_dp`` spreads each single-request call over every worker
@@ -409,12 +410,7 @@ class MultiTurnRollout(Rollout):
         allow_partial_rollout: bool = False,
         tools_factory: Callable[[Any], tuple[Any, list[Any], Any]] | None = None,
         tools_config: Any = None,
-        remote_group: str | None = None,
     ):
-        # ``remote_group`` is consumed by the ``@remote_class`` wrapper that places this
-        # rollout on its own DeviceGroup (dev's disaggregated loop passes it); it is not
-        # rollout state. Older revisions omitted it from the signature, so the wrapper
-        # forwarded it into this __init__ and every disaggregated run raised TypeError.
         super().__init__()
         if isinstance(sampler, (API, APISampler)):
             if api is not None:
@@ -495,7 +491,9 @@ class MultiTurnRollout(Rollout):
         # that shapes messages each turn. The ledger still owns every token id;
         # the harness only reshapes the message view and this turn's tool
         # framing, so a framework agent (ms-agent, ...) can drive this loop
-        # locally without this class knowing which framework it is.
+        # locally without this class knowing which framework it is. This is the
+        # forward-tunnel alternative to ``ExternalRollout``'s reverse endpoint;
+        # both stay selectable and general.
         self.harness = harness
         # A LoRA directory on disk, forwarded to every sample call. Training syncs
         # its adapter into the sampler directly, but evaluating a saved one has no

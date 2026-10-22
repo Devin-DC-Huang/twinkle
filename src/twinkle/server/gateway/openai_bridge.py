@@ -9,9 +9,10 @@ server dependency — fully unit-testable in isolation.
 The response is OpenAI's shape and nothing else. Training on what an endpoint
 served needs the token ids the sampler emitted, not the text re-tokenized -- but
 that is not this gateway's job: a rollout that trains on an agent's own requests
-serves them itself, in the trainer's process, and reports each round through a
-callback. An extra field here would be a second, weaker way to do the same thing,
-over a hop that has already lost the sampler's own objects.
+serves them itself (``twinkle_agentic.rollout.PolicyEndpoint``), in the trainer's
+process, and reports each round through a callback. An extra field here would be a
+second, weaker way to do the same thing, over a hop that has already lost the
+sampler's own objects.
 """
 from __future__ import annotations
 

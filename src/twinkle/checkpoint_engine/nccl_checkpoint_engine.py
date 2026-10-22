@@ -152,8 +152,8 @@ class NCCLCheckpointEngine(CheckpointEngine):
 
     def _start_zmq_server(self):
         """Start ZMQ PUB server for metadata broadcast (master only)."""
-        import ray
-        self.ip = ray.util.get_node_ip_address().strip('[]')
+        from twinkle.infra import node_ip
+        self.ip = node_ip()
         self.listen_port = find_free_port()
         self.auth_key = generate_auth_key()  # 256-bit shared secret
 

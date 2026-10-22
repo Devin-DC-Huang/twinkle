@@ -86,8 +86,8 @@ class DeltaHCCLCheckpointEngine(DeltaSyncMixin, CheckpointEngine):
         if self.socket is None:
             ip = find_node_ip()
             if not ip:
-                import ray
-                ip = ray.util.get_node_ip_address().strip('[]')
+                from twinkle.infra import node_ip
+                ip = node_ip()
             self.ip = ip
             self.zmq_port = find_free_port()
             self.dist_port = find_free_port()
