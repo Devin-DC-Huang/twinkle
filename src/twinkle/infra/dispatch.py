@@ -12,7 +12,7 @@ from twinkle.utils import DeviceGroup, DeviceMesh, Platform, check_unsafe, get_l
 
 from .continuous_work import _WORKER_ASYNC_PREFIX, _cw_barrier, _cw_batch_len, _cw_register, _cw_unregister, \
     _get_workers, _make_worker_async_companion, _resolve_sticky_key, _run_continous_work, _select_workers, \
-    _sticky_bind, _sticky_lookup, get_worker_id
+    _sticky_bind, _sticky_lookup, _validate_cw_session_ids, get_worker_id
 
 logger = get_logger()
 
@@ -709,6 +709,13 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
             whole. The caller's collect then materialises only the rest of the container, and the
             next remote call dereferences the stashed references at its worker. Local mode has no
             remote path, so the natural value passes through untouched.
+
+    Wrapped continuous-work calls also accept ``_session_ids``, a list or tuple of
+    non-empty session strings (or ``None`` for ordinary load balancing), aligned
+    with the materialized list batch. This metadata stays on the driver. Bindings
+    are local to the driver and method, survive completed calls, and expire after
+    30 minutes idle. A bound worker outside the current eligible subset causes
+    rebinding. LazyCollect inputs and ``sync=True`` do not support this option.
     """ # noqa
     if sticky and sticky_key is None:
         raise ValueError('remote_function(sticky=True) requires sticky_key (a field-path string or a callable).')
@@ -740,6 +747,11 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                 device_mesh = getattr(self, 'device_mesh', None)
                 worker_ids = kwargs.pop('_worker_ids', None)
                 dispatch_context = kwargs.pop('_dispatch_context', None)
+                session_ids = kwargs.pop('_session_ids', None)
+                if session_ids is not None:
+                    if not enable_continous_work or sync:
+                        raise ValueError('_session_ids requires enable_continous_work=True and sync=False.')
+                    session_ids = _validate_cw_session_ids(session_ids, _cw_batch_len(args, kwargs))
                 # Sticky ownership: resolve the declared key once per call, on the driver only (the
                 # ownership table lives on the driver-side handler). A ``sticky`` call with an
                 # existing owner is pinned to that worker (request ownership); a ``control`` call
@@ -804,6 +816,10 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                         # This is the driver
                         from ._ray import RayHelper
 
+                        if session_ids is not None and RayHelper.has_ref(args, kwargs):
+                            raise ValueError(
+                                '_session_ids does not support LazyCollect inputs; materialize the batch first.')
+
                         # Resolve the effective ray.get timeout before choosing execute_method:
                         # the decorator's explicit value wins, the instance attribute is the
                         # fallback. ``is not None`` (not ``or``) so that a decorator ``timeout=0``
@@ -834,6 +850,8 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                             _subset = worker_ids is not None
                         _workers = _get_workers(_select_workers(self, selected_ids), execute)
                         if not _workers:
+                            if session_ids:
+                                raise RuntimeError('No sampler worker is available for sticky session routing.')
                             return []
                         if _subset and worker_selector is not None:
                             args, kwargs = self._normalize_sampling_args(args, kwargs)
@@ -858,11 +876,11 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                             assert not sync, (f'{func.__name__}: enable_continous_work cannot be used with sync=True, '
                                               'which exists for collectives that must run in lock step.')
                             _batch_len = _cw_batch_len(args, kwargs)
-                            if _batch_len:
+                            if _batch_len or session_ids is not None:
                                 return _run_continous_work(self, func.__name__, execute_method, _workers, args, kwargs,
                                                            _batch_len,
                                                            _rgt,
-                                                           on_dispatched=_finish_dispatch)
+                                                           on_dispatched=_finish_dispatch, session_ids=session_ids)
                         if RayHelper.has_ref(args, kwargs):
                             # If has any object-ref, dispatch in worker, because we don't know the structure in the ref.
                             # for example, dataloader returns any data list.

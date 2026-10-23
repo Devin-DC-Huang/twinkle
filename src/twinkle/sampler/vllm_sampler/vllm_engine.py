@@ -336,6 +336,7 @@ class VLLMEngine(BaseSamplerEngine):
             'dtype': self.dtype,
             'load_format': self.load_format,
             'disable_log_stats': True,
+            'enable_prefix_caching': self.enable_prefix_caching,
         }
 
         if self.tensor_parallel_size > 1:
@@ -346,9 +347,6 @@ class VLLMEngine(BaseSamplerEngine):
 
         if self.quantization is not None:
             engine_config['quantization'] = self.quantization
-
-        if self.enable_prefix_caching:
-            engine_config['enable_prefix_caching'] = True
 
         if self.enable_sleep_mode:
             engine_config['enable_sleep_mode'] = True

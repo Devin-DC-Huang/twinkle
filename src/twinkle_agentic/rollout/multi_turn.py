@@ -352,6 +352,11 @@ class MultiTurnRollout(Rollout):
         * ``tool_manager``: a single :class:`ToolManager` or a 1:1 list.
         * ``adapter_path`` / ``use_base_model``: see ``__init__``.
         * ``followup_fn``: see ``__init__``.
+        * ``sticky_session``: keep every turn of an episode on the same sampler
+          worker. Generate one session ID per episode when enabled.
+        * ``session_ids``: explicit per-trajectory session strings (or ``None``
+          for load balancing), aligned with the trajectory batch. Supplying them
+          also enables sticky routing. Requires a continuous-work sampler.
     """
 
     def __init__(
@@ -377,6 +382,7 @@ class MultiTurnRollout(Rollout):
         allow_partial_rollout: bool = False,
         tools_factory: Callable[[Any], tuple[Any, list[Any], Any]] | None = None,
         tools_config: Any = None,
+        sticky_session: bool = False,
     ):
         super().__init__()
         if isinstance(sampler, (API, APISampler)):
@@ -418,8 +424,11 @@ class MultiTurnRollout(Rollout):
             )
         if max_trajectory_tokens is not None and max_trajectory_tokens < 1:
             raise ValueError(f"max_trajectory_tokens must be >= 1 or None, got {max_trajectory_tokens}")
+        if sticky_session and not getattr(getattr(type(sampler), "sample", None), "_enable_continous_work", False):
+            raise ValueError("sticky_session requires a sampler with enable_continous_work=True.")
         self._init_common(max_turns=max_turns, sampling_params=sampling_params, concurrency=concurrency, tracer=tracer)
         self.sampler = sampler
+        self.sticky_session = sticky_session
         self.template = template
         self._template_backend = getattr(type(sampler), "template_backend", "vllm") if sampler is not None else "vllm"
         # No template -> account in messages, not tokens (see ``_new_ledger``).
@@ -842,9 +851,25 @@ class MultiTurnRollout(Rollout):
         response_callback = kwargs.get("response_callback", self.response_callback)
         if not callable(response_callback):
             raise TypeError("response_callback must be callable")
+        session_ids = kwargs.get("session_ids")
+        if kwargs.get("sticky_session", self.sticky_session) or session_ids is not None:
+            sample = getattr(type(self.sampler), "sample", None)
+            if not getattr(sample, "_enable_continous_work", False):
+                raise ValueError("sticky_session requires a sampler with enable_continous_work=True.")
+            if session_ids is None:
+                # Resolve once before launching episode threads, never once per turn.
+                session_ids = [uuid.uuid4().hex for _ in range(n)]
+            elif not isinstance(session_ids, (list, tuple)):
+                raise TypeError("session_ids must be a list or tuple aligned with trajectories.")
+            elif len(session_ids) != n:
+                raise ValueError(f"session_ids must contain {n} entries, got {len(session_ids)}.")
+            if any(sid is not None and (not isinstance(sid, str) or not sid) for sid in session_ids):
+                raise ValueError("session_ids entries must be non-empty strings or None.")
+            session_ids = tuple(session_ids)
         return {
             "sampling_params": sampling_params,
             "adapter_kwargs": adapter_kwargs,
+            "session_ids": session_ids,
             "response_callback": response_callback,
             "tool_managers": self._broadcast(kwargs.get("tool_manager", self.tool_manager), n, name="tool_manager"),
             "followup_fn": kwargs.get("followup_fn", self.followup_fn),
@@ -904,7 +929,11 @@ class MultiTurnRollout(Rollout):
     def _run_episode(self, trajectory: Trajectory, index: int, ctx: dict[str, Any], harness=None) -> Trajectory:
         tool_manager: ToolManager = ctx["tool_managers"][index]
         followup_fn = ctx["followup_fn"]
-        adapter_kwargs: dict[str, Any] = ctx["adapter_kwargs"]
+        # Each episode owns its metadata; mutating the shared dict would let
+        # concurrent episodes overwrite one another's session ID.
+        adapter_kwargs: dict[str, Any] = dict(ctx["adapter_kwargs"])
+        if ctx.get("session_ids") is not None:
+            adapter_kwargs["_session_ids"] = [ctx["session_ids"][index]]
         response_callback: ResponseCallback = ctx["response_callback"]
 
         # The token account for this episode. Every id the trajectory ends up
