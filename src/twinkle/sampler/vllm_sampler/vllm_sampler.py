@@ -434,6 +434,13 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin, DeltaSamp
             num_samples: Number of completions to generate per input prompt.
                 When > 1, returns num_samples sequences for each input.
 
+            _session_ids: Ray driver-only routing metadata accepted by the decorator:
+                one session string per input, or None for ordinary load balancing.
+                Repeated sessions reuse their worker; bindings expire after 30 minutes
+                idle or are replaced when their worker is no longer eligible. Session
+                IDs must be unique within this sampler handle (include tenant/adapter
+                identity when needed). Requires a materialized list batch.
+
         Returns:
             SampleResponse containing sampled sequences.
             Total sequences = len(inputs) * num_samples.
