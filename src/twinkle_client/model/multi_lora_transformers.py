@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 from twinkle.protocol.types import model as model_types
 from twinkle.protocol.types.component import DataRef
 from twinkle_client._request_builder import build_request
+from twinkle_client.exceptions import TwinkleHTTPError
 from twinkle_client.http import ClientTransport
 from twinkle_client.http.context import capture_transport
 
@@ -188,7 +189,13 @@ class MultiLoraTransformersModel:
         name = adapter_name or self.adapter_name
         with self._training_lock:
             training_id = self._training_ids.get(name)
-        self._submit('remove_adapter', model_types.AdapterRequest, None, adapter_name=name, training_id=training_id)
+        try:
+            self._submit('remove_adapter', model_types.AdapterRequest, None, adapter_name=name, training_id=training_id)
+        except TwinkleHTTPError as exc:
+            if exc.status_code != 404:
+                raise
+            # An expired or lost handle is unusable. Forget its local binding so
+            # this label can be recreated; unknown cleanup outcomes still raise.
         with self._training_lock:
             if self._training_ids.get(name) == training_id:
                 self._training_ids.pop(name, None)

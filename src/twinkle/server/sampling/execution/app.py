@@ -113,8 +113,10 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
         )
         self.sampler_type = sampler_type
         self.model_id = model_id
-        replica_context = serve.get_replica_context()
-        self.replica_id = context['instance_id'] if context is not None else replica_context.replica_id.unique_id
+        if context is not None:
+            self.replica_id = context.instance_id
+        else:
+            self.replica_id = serve.get_replica_context().replica_id.unique_id
 
         sampler_kwargs: dict[str, Any] = {
             'model_id': model_id,

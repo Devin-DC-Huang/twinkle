@@ -50,9 +50,10 @@ class DevicePool:
         import ray
         from ray.util.placement_group import placement_group
         candidates = [node for node in ray.nodes() if node.get('Alive') and node['Resources'].get(resource, 0) >= count]
-        available = ray.available_resources()
-        if not candidates or available.get(resource, 0) < count:
+        if not candidates:
             raise CapacityUnavailableError(f'No single-node allocation available for {count} {resource} devices')
+        # The aggregate free-resource snapshot can lag a confirmed group removal.
+        # pg.ready() is the allocation witness and is bounded by allocate().
         cpus = min(_gpu_placement_group_cpus(int(node['Resources'].get('CPU', 0)), count) for node in candidates)
         bundle = {resource: count, 'CPU': count if resource == 'CPU' else cpus}
         return placement_group([bundle], strategy='STRICT_PACK', name=name)

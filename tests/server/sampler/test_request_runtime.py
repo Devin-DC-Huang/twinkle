@@ -15,6 +15,40 @@ from twinkle.server.task_queue.types import ExecutionScope
 
 
 @pytest.mark.asyncio
+async def test_allocated_sampler_initializes_with_typed_owner_context(monkeypatch):
+    from unittest.mock import Mock
+    from twinkle.infra._ray.ray_helper import RayHelper
+    from twinkle.infra._ray.resource_manager import ResourceManager
+    from twinkle.server.sampling.execution import app as module
+    from twinkle.server.state.models import RuntimeContext
+
+    context = RuntimeContext(namespace='owned', registry_name='registry', instance_id='sampler-owned')
+    allocation = object()
+    manager = object()
+    allocate = Mock(return_value=manager)
+    sampler = SimpleNamespace()
+    monkeypatch.setenv('TWINKLE_RAY_NAMESPACE', 'before')
+    monkeypatch.setenv('TWINKLE_RAY_REGISTRY_NAME', 'before')
+    monkeypatch.setattr(RayHelper, 'resource_manager', None)
+    monkeypatch.setattr(ResourceManager, 'from_allocation', allocate)
+    monkeypatch.setattr(module, 'init_twinkle_runtime', lambda **kwargs: None)
+    monkeypatch.setattr(module, '_construct_sampler_backend', lambda *args: sampler)
+    monkeypatch.setattr(module.SamplerManagement, '_init_task_queue', lambda *args, **kwargs: None)
+    monkeypatch.setattr(module, 'get_server_state', lambda: SimpleNamespace())
+    monkeypatch.setattr(module.serve, 'get_replica_context', lambda: SimpleNamespace(
+        replica_id=SimpleNamespace(unique_id='serve-replica')))
+    owner = module.SamplerManagement.__new__(module.SamplerManagement)
+    await owner.__init__(
+        model_id='mock', nproc_per_node=1, device_group={'name': 'sampler', 'ranks': 1, 'device_type': 'cpu'},
+        device_mesh={'dp_size': 1}, sampler_type='mock', sampling_context=context,
+        placement_group=allocation, allocation_devices=['0'])
+    assert owner.replica_id == context.instance_id
+    assert RayHelper.resource_manager is manager
+    allocate.assert_called_once_with(owner.device_group, allocation, ['0'])
+    await owner.data_plane.close()
+
+
+@pytest.mark.asyncio
 async def test_worker_exports_actual_completion_handle_without_private_task_lookup():
     queue = _DummyQueue()
     queue._task_queue_config = TaskQueueConfig(execution_timeout=0.05)

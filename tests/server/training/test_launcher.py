@@ -1,5 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import socket
+import asyncio
+import threading
 import uuid
 
 import pytest
@@ -8,6 +10,56 @@ import ray
 from twinkle.server.config import ServerConfig
 from twinkle.server.launcher.server_launcher import ServerLauncher
 from twinkle.server.training.actor import controller_name
+
+
+def test_unresponsive_controller_does_not_block_other_cleanup():
+    @ray.remote(num_cpus=0)
+    class Controller:
+        def __init__(self):
+            self.entered = asyncio.Event()
+            self.resume = asyncio.Event()
+
+        async def shutdown(self):
+            self.entered.set()
+            await self.resume.wait()
+
+        async def wait_until_entered(self):
+            await self.entered.wait()
+
+        async def unblock(self):
+            self.resume.set()
+
+    controller = Controller.remote()
+    launcher = ServerLauncher(ServerConfig(resources={'shutdown_timeout_s': 0.3}))
+    launcher._training_controller = controller
+    finished = threading.Event()
+    errors, cleaned = [], []
+
+    def stop():
+        try:
+            launcher._run_cleanup([
+                ('blocked controller', launcher._stop_training_controller),
+                ('other owner', lambda: cleaned.append(True))], raise_errors=True)
+        except Exception as error:
+            errors.append(error)
+        finally:
+            finished.set()
+
+    worker = threading.Thread(target=stop)
+    # Ensure actor startup is outside the deadline under test.
+    ray.get(controller.__ray_ready__.remote(), timeout=10)
+    entered = controller.wait_until_entered.remote()
+    worker.start()
+    try:
+        ray.get(entered, timeout=10)
+        assert finished.wait(2), 'Controller shutdown exceeded its budget and blocked the next owner'
+        assert cleaned == [True]
+        assert len(errors) == 1 and isinstance(errors[0].__cause__, ray.exceptions.GetTimeoutError)
+    finally:
+        if not finished.is_set():
+            ray.get(controller.unblock.remote(), timeout=5)
+        worker.join(5)
+        ray.kill(controller, no_restart=True)
 
 
 def test_failed_initialization_does_not_leave_an_actor_that_blocks_a_retry():

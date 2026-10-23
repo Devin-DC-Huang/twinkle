@@ -9,8 +9,27 @@ import pytest
 from twinkle.server.resources.allocation import DevicePool
 
 
+def test_stale_resource_summary_does_not_reject_a_schedulable_group(monkeypatch):
+    import importlib
+    import ray
+    placement = importlib.import_module('ray.util.placement_group')
+    monkeypatch.setattr(ray, 'nodes', lambda: [{'Alive': True, 'Resources': {'CPU': 4, 'GPU': 2}}])
+    monkeypatch.setattr(ray, 'available_resources', lambda: {'CPU': 4})
+    created = []
+    group = object()
+
+    def create(bundles, **kwargs):
+        created.append((bundles, kwargs))
+        return group
+
+    monkeypatch.setattr(placement, 'placement_group', create)
+    assert DevicePool._create_group('GPU', 2, 'replacement') is group
+    assert created[0][0][0]['GPU'] == 2
+    assert created[0][1] == {'strategy': 'STRICT_PACK', 'name': 'replacement'}
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize('blocked', ['nodes', 'available_resources', 'placement_group'])
+@pytest.mark.parametrize('blocked', ['nodes', 'placement_group'])
 async def test_cancelled_allocation_keeps_late_creation_owned(monkeypatch, blocked):
     import importlib
     import ray
@@ -44,7 +63,6 @@ async def test_cancelled_allocation_keeps_late_creation_owned(monkeypatch, block
         return pg
 
     monkeypatch.setattr(ray, 'nodes', lambda: call('nodes', [{'Alive': True, 'Resources': {'CPU': 2}}]))
-    monkeypatch.setattr(ray, 'available_resources', lambda: call('available_resources', {'CPU': 2}))
     monkeypatch.setattr(placement, 'placement_group', create)
     monkeypatch.setattr(placement, 'get_placement_group', get)
     monkeypatch.setattr(placement, 'remove_placement_group', lambda group: removed.append(group))

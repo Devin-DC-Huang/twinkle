@@ -334,6 +334,45 @@ def test_unknown_training_rejected_before_handshake(monkeypatch):
     assert not calls
 
 
+def test_expired_handle_can_be_removed_and_recreated_on_same_object(monkeypatch):
+    from twinkle_client.exceptions import TwinkleHTTPError
+    from twinkle_client.model.multi_lora_transformers import MultiLoraTransformersModel
+    calls = []
+    _patch_transport(monkeypatch, calls, lambda url: _completed(None))
+    model = MultiLoraTransformersModel('base')
+    model.add_adapter_to_model('same', None)
+    submit = model._submit
+
+    def expired(*args, **kwargs):
+        raise TwinkleHTTPError('Training handle expired', status_code=404, error_code=404)
+
+    monkeypatch.setattr(model, '_submit', expired)
+    model.remove_adapter('same')
+    monkeypatch.setattr(model, '_submit', submit)
+    model.add_adapter_to_model('same', None)
+    model.zero_grad()
+    assert calls[-1][1]['training_id'] == model._training_ids['same']
+
+
+def test_failed_release_keeps_handle_when_outcome_is_unknown(monkeypatch):
+    import pytest
+    from twinkle_client.exceptions import TwinkleHTTPError
+    from twinkle_client.model.multi_lora_transformers import MultiLoraTransformersModel
+    calls = []
+    _patch_transport(monkeypatch, calls, lambda url: _completed(None))
+    model = MultiLoraTransformersModel('base')
+    model.add_adapter_to_model('same', None)
+    identity = model._training_ids['same']
+    for error in (TwinkleHTTPError('Unavailable', status_code=503), TimeoutError('ACK unknown')):
+        def failed(*args, **kwargs):
+            raise error
+        monkeypatch.setattr(model, '_submit', failed)
+        with pytest.raises(type(error)):
+            model.remove_adapter('same')
+        assert model._training_ids['same'] == identity
+        assert model.adapter_name == 'same'
+
+
 def test_sequence_and_handle_selection_are_object_local(monkeypatch):
     from twinkle_client.model.multi_lora_transformers import MultiLoraTransformersModel
     calls = []
