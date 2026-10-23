@@ -94,13 +94,13 @@ def test_resident_release_ack_after_worker_failure(tmp_path):
                                       'pp_size': 1 if backend == 'transformers' else 2},
                       'max_length': 512, 'idle_timeout_s': 3600,
                       'queue_config': {'execution_timeout': 600},
-                      'env_vars': {'TWINKLE_TRUST_REMOTE_CODE': '1', 'TWINKLE_FAIL_FAST': '0'}}},
+                      'env_vars': {'TWINKLE_TRUST_REMOTE_CODE': '1'}}},
         ],
     }
     (directory / 'server.json').write_text(json.dumps(raw, indent=2))
     os.environ.update(TWINKLE_STATE_RAY_NAMESPACE=namespace, TWINKLE_PERSISTENCE_MODE=persistence,
                       TWINKLE_DEFAULT_SAVE_DIR=str(directory / 'checkpoints'), TWINKLE_TRUST_REMOTE_CODE='1',
-                      TWINKLE_FAIL_FAST='0', TWINKLE_MODEL_ID_ALIASES=json.dumps({model_name: model}),
+                      TWINKLE_MODEL_ID_ALIASES=json.dumps({model_name: model}),
                       PYTHONPATH=os.pathsep.join((str(root / 'src'), str(root))))
     if managed:
         os.environ.update(TWINKLE_PERSISTENCE_REDIS_URL=managed.url, TWINKLE_PERSISTENCE_KEY_PREFIX=prefix)

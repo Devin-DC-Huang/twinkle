@@ -304,7 +304,7 @@ def main():
             app['args'] = {
                 **common, 'model_id': args.model, 'backend': args.backend, 'train_mode': 'lora',
                 'max_loras': 10, 'max_r': 32,
-                'env_vars': {'TWINKLE_FAIL_FAST': '0', 'TWINKLE_TRUST_REMOTE_CODE': '1'},
+                'env_vars': {'TWINKLE_TRUST_REMOTE_CODE': '1'},
             }
             app.pop('deployments', None)
             full_applications.append({
@@ -332,7 +332,6 @@ def main():
         'TWINKLE_MODEL_ID_ALIASES': json.dumps({model.name: model.model_id
                                               for model in config.training_config.models}),
         'TWINKLE_TRUST_REMOTE_CODE': '1',
-        'TWINKLE_FAIL_FAST': '0',
         'TWINKLE_TEST_GPU_E2E': '1',
         'TWINKLE_TEST_BACKEND': args.backend,
         'TWINKLE_SERVER_URL': f'http://127.0.0.1:{port}',
