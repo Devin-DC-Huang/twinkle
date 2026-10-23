@@ -7,15 +7,16 @@ from twinkle.server.resources.instances import InstanceLifecycle
 
 @pytest.mark.asyncio
 async def test_spawn_logs_exception_with_traceback(caplog, monkeypatch):
-    # The ``twinkle`` logger disables propagation, so attach caplog to the lifecycle logger directly.
+    # Capture one path regardless of the parent logger's runtime configuration.
     target = logging.getLogger('twinkle.server.resources.instances')
-    monkeypatch.setattr(target, 'handlers', [*target.handlers, caplog.handler])
+    monkeypatch.setattr(target, 'handlers', [caplog.handler])
+    monkeypatch.setattr(target, 'propagate', False)
     lifecycle = InstanceLifecycle('Training')
 
     async def broken():
         raise RuntimeError('background sentinel')
 
-    with caplog.at_level(logging.ERROR):
+    with caplog.at_level(logging.ERROR, logger=target.name):
         lifecycle.spawn(broken())
         await lifecycle.join()
     records = [record for record in caplog.records if record.getMessage() == 'Training background job failed']
@@ -28,7 +29,9 @@ async def test_spawn_logs_exception_with_traceback(caplog, monkeypatch):
 async def test_concurrent_close_shares_one_stop_and_retries_quarantine(caplog, monkeypatch):
     import asyncio
     target = logging.getLogger('twinkle.server.resources.instances')
-    monkeypatch.setattr(target, 'handlers', [*target.handlers, caplog.handler])
+    monkeypatch.setattr(target, 'handlers', [caplog.handler])
+    monkeypatch.setattr(target, 'propagate', False)
+    caplog.set_level(logging.WARNING, logger=target.name)
     lifecycle = InstanceLifecycle('test')
     entered, resume = asyncio.Event(), asyncio.Event()
     calls, events = [], []
