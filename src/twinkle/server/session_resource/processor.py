@@ -80,7 +80,7 @@ class ProcessorManagerMixin(SessionResourceMixin):
 
         ``_on_processor_expired`` is the supported extension point: the
         processor-domain name is kept deliberately so subclass authors override a
-        method named for processors rather than the generic base-class hook. It is
+        method named for processors rather than the generic base-class hook.
         """
         await self._on_processor_expired(resource_id)
 

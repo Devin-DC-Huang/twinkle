@@ -11,7 +11,7 @@ from tinker import types
 from typing import Any, List
 
 from twinkle import DeviceMesh, remote_function
-from twinkle.server.training.execution.tinker_datum import datum_to_input_feature, extract_rl_features_for_loss
+from twinkle.server.model.tinker_datum import datum_to_input_feature, extract_rl_features_for_loss
 from twinkle.server.validation.tinker_loss import validate_tinker_loss
 from twinkle.template import Template
 

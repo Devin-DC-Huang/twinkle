@@ -49,12 +49,6 @@ def test_exception_summary_falls_back_to_the_ray_error_itself():
     assert 'Model.step' in summary
 
 
-
-
-
-
-
-
 @pytest.mark.asyncio
 async def test_worker_stop_exits_when_wait_for_swallows_cancellation(monkeypatch):
     queue = _DummyQueue()

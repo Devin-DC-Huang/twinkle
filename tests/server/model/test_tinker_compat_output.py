@@ -3,7 +3,7 @@ import torch
 from tinker import types
 from unittest.mock import Mock
 
-from twinkle.server.training.execution.tinker_datum import extract_rl_features_for_loss
+from twinkle.server.model.tinker_datum import extract_rl_features_for_loss
 from twinkle.server.training.execution.backends.common import TwinkleCompatModelBase
 from twinkle.server.exceptions import RequestRejectedError
 

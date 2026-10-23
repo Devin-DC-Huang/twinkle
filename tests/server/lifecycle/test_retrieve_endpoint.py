@@ -17,10 +17,10 @@ from twinkle.server.gateway.twinkle_handlers import _register_gateway_twinkle_ro
 
 
 class _State:
+    """A fake ServerState whose get_future returns a fixed record (or None)."""
 
     async def assert_future_owner(self, request_id, token):
         return None
-    """A fake ServerState whose get_future returns a fixed record (or None)."""
 
     def __init__(self, record):
         self._record = record
