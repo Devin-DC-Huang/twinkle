@@ -25,8 +25,8 @@ from twinkle.protocol.serialize import deserialize_object
 from twinkle.server.checkpoint import create_checkpoint_manager
 from twinkle.server.exceptions import RequestRejectedError
 from twinkle.server.lifecycle.submit import backend_kwargs, input_metrics, run_submit, to_backend_inputs
-from twinkle.server.training.execution.data_plane_inputs import (data_plane_request_shape, merge_forward_kwargs,
-                                                                 resolve_data_plane_model_inputs, select_output_rows)
+from twinkle.server.model.data_plane_inputs import (data_plane_request_shape, merge_forward_kwargs,
+                                                    resolve_data_plane_model_inputs, select_output_rows)
 from twinkle.server.validation import BackendCapability
 from twinkle.utils.logger import get_logger
 

@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from twinkle.server.telemetry import metrics
-from twinkle.server.training.controller import TrainingController
+from twinkle.server.model.pool.controller import TrainingController
 from twinkle.server.telemetry.metrics import TrainingInstanceMetrics
 
 _ALLOWED_ATTRIBUTES = {'backend', 'mode', 'state', 'status', 'reason', 'device_type', 'resident'}
@@ -213,7 +213,7 @@ async def test_startup_and_shutdown_histograms_follow_real_attempts(fail_start):
 async def test_sweep_instruments_one_iteration_and_its_outcome(monkeypatch, failed):
     import asyncio
     from unittest.mock import AsyncMock, MagicMock
-    from twinkle.server.training.actor import TrainingControllerActor
+    from twinkle.server.model.pool.actor import TrainingControllerActor
 
     async def stop_after_iteration(delay):
         raise asyncio.CancelledError
@@ -221,7 +221,7 @@ async def test_sweep_instruments_one_iteration_and_its_outcome(monkeypatch, fail
     actor = SimpleNamespace(core=SimpleNamespace(sweep=AsyncMock(
         side_effect=RuntimeError('state unavailable') if failed else None)),
         config=SimpleNamespace(sweep_interval_s=5), _metrics=MagicMock())
-    monkeypatch.setattr('twinkle.server.training.actor.asyncio.sleep', stop_after_iteration)
+    monkeypatch.setattr('twinkle.server.model.pool.actor.asyncio.sleep', stop_after_iteration)
     with pytest.raises(asyncio.CancelledError):
         await TrainingControllerActor.__ray_metadata__.modified_class._sweep(actor)
     tags = {'status': 'error' if failed else 'success'}
@@ -236,7 +236,7 @@ async def test_driver_records_allocation_attempts(failed):
     from unittest.mock import AsyncMock, MagicMock
     from twinkle.server.config.training import TrainingConfig
     from twinkle.server.resources.allocation import DeviceAllocation
-    from twinkle.server.training.driver import RayInstanceDriver
+    from twinkle.server.model.pool.driver import RayInstanceDriver
 
     config = TrainingConfig(models=[{'name': 'tiny', 'model_id': 'tiny', 'backend': 'mock',
         'device_type': 'cpu', 'mode': 'full', 'config': {'num_devices': 1, 'device_mesh': {'device_type': 'cpu'}}}])

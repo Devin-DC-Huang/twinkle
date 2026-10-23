@@ -19,9 +19,9 @@ from twinkle.data_format import InputFeature, Trajectory
 from twinkle.infra import collect_tensor_dict
 from twinkle.model import MultiLoraTransformersModel, SpectralHybridTransformersModel
 from twinkle.model.transformers import TransformersModel
+from twinkle.server.model.backends.common import (TwinkleCompatModelBase, clean_metrics,
+                                                  collect_forward_backward_results, to_cpu_safe_output)
 from twinkle.server.model.tinker_datum import datum_to_input_feature, extract_rl_features_for_loss
-from twinkle.server.training.execution.backends.common import (TwinkleCompatModelBase, clean_metrics,
-                                                               collect_forward_backward_results, to_cpu_safe_output)
 
 
 class _TransformersTinkerCompatMixin(TwinkleCompatModelBase):

@@ -117,8 +117,8 @@ class ServerLauncher:
         import ray
         from ray import serve
 
-        from twinkle.server.sampling.actor import create_sampler_controller
-        from twinkle.server.sampling.router import build_sampler_router
+        from twinkle.server.sampler.pool.actor import create_sampler_controller
+        from twinkle.server.sampler.pool.router import build_sampler_router
         controller, options, pool_id = create_sampler_controller(app, self.ray_namespace,
                                                                  self.config.resources.model_dump(),
                                                                  build_worker_env_vars())
@@ -156,8 +156,8 @@ class ServerLauncher:
         import ray
         from ray import serve
 
-        from twinkle.server.training.actor import TrainingControllerActor, controller_name
-        from twinkle.server.training.router import build_training_router
+        from twinkle.server.model.pool.actor import TrainingControllerActor, controller_name
+        from twinkle.server.model.pool.router import build_training_router
         config = self.config.training_config
         controller = TrainingControllerActor.options(
             name=controller_name(self.ray_namespace),

@@ -49,7 +49,7 @@ def release_gate(actor, action):
 
 def worker_origin(actor):
     import twinkle
-    from twinkle.server.training import controller
+    from twinkle.server.model.pool import controller
     return {'python': sys.executable, 'twinkle': twinkle.__file__, 'controller': controller.__file__,
             'visible_devices': os.environ.get('CUDA_VISIBLE_DEVICES')}
 

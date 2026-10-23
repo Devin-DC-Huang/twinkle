@@ -9,7 +9,7 @@ name unchanged in LoRA mode. The inline forward/backward/step endpoints did this
 the ``*_from_data_plane`` endpoints originally passed the raw tenant name, so a
 full-mode data-plane request drove the wrong optimizer group.
 
-This guard fails if any ``self.call_backend(...)`` in ``training/execution/twinkle_handlers.py``
+This guard fails if any ``self.call_backend(...)`` in ``model/twinkle_handlers.py``
 passes ``adapter_name`` as the bare local (i.e. unmapped). Passing the raw name
 *positionally* (as ``add_adapter_to_model`` does when creating a tenant adapter)
 is intentionally not a keyword and is therefore not flagged.
@@ -21,7 +21,7 @@ import pathlib
 
 import twinkle
 
-_HANDLERS = pathlib.Path(twinkle.__file__).resolve().parent / 'server' / 'training' / 'execution' / 'twinkle_handlers.py'
+_HANDLERS = pathlib.Path(twinkle.__file__).resolve().parent / 'server' / 'model' / 'twinkle_handlers.py'
 
 
 def _is_call_backend(func: ast.AST) -> bool:

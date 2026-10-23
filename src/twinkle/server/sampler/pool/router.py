@@ -11,7 +11,7 @@ from twinkle.server.checkpoint import create_checkpoint_manager
 from twinkle.server.deployment import bind_deployment, build_deployment_app
 from twinkle.server.lifecycle.proxy import ForwardedRequest
 from twinkle.server.middleware.auth import get_token_from_request
-from twinkle.server.sampling.execution.weights import is_full_checkpoint
+from twinkle.server.sampler.weights import is_full_checkpoint
 from twinkle.server.state import get_server_state
 from .controller import sampler_controller_name
 

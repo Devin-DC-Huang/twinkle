@@ -13,15 +13,15 @@ _ROOT_COMPONENT = '__root__'
 # the same layer are independent and therefore may not import one another.
 _LAYERS = (
     frozenset({'exceptions'}),
-    frozenset({'config', 'middleware', 'model', 'runtime', 'task_errors', 'utils', 'validation'}),
+    frozenset({'config', 'middleware', 'model.tinker_datum', 'runtime', 'task_errors', 'utils', 'validation'}),
     frozenset({'telemetry'}),
     frozenset({'state'}),
     frozenset({'resources'}),
     frozenset({'deployment', 'lifecycle', 'session_resource'}),
     frozenset({'task_queue'}),
     frozenset({'checkpoint', 'data_plane'}),
-    frozenset({'gateway', 'training.execution', 'sampling.execution', 'processor'}),
-    frozenset({'sampling', 'training'}),
+    frozenset({'gateway', 'model', 'sampler', 'processor'}),
+    frozenset({'model.pool', 'sampler.pool'}),
     frozenset({'launcher'}),
     frozenset({'cli'}),
     frozenset({'__main__', _ROOT_COMPONENT}),
@@ -32,9 +32,9 @@ def _component(module: str) -> str:
     if module == _ROOT:
         return _ROOT_COMPONENT
     relative = module.removeprefix(f'{_ROOT}.')
-    for execution in ('training.execution', 'sampling.execution'):
-        if relative == execution or relative.startswith(execution + '.'):
-            return execution
+    for component in ('model.pool', 'sampler.pool', 'model.tinker_datum'):
+        if relative == component or relative.startswith(component + '.'):
+            return component
     return relative.split('.', 1)[0]
 
 
@@ -48,7 +48,7 @@ def test_lightweight_imports_do_not_load_runtime(statement):
     code = statement + '''
 import sys
 assert not any(name in sys.modules for name in (
-    'torch', 'ray', 'twinkle.server.launcher', 'twinkle.server.training.actor', 'twinkle.hub.hub'
+    'torch', 'ray', 'twinkle.server.launcher', 'twinkle.server.model.pool.actor', 'twinkle.hub.hub'
 )), sorted(sys.modules)
 '''
     result = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, timeout=60)
@@ -104,7 +104,7 @@ def test_server_components_form_declared_dag():
         f'invalid edges={violations}')
 
 
-@pytest.mark.parametrize('component', ['training', 'sampling'])
+@pytest.mark.parametrize('component', ['model.pool', 'sampler.pool'])
 def test_controller_import_does_not_load_ray_composition(component):
     code = f'''import twinkle.server.{component}.controller
 import sys

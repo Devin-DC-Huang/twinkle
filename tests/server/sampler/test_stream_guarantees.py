@@ -9,8 +9,8 @@ from unittest.mock import AsyncMock
 import pytest
 from fastapi import FastAPI
 
-from twinkle.server.sampling.execution.app import SamplerManagement
-from twinkle.server.sampling.execution.twinkle_handlers import _await_generation, _register_twinkle_sampler_routes, _stream_queue
+from twinkle.server.sampler.app import SamplerManagement
+from twinkle.server.sampler.twinkle_handlers import _await_generation, _register_twinkle_sampler_routes, _stream_queue
 
 
 class _BlockingQueue:
@@ -89,7 +89,7 @@ async def test_stream_timeout_returns_error_payload_and_closes_queue():
 class _GenerationService:
 
     def __init__(self) -> None:
-        from twinkle.server.sampling.execution.concurrency import SamplerConcurrency
+        from twinkle.server.sampler.concurrency import SamplerConcurrency
         self.sampling_guard = SamplerConcurrency()
         self.cancelled = False
         self.sampler = SimpleNamespace(

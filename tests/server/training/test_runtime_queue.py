@@ -9,7 +9,7 @@ import pytest
 
 from twinkle.server.config.task_queue import TaskQueueConfig
 from twinkle.server.task_queue import TaskQueueMixin
-from twinkle.server.training.execution.runtime import TrainingRuntime
+from twinkle.server.model.runtime import TrainingRuntime
 from twinkle.server.lifecycle.submit import submit_training_task
 from tests.server.training.helpers import create, setup
 

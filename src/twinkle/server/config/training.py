@@ -64,7 +64,7 @@ class ModelArgs(TrainingArguments, LoraArguments):
     """Args for the ``model`` deployment.
 
     The ``backend`` field selects the model implementation (transformers /
-    megatron / mock) — see ``training/execution/app.py`` for the dispatch site that picks
+    megatron / mock) — see ``model/app.py`` for the dispatch site that picks
     the runtime class based on this value.
     """
 

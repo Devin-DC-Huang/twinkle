@@ -16,10 +16,10 @@ from tinker import types as tinker_types
 from twinkle.data_format import SampledSequence, SampleResponse
 from twinkle.exceptions import FullWeightLoadError
 from twinkle.protocol.types import SampleRequest
-from twinkle.server.sampling.execution.app import SamplerManagement
-from twinkle.server.sampling.execution.concurrency import SamplerConcurrency
-from twinkle.server.sampling.execution.tinker_handlers import _register_tinker_sampler_routes
-from twinkle.server.sampling.execution.twinkle_handlers import _register_twinkle_sampler_routes
+from twinkle.server.sampler.app import SamplerManagement
+from twinkle.server.sampler.concurrency import SamplerConcurrency
+from twinkle.server.sampler.tinker_handlers import _register_tinker_sampler_routes
+from twinkle.server.sampler.twinkle_handlers import _register_twinkle_sampler_routes
 from twinkle.server.task_queue.backend_gate import BackendGate
 from twinkle.server.config.task_queue import TaskQueueConfig
 from twinkle.server.exceptions import BackendBusyError
@@ -166,7 +166,7 @@ async def make_service():
 
 @pytest.mark.asyncio
 async def test_standalone_checkpoint_load_waits_for_ordinary_sampling(make_service, tmp_path):
-    from twinkle.server.sampling.execution.weights import resolve_sampler_weights
+    from twinkle.server.sampler.weights import resolve_sampler_weights
     checkpoint = tmp_path / '2'
     checkpoint.mkdir()
     (checkpoint / 'model.safetensors').touch()
@@ -401,7 +401,7 @@ async def test_partial_checkpoint_failure_quarantines_changed_weights(make_servi
 
 @pytest.mark.asyncio
 async def test_completed_generation_failure_does_not_quarantine_replica(make_service):
-    from twinkle.server.sampling.execution.twinkle_handlers import _await_generation
+    from twinkle.server.sampler.twinkle_handlers import _await_generation
     service = make_service()
     service.sampler.get_generation_status = lambda _: {'status': 'failed', 'error': 'invalid input'}
     service.sampler.cancel_generation = lambda _: {'status': 'completed'}

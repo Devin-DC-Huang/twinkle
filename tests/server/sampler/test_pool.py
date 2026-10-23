@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from twinkle.server.config.application_spec import SamplerArgs
-from twinkle.server.sampling.controller import SamplerController
+from twinkle.server.sampler.pool.controller import SamplerController
 
 
 @pytest.fixture(scope='session', autouse=True)

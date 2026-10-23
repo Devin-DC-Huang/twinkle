@@ -10,7 +10,7 @@ from tests.server.state.fake_backend import FakeBackend
 from tests.server.training.helpers import settle
 from twinkle.hub import HubOperation
 from twinkle.server.state import ServerState
-from twinkle.server.training.router import TrainingRouter
+from twinkle.server.model.pool.router import TrainingRouter
 from twinkle.server.config.training import TrainingConfig
 
 
@@ -84,9 +84,9 @@ async def test_native_lora_admission_does_not_import_peft(monkeypatch, rank):
 
 def test_router_schemas_match_model_runtime_routes():
     from fastapi import FastAPI
-    from twinkle.server.training.execution.tinker_handlers import _register_model_tinker_routes
-    from twinkle.server.training.execution.twinkle_handlers import _register_model_twinkle_routes
-    from twinkle.server.training.router import NATIVE_REQUESTS, TINKER_REQUESTS
+    from twinkle.server.model.tinker_handlers import _register_model_tinker_routes
+    from twinkle.server.model.twinkle_handlers import _register_model_twinkle_routes
+    from twinkle.server.model.pool.router import NATIVE_REQUESTS, TINKER_REQUESTS
 
     app = FastAPI()
     _register_model_tinker_routes(app, lambda: None)

@@ -128,8 +128,8 @@ async def test_serve_handle_lookup_cannot_block_driver_deadlines(monkeypatch, ki
     from types import SimpleNamespace
     from ray import serve
     from twinkle.server.resources.runtime import RayRuntime
-    from twinkle.server.sampling.driver import SamplerDriver
-    from twinkle.server.training.driver import RayInstanceDriver
+    from twinkle.server.sampler.pool.driver import SamplerDriver
+    from twinkle.server.model.pool.driver import RayInstanceDriver
 
     entered, resume, returned = threading.Event(), threading.Event(), threading.Event()
 

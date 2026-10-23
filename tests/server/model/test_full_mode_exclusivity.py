@@ -13,7 +13,7 @@ from starlette.requests import Request
 from tests.server.state.fake_backend import FakeBackend
 from tests.server.training.helpers import request, setup
 from twinkle.server.config.training import TrainingConfig
-from twinkle.server.training.router import TrainingRouter
+from twinkle.server.model.pool.router import TrainingRouter
 
 
 async def _setup_full_instance():

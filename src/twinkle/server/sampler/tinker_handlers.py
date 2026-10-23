@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 from twinkle.data_format import SamplingParams
 from twinkle.server.checkpoint import create_checkpoint_manager
 from twinkle.server.exceptions import RequestRejectedError
-from twinkle.server.sampling.execution.weights import sample_with_weights
+from twinkle.server.sampler.weights import sample_with_weights
 from twinkle.utils.logger import get_logger
 from .runtime import request_execution_scope
 

@@ -8,7 +8,7 @@ from starlette.requests import Request
 
 import twinkle.protocol.types as types
 from twinkle.data_format import SampledSequence, SampleResponse
-from twinkle.server.sampling.execution.twinkle_handlers import (
+from twinkle.server.sampler.twinkle_handlers import (
     _register_twinkle_sampler_routes,
     _build_rollout_rows_and_tags,
 )
@@ -64,7 +64,7 @@ def test_async_sampler_rejects_group_id_count_mismatch() -> None:
 class _SamplerManagement:
 
     def __init__(self):
-        from twinkle.server.sampling.execution.concurrency import SamplerConcurrency
+        from twinkle.server.sampler.concurrency import SamplerConcurrency
         self.sampling_guard = SamplerConcurrency()
         self.sampler = self
         self.data_plane = self

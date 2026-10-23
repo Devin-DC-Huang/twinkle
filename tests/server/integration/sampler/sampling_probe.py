@@ -11,8 +11,8 @@ from ray.util import list_named_actors
 from ray.util.placement_group import placement_group_table
 
 from twinkle.server.config.application_spec import SamplerArgs
-from twinkle.server.sampling.controller import SamplerController
-from twinkle.server.sampling.driver import SamplerDriver
+from twinkle.server.sampler.pool.controller import SamplerController
+from twinkle.server.sampler.pool.driver import SamplerDriver
 
 
 async def run(namespace):

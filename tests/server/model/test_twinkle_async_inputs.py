@@ -5,8 +5,8 @@ from fastapi import FastAPI
 from starlette.requests import Request
 
 import twinkle.protocol.types as types
-from twinkle.server.training.execution.data_plane_inputs import model_result_rows
-from twinkle.server.training.execution.twinkle_handlers import _register_model_twinkle_routes
+from twinkle.server.model.data_plane_inputs import model_result_rows
+from twinkle.server.model.twinkle_handlers import _register_model_twinkle_routes
 
 
 def test_model_result_rows_keeps_one_output_row_per_sample() -> None:
@@ -161,8 +161,8 @@ async def test_save_forwards_backend_options_and_returns_public_path(
         monkeypatch, tmp_path, is_sampler, save_optimizer, full_mode):
     from pathlib import Path
     from twinkle.server.checkpoint.twinkle import TwinkleCheckpointManager, TwinkleTrainingRunManager
-    from twinkle.server.training.execution.app import ModelManagement
-    import twinkle.server.training.execution.twinkle_handlers as handlers
+    from twinkle.server.model.app import ModelManagement
+    import twinkle.server.model.twinkle_handlers as handlers
 
     class Management(_SchedulingManagement):
         is_full_mode = ModelManagement.is_full_mode
@@ -203,7 +203,7 @@ async def test_save_forwards_backend_options_and_returns_public_path(
 @pytest.mark.asyncio
 async def test_training_save_failure_does_not_publish_checkpoint(monkeypatch, tmp_path):
     from twinkle.server.checkpoint.twinkle import TwinkleCheckpointManager, TwinkleTrainingRunManager
-    import twinkle.server.training.execution.twinkle_handlers as handlers
+    import twinkle.server.model.twinkle_handlers as handlers
 
     class Management(_SchedulingManagement):
         def save(self, **kwargs):
@@ -234,7 +234,7 @@ async def test_training_save_failure_does_not_publish_checkpoint(monkeypatch, tm
 @pytest.mark.parametrize('local', [False, True], ids=['external', 'checkpoint-uri'])
 async def test_checkpoint_consumers_keep_backend_path_and_options(monkeypatch, tmp_path, operation, local):
     from unittest.mock import MagicMock
-    import twinkle.server.training.execution.twinkle_handlers as handlers
+    import twinkle.server.model.twinkle_handlers as handlers
     from twinkle.server.checkpoint.twinkle import TwinkleCheckpointManager, TwinkleTrainingRunManager
 
     monkeypatch.setattr('twinkle.server.checkpoint.training_run_manager.TWINKLE_DEFAULT_SAVE_DIR', str(tmp_path))

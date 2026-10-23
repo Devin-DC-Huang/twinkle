@@ -28,9 +28,9 @@ def get_builders() -> dict[str, Callable]:
     """
     from twinkle.server.data_plane import build_data_plane_app
     from twinkle.server.gateway import build_gateway_app
+    from twinkle.server.model import build_model_app
     from twinkle.server.processor import build_processor_app
-    from twinkle.server.sampling.execution import build_sampler_app
-    from twinkle.server.training.execution import build_model_app
+    from twinkle.server.sampler import build_sampler_app
 
     return {
         'build_gateway_app': build_gateway_app,

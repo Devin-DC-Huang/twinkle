@@ -11,8 +11,8 @@ from twinkle.server.state import ServerState
 from twinkle.server.state.backend.memory_backend import RayActorBackend
 from twinkle.server.state.training_records import CreateTraining
 from twinkle.server.task_queue import TaskQueueMixin
-from twinkle.server.training.controller import TrainingController
-from twinkle.server.training.execution.runtime import TrainingRuntime
+from twinkle.server.model.pool.controller import TrainingController
+from twinkle.server.model.runtime import TrainingRuntime
 
 
 class Clock:

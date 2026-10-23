@@ -9,7 +9,7 @@ import ray
 
 from twinkle.server.config import ServerConfig
 from twinkle.server.launcher.server_launcher import ServerLauncher
-from twinkle.server.training.actor import controller_name
+from twinkle.server.model.pool.actor import controller_name
 
 
 def test_unresponsive_controller_does_not_block_other_cleanup():

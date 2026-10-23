@@ -7,10 +7,10 @@ from types import SimpleNamespace
 import pytest
 
 from twinkle.loss.grpo import GRPOLoss
-from twinkle.server.training.execution.backends import common
-from twinkle.server.training.execution.backends.common import TwinkleCompatModelBase
-from twinkle.server.training.execution.backends.megatron_model import (TwinkleCompatFullMegatronModel, TwinkleCompatMegatronModel)
-from twinkle.server.training.execution.backends.transformers_model import (TwinkleCompatFullTransformersModel,
+from twinkle.server.model.backends import common
+from twinkle.server.model.backends.common import TwinkleCompatModelBase
+from twinkle.server.model.backends.megatron_model import (TwinkleCompatFullMegatronModel, TwinkleCompatMegatronModel)
+from twinkle.server.model.backends.transformers_model import (TwinkleCompatFullTransformersModel,
                                                               TwinkleCompatTransformersModel)
 
 

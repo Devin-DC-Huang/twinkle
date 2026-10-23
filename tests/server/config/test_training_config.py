@@ -223,7 +223,7 @@ def test_model_yaml_rejects_alternative_resource_and_mode_syntax(extra):
 def test_configured_options_reach_cpu_router_without_changing_yaml(monkeypatch):
     from types import SimpleNamespace
     from twinkle.server.launcher.server_launcher import ServerLauncher
-    from twinkle.server.training.actor import TrainingControllerActor
+    from twinkle.server.model.pool.actor import TrainingControllerActor
     import ray
     from ray import serve
     config = ServerConfig(applications=[configured_application()])
@@ -237,7 +237,7 @@ def test_configured_options_reach_cpu_router_without_changing_yaml(monkeypatch):
         captured.update(args[-1])
         return 'app'
 
-    monkeypatch.setattr('twinkle.server.training.router.build_training_router', router)
+    monkeypatch.setattr('twinkle.server.model.pool.router.build_training_router', router)
     monkeypatch.setattr(serve, 'run', lambda *args, **kwargs: None)
     ServerLauncher(config)._deploy_training()
     assert captured['max_ongoing_requests'] == 17
@@ -253,7 +253,7 @@ def test_configured_options_reach_cpu_router_without_changing_yaml(monkeypatch):
 async def test_configured_options_reach_runtime_with_one_controller_owned_replica(monkeypatch):
     import importlib
     from twinkle.server.state.training_records import InstanceRecord
-    from twinkle.server.training.driver import RayInstanceDriver
+    from twinkle.server.model.pool.driver import RayInstanceDriver
     from ray import serve
     config = ServerConfig(applications=[configured_application()])
     model = config.training_config.models[0]
@@ -266,7 +266,7 @@ async def test_configured_options_reach_runtime_with_one_controller_owned_replic
         captured.update(kwargs)
         return 'app'
 
-    monkeypatch.setattr('twinkle.server.training.execution.app.build_model_app', builder)
+    monkeypatch.setattr('twinkle.server.model.app.build_model_app', builder)
     monkeypatch.setattr(importlib.import_module('ray.util.placement_group'), 'get_placement_group', lambda name: 'pg')
     monkeypatch.setattr(serve, 'run', lambda *args, **kwargs: None)
     await driver.deploy(instance, driver.config.get(model.name, 'lora'))

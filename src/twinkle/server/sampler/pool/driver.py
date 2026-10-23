@@ -29,7 +29,7 @@ class SamplerDriver:
     async def start(self, instance):
         from ray.util.placement_group import get_placement_group
 
-        from twinkle.server.sampling.execution.app import build_sampler_app
+        from twinkle.server.sampler.app import build_sampler_app
         group = self.args.device_group
         device_type = str(group.get('device_type', 'cpu' if self.args.sampler_type == 'mock' else 'cuda')).lower()
         allocation = await self.runtime.pool.allocate(

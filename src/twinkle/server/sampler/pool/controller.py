@@ -20,7 +20,7 @@ from twinkle.server.config.application_spec import SamplerArgs
 from twinkle.server.config.resources import ResourceOptions
 from twinkle.server.exceptions import ResourceExhaustedError
 from twinkle.server.resources.instances import InstanceLifecycle
-from twinkle.server.sampling.execution.concurrency import SamplerConcurrency
+from twinkle.server.sampler.concurrency import SamplerConcurrency
 
 logger = logging.getLogger(__name__)
 _CONTROL_ENDPOINTS = frozenset(

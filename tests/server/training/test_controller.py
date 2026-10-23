@@ -11,7 +11,7 @@ from twinkle.server.config.training import TrainingConfig
 from twinkle.server.exceptions import RequestRejectedError, ResourceNotFoundError
 from twinkle.server.state import ServerState
 from twinkle.server.state.backend.memory_backend import RayActorBackend
-from twinkle.server.training.controller import TrainingController
+from twinkle.server.model.pool.controller import TrainingController
 from twinkle.server.exceptions import TrainingExpiredError
 from twinkle.server.resources.allocation import CapacityUnavailableError
 from twinkle.server.state.training_records import CreateTraining

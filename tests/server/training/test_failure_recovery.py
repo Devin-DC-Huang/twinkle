@@ -285,7 +285,7 @@ async def test_shutdown_waits_for_late_serve_deployment_before_confirming_releas
     from types import SimpleNamespace
     from twinkle.server.config.training import TrainingConfig
     from twinkle.server.state.training_records import InstanceRecord
-    from twinkle.server.training.driver import RayInstanceDriver
+    from twinkle.server.model.pool.driver import RayInstanceDriver
     from ray import serve
     config = TrainingConfig(models=[{'name': 'small', 'model_id': 'weights', 'backend': 'mock', 'device_type': 'cpu', 'mode': 'lora', 'config': {'num_devices': 1, 'device_mesh': {'dp_size': 1}}}])
     store = SimpleNamespace(models=SimpleNamespace(unregister_replica_capacity=AsyncMock()))
@@ -300,7 +300,7 @@ async def test_shutdown_waits_for_late_serve_deployment_before_confirming_releas
         if not release.wait(10):
             raise TimeoutError('test did not release Serve')
 
-    monkeypatch.setattr('twinkle.server.training.execution.app.build_model_app', lambda **kwargs: 'app')
+    monkeypatch.setattr('twinkle.server.model.app.build_model_app', lambda **kwargs: 'app')
     monkeypatch.setattr(importlib.import_module('ray.util.placement_group'), 'get_placement_group', lambda name: 'pg')
     monkeypatch.setattr('ray.util.list_named_actors', lambda **kwargs: [])
     monkeypatch.setattr(serve, 'run', deploy)

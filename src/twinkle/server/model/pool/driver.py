@@ -45,7 +45,7 @@ class RayInstanceDriver:
     async def deploy(self, instance, spec):
         from ray.util.placement_group import get_placement_group
 
-        from twinkle.server.training.execution.app import build_model_app
+        from twinkle.server.model.app import build_model_app
 
         name = self.application_name(instance)
         context = TrainingRuntimeContext(

@@ -507,8 +507,8 @@ def test_hybrid_rejects_client_owned_fft_and_target_parameter_config():
 
 
 def test_transformers_server_selects_hybrid_model_only_for_hybrid_train_mode(monkeypatch):
-    from twinkle.server.training.execution import app
-    from twinkle.server.training.execution.backends import transformers_model
+    from twinkle.server.model import app
+    from twinkle.server.model.backends import transformers_model
 
     class Regular:
 
@@ -535,7 +535,7 @@ def test_transformers_server_selects_hybrid_model_only_for_hybrid_train_mode(mon
 
 def test_hybrid_server_model_exposes_device_mesh_to_remote_class():
     from twinkle.infra import _get_device_mesh_param_name
-    from twinkle.server.training.execution.backends.transformers_model import TwinkleCompatSpectralHybridTransformersModel
+    from twinkle.server.model.backends.transformers_model import TwinkleCompatSpectralHybridTransformersModel
 
     assert _get_device_mesh_param_name(TwinkleCompatSpectralHybridTransformersModel.__init__) == 'device_mesh'
 
