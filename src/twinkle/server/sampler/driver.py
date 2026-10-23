@@ -55,27 +55,34 @@ class SamplerDriver:
         await self.runtime.deploy(instance.identity, allocation.name, app,
                                   f'/api/v1/sampling-runtime/{instance.identity}', lambda: self.shutdown(instance))
 
-    def handle(self, instance):
-        return self.runtime.handle(instance.application)
+    async def handle(self, instance):
+        return await self.runtime.handle(instance.application)
 
     async def invoke(self, instance, ticket, payload, stream_queue=None):
-        return await self.handle(instance).invoke.remote(ticket, payload, stream_queue)
+        handle = await self.handle(instance)
+        return await handle.invoke.remote(ticket, payload, stream_queue)
 
     async def wait_operation(self, instance, ticket):
-        await self.handle(instance).wait_operation.remote(ticket)
+        handle = await self.handle(instance)
+        await handle.wait_operation.remote(ticket)
 
     async def load_weights(self, instance, path):
-        await self.handle(instance).install_base_weights.remote(path)
+        handle = await self.handle(instance)
+        await handle.install_base_weights.remote(path)
 
     async def health(self, instance):
-        return await asyncio.wait_for(self.handle(instance).runtime_identity.remote(), 5)
+        async with asyncio.timeout(5):
+            handle = await self.handle(instance)
+            return await handle.runtime_identity.remote()
 
     async def shutdown(self, instance):
         name = instance.application or self.runtime.pool.name(f'sampling_{self.pool_id}_{instance.epoch}',
                                                               instance.identity)
         futures = []
         try:
-            futures = await asyncio.wait_for(self.handle(instance).pending_futures.remote(), 5)
+            async with asyncio.timeout(5):
+                handle = await self.handle(instance)
+                futures = await handle.pending_futures.remote()
         except Exception:
             pass
         await self.runtime.shutdown(instance.identity, name)

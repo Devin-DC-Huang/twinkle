@@ -86,18 +86,20 @@ class RayInstanceDriver:
         await self.runtime.deploy(instance.instance_id, name, app, f'/api/v1/training-runtime/{instance.instance_id}',
                                   lambda: self.shutdown(instance))
 
-    def handle(self, instance):
-        return self.runtime.handle(instance.application_name or self.application_name(instance))
+    async def handle(self, instance):
+        return await self.runtime.handle(instance.application_name or self.application_name(instance))
 
     async def create_training(self, instance, training, request):
-        await self.handle(instance).initialize_training.remote(training.model_dump(), request.model_dump())
+        handle = await self.handle(instance)
+        await handle.initialize_training.remote(training.model_dump(), request.model_dump())
 
     async def release_training(self, instance, training):
-        await self.handle(instance).release_training.remote(training.model_dump(), instance.resident
-                                                            and not instance.dirty)
+        handle = await self.handle(instance)
+        await handle.release_training.remote(training.model_dump(), instance.resident and not instance.dirty)
 
     async def verify_operation(self, instance, request_id):
-        return await self.handle(instance).verify_operation.remote(request_id)
+        handle = await self.handle(instance)
+        return await handle.verify_operation.remote(request_id)
 
     async def shutdown(self, instance: InstanceRecord):
         name = instance.application_name or self.application_name(instance)
@@ -115,7 +117,9 @@ class RayInstanceDriver:
         await self.store.state.unregister_replica_capacity(instance.instance_id)
 
     async def health(self, instance):
-        return await asyncio.wait_for(self.handle(instance).runtime_identity.remote(), 5)
+        async with asyncio.timeout(5):
+            handle = await self.handle(instance)
+            return await handle.runtime_identity.remote()
 
     async def recover_orphans(self):
         """Ownership names survive loss of the memory state actor."""

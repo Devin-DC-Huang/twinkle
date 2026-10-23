@@ -77,9 +77,15 @@ class RayRuntime:
             await asyncio.gather(*tuple(self.cleanup_tasks), return_exceptions=True)
 
     @staticmethod
-    def handle(name):
-        from ray import serve
-        return serve.get_app_handle(name)
+    async def handle(name):
+
+        def lookup():
+            from ray import serve
+            return serve.get_app_handle(name)
+
+        # get_app_handle waits synchronously for the Serve controller. Keep
+        # that RPC inside the caller's cancellable asynchronous deadline.
+        return await asyncio.to_thread(lookup)
 
     async def shutdown(self, identity, name, *, observe_removal=None):
         import ray
@@ -125,8 +131,10 @@ class RayRuntime:
         """Decode only this owner's names; never sweep another service's resources."""
         from ray import serve
         from ray.util.placement_group import placement_group_table
-        names = set(serve.status().applications)
-        names.update(row.get('name', '') for row in placement_group_table().values() if row.get('state') != 'REMOVED')
+        applications, groups = await asyncio.gather(
+            asyncio.to_thread(serve.status), asyncio.to_thread(placement_group_table))
+        names = set(applications.applications)
+        names.update(row.get('name', '') for row in groups.values() if row.get('state') != 'REMOVED')
         for name in sorted(names):
             instance = decode(name)
             if instance is not None:

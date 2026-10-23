@@ -120,3 +120,80 @@ async def test_shutdown_actor_lookup_cannot_block_the_close_deadline(monkeypatch
         resume.set()
         await asyncio.to_thread(returned.wait, 3)
         await lifecycle.join()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('kind', ['sampler', 'training'])
+async def test_serve_handle_lookup_cannot_block_driver_deadlines(monkeypatch, kind):
+    import threading
+    from types import SimpleNamespace
+    from ray import serve
+    from twinkle.server.resources.runtime import RayRuntime
+    from twinkle.server.sampler.driver import SamplerDriver
+    from twinkle.server.training.driver import RayInstanceDriver
+
+    entered, resume, returned = threading.Event(), threading.Event(), threading.Event()
+
+    def lookup(name):
+        entered.set()
+        try:
+            if not resume.wait(2):
+                raise TimeoutError('blocked Serve controller RPC')
+            raise RuntimeError('lookup released after cancellation')
+        finally:
+            returned.set()
+
+    monkeypatch.setattr(serve, 'get_app_handle', lookup)
+    driver_type = SamplerDriver if kind == 'sampler' else RayInstanceDriver
+    driver = driver_type.__new__(driver_type)
+    driver.runtime = RayRuntime('test', allocation_timeout=1, shutdown_timeout=1)
+    instance = SimpleNamespace(application='app', application_name='app')
+    operation = asyncio.create_task(driver.health(instance))
+    try:
+        assert await asyncio.to_thread(entered.wait, 3)
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(operation, .02)
+        assert not returned.is_set(), 'Serve handle lookup blocked the controller event loop'
+    finally:
+        resume.set()
+        await asyncio.gather(operation, return_exceptions=True)
+        await asyncio.to_thread(returned.wait, 3)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('kind', ['applications', 'placement_groups'])
+async def test_orphan_inventory_cannot_block_recovery_deadlines(monkeypatch, kind):
+    import threading
+    from types import SimpleNamespace
+    from ray import serve
+    from twinkle.server.resources.runtime import RayRuntime
+
+    # Import the module rather than ray.util's same-named public function.
+    import importlib
+    placement_module = importlib.import_module('ray.util.placement_group')
+    entered, resume, returned = threading.Event(), threading.Event(), threading.Event()
+
+    def inventory():
+        entered.set()
+        try:
+            if not resume.wait(2):
+                raise TimeoutError('blocked resource inventory RPC')
+            return SimpleNamespace(applications={}) if kind == 'applications' else {}
+        finally:
+            returned.set()
+
+    monkeypatch.setattr(
+        serve, 'status', inventory if kind == 'applications' else lambda: SimpleNamespace(applications={}))
+    monkeypatch.setattr(
+        placement_module, 'placement_group_table', inventory if kind == 'placement_groups' else lambda: {})
+    runtime = RayRuntime('test', allocation_timeout=1, shutdown_timeout=1)
+    operation = asyncio.create_task(runtime.recover_orphans(lambda name: None, None))
+    try:
+        assert await asyncio.to_thread(entered.wait, 3)
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(operation, .02)
+        assert not returned.is_set(), 'Resource inventory blocked the controller event loop'
+    finally:
+        resume.set()
+        await asyncio.gather(operation, return_exceptions=True)
+        await asyncio.to_thread(returned.wait, 3)
