@@ -12,7 +12,7 @@ from twinkle.server.exceptions import RequestRejectedError, ResourceNotFoundErro
 from twinkle.server.state import ServerState
 from twinkle.server.state.backend.memory_backend import RayActorBackend
 from twinkle.server.training.controller import TrainingController
-from twinkle.server.training.errors import TrainingExpiredError
+from twinkle.server.exceptions import TrainingExpiredError
 from twinkle.server.resources.allocation import CapacityUnavailableError
 from twinkle.server.state.training_records import CreateTraining
 
@@ -43,10 +43,8 @@ async def test_late_initializer_keeps_its_slot_reserved_until_serial_cleanup():
     active = await create(controller, state, 'active')
     raw = controller.config.model_dump()
     raw['startup_timeout_s'] = 0.03
-    raw['models'][0]['modes']['lora']['max_loras'] = 2
+    raw['models'][0]['config']['max_loras'] = 2
     controller.config = TrainingConfig.model_validate(raw)
-    from twinkle.server.training.catalog import TrainingCatalog
-    controller.catalog = TrainingCatalog(controller.config)
     entered, unblock = asyncio.Event(), asyncio.Event()
     original_create, original_release = runtime.create_training, runtime.release_training
     initializer = None
@@ -105,13 +103,11 @@ async def test_user_gets_full_initialization_window_after_base_model_startup():
 @pytest.mark.asyncio
 async def test_resident_rebuild_does_not_block_expiry_or_another_mode():
     from tests.server.state.fake_backend import FakeBackend
-    from twinkle.server.training.catalog import TrainingCatalog
     controller, state, runtime, clock = await setup(backend=FakeBackend())
     expired = await create(controller, state, 'expired-full', mode='full')
     raw = controller.config.model_dump()
-    raw['models'][0]['modes']['lora']['min_replicas'] = 1
+    raw['models'][0]['config']['min_replicas'] = 1
     controller.config = TrainingConfig.model_validate(raw)
-    controller.catalog = TrainingCatalog(controller.config)
     runtime.start_gate.clear()
     await asyncio.wait_for(controller.sweep(), 0.1)
     for _ in range(20):
@@ -158,41 +154,28 @@ async def test_reconciliation_of_committed_completion_does_not_extend_idle_time(
 
 
 @pytest.mark.asyncio
-async def test_legacy_session_and_max_lifetime_bounds_keep_their_original_meaning():
-    import time
-    from datetime import datetime, timezone
+async def test_old_creation_time_and_live_heartbeat_do_not_override_business_idle():
     from tests.server.state.fake_backend import FakeBackend
-    from twinkle.server.training.catalog import TrainingCatalog
     controller, state, runtime, clock = await setup(backend=FakeBackend())
-    raw = controller.config.model_dump()
-    raw['models'][0]['modes']['lora']['idle_timeout_s'] = None
-    raw['models'][0]['legacy_expiration'] = {'session_timeout_s': 30, 'max_lifetime_s': 36000}
-    controller.config = TrainingConfig.model_validate(raw)
-    controller.catalog = TrainingCatalog(controller.config)
-    identity = await create(controller, state, 'legacy')
-    clock.now = 1801
+    identity = await create(controller, state, 'idle-only')
+    controller.trainings[identity].created_at = '2000-01-01T00:00:00+00:00'
+    clock.now = 9
+    await state.touch_session('session')
+    await controller.sweep()
+    assert controller.trainings[identity].state == 'ACTIVE'
+    clock.now = 10
     await state.touch_session('session')
     await controller.sweep()
     await controller.wait_for_jobs()
-    assert controller.trainings[identity].state == 'ACTIVE'
-    controller.trainings[identity].created_at = datetime.fromtimestamp(time.time() - 36001, timezone.utc).isoformat()
-    await controller.sweep()
-    await controller.wait_for_jobs()
     assert controller.trainings[identity].state == 'EXPIRED'
-    second = await create(controller, state, 'stale-heartbeat')
-    session = await state._backend.get('session::session')
-    session['last_heartbeat'] = time.time() - 31
-    await state._backend.set('session::session', session)
-    await controller.sweep()
-    await controller.wait_for_jobs()
-    assert controller.trainings[second].state == 'EXPIRED'
+    assert not runtime.allocations
 
 
 @pytest.mark.asyncio
 async def test_lazy_queries_allocate_nothing():
     controller, state, runtime, _ = await setup()
     assert runtime.starts == 0
-    assert controller.catalog.get('small', 'full').capacity == 1
+    assert controller.config.get('small-full', 'full').capacity == 1
     with pytest.raises(ResourceNotFoundError):
         await controller.route('unknown', 'owner')
     assert not runtime.allocations
@@ -472,11 +455,9 @@ async def test_info_does_not_renew_and_expiry_wins_before_next_sweep():
 async def test_full_resident_cannot_accept_user_while_resetting():
     controller, state, runtime, _ = await setup()
     original = controller.config.model_dump()
-    original['models'][0]['modes']['full']['min_replicas'] = 1
-    original['models'][0]['modes']['full']['max_replicas'] = 1
+    original['models'][1]['config']['min_replicas'] = 1
+    original['models'][1]['config']['max_replicas'] = 1
     controller.config = TrainingConfig.model_validate(original)
-    from twinkle.server.training.catalog import TrainingCatalog
-    controller.catalog = TrainingCatalog(controller.config)
     await controller.sweep()
     await controller.wait_for_jobs()
     identity = await create(controller, state, 1, mode='full')
@@ -543,7 +524,7 @@ async def test_late_startup_result_cannot_publish_success(late_phase):
 async def test_failed_resident_startup_rolls_back_previously_loaded_residents():
     controller, state, runtime, clock = await setup(devices=2)
     raw = controller.config.model_dump()
-    raw['models'][0]['modes']['lora']['min_replicas'] = 2
+    raw['models'][0]['config']['min_replicas'] = 2
     replacement = TrainingController(TrainingConfig.model_validate(raw), state.create_training_store('unit'), runtime, clock=clock)
     with pytest.raises(CapacityUnavailableError):
         await replacement.initialize()
@@ -616,13 +597,13 @@ async def test_create_requires_its_own_atomic_start_ack(fault, monkeypatch):
 
         monkeypatch.setattr(controller.store, 'save_training', cancel_during_save)
     else:
-        start = state.try_start_future
+        start = state.futures.try_start
 
         async def lose_ack(request_id):
             assert await start(request_id)
             raise ConnectionError('start acknowledgement lost')
 
-        monkeypatch.setattr(state, 'try_start_future', lose_ack)
+        monkeypatch.setattr(state.futures, 'try_start', lose_ack)
     try:
         ref = await controller.create(request(fault))
         await controller.wait_for_jobs()
@@ -687,10 +668,8 @@ async def test_last_lora_release_does_not_report_unconfirmed_device_release():
 async def test_two_device_lora_capacity_shares_two_instances_and_releases_them():
     from tests.server.state.fake_backend import FakeBackend
     from twinkle.server.config import ServerConfig
-    from twinkle.server.training.catalog import TrainingCatalog
     controller, state, runtime, _ = await setup(backend=FakeBackend(), devices=4, quota=3)
     controller.config = ServerConfig.from_yaml('cookbook/client/server/megatron/server_config.yaml').training_config
-    controller.catalog = TrainingCatalog(controller.config)
     name = controller.config.models[0].name
     try:
         requests = [request(index, token=f'owner-{index // 3}').model_copy(update={'base_model': name})

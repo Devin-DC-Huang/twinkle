@@ -80,7 +80,7 @@ def test_resident_release_ack_after_worker_failure(tmp_path):
     model_name = 'Qwen/Qwen3.5-4B'
     raw = {
         'ray_namespace': namespace, 'http_options': {'host': '127.0.0.1', 'port': port},
-        'training': {'startup_timeout_s': 1800, 'shutdown_timeout_s': 180, 'sweep_interval_s': 1},
+        'resources': {'startup_timeout_s': 1800, 'shutdown_timeout_s': 180, 'sweep_interval_s': 1},
         'persistence': ({'mode': persistence, 'redis_url': managed.url, 'key_prefix': prefix}
                         if managed else {'mode': persistence}),
         'applications': [

@@ -72,8 +72,8 @@ async def exercise(model, directory, namespace, evidence):
     from ray.util.placement_group import placement_group_table
     from transformers import AutoTokenizer
     from twinkle.server.config.application_spec import SamplerArgs
-    from twinkle.server.sampler.controller import SamplerController
-    from twinkle.server.sampler.driver import SamplerDriver
+    from twinkle.server.sampling.controller import SamplerController
+    from twinkle.server.sampling.driver import SamplerDriver
     from twinkle.server.state import get_server_state
 
     args = SamplerArgs(model_id=str(model), sampler_type='vllm',

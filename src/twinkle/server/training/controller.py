@@ -8,32 +8,28 @@ import time
 import traceback
 import uuid
 from collections.abc import Callable
-from datetime import datetime
 from typing import Any, Protocol
 
-from twinkle.server.config.training import TrainingConfig
+from twinkle.server.config.training import TrainingConfig, TrainingModelConfig
 from twinkle.server.exceptions import (RequestRejectedError, ResourceExhaustedError, ResourceNotFoundError,
-                                       ResourceQuotaExceededError)
+                                       ResourceQuotaExceededError, TrainingExpiredError)
 from twinkle.server.resources.allocation import CapacityUnavailableError
 from twinkle.server.resources.instances import InstanceLifecycle
 from twinkle.server.state.models import FutureFailureRecord
 from twinkle.server.state.training_records import (LIVE_INSTANCES, TERMINAL_TRAINING, CreateTraining, InstanceRecord,
-                                                   TrainingRecord)
+                                                   RuntimeOwner, TrainingRecord, TrainingRoute)
 from twinkle.server.state.training_store import TrainingStore
-from twinkle.server.telemetry.metrics import get_training_metrics
-from twinkle.server.telemetry.training_metrics import TrainingInstanceMetrics, quarantine_reason
-from .catalog import TrainingCatalog, TrainingSpec
-from .errors import TrainingExpiredError
+from twinkle.server.telemetry.metrics import TrainingInstanceMetrics, TrainingInstanceSnapshot, get_training_metrics
 
 logger = logging.getLogger(__name__)
 
 
 class InstanceDriver(Protocol):
 
-    async def allocate(self, instance: InstanceRecord, spec: TrainingSpec) -> dict[str, Any]:
+    async def allocate(self, instance: InstanceRecord, spec: TrainingModelConfig) -> dict[str, Any]:
         ...
 
-    async def deploy(self, instance: InstanceRecord, spec: TrainingSpec) -> None:
+    async def deploy(self, instance: InstanceRecord, spec: TrainingModelConfig) -> None:
         ...
 
     async def create_training(self, instance: InstanceRecord, training: TrainingRecord,
@@ -80,7 +76,6 @@ class TrainingController:
                  *,
                  clock: Callable[[], float] = time.monotonic):
         self.config = config
-        self.catalog = TrainingCatalog(config)
         self.store = store
         self.driver = driver
         self.clock = clock
@@ -97,19 +92,27 @@ class TrainingController:
         self._instance_metrics = TrainingInstanceMetrics(self._metrics)
 
     def _instance_metric_tags(self, instance: InstanceRecord) -> dict[str, str]:
-        spec = self.catalog.get(instance.base_model, instance.mode)
+        spec = self.config.get(instance.base_model, instance.mode)
         return {
-            'backend': spec.model.backend,
+            'backend': spec.backend,
             'mode': instance.mode,
             'state': instance.state,
             'resident': str(instance.resident).lower(),
         }
 
     def _report_instance_metrics(self) -> None:
-        self._instance_metrics.report((self._instance_metric_tags(instance),
-                                       self.catalog.get(instance.base_model, instance.mode).model.device_type,
-                                       len(instance.devices), int(bool(instance.application_name)))
-                                      for instance in self.instances.values() if instance.state != 'STOPPED')
+        snapshots = []
+        for instance in self.instances.values():
+            if instance.state == 'STOPPED':
+                continue
+            model = self.config.get(instance.base_model, instance.mode)
+            snapshots.append(
+                TrainingInstanceSnapshot(
+                    **self._instance_metric_tags(instance),
+                    device_type=model.device_type,
+                    device_count=len(instance.devices),
+                    placement_group_count=int(bool(instance.application_name))))
+        self._instance_metrics.report(snapshots)
 
     async def initialize(self) -> None:
         """Discard old state only after owned compute has been confirmed dead."""
@@ -136,13 +139,13 @@ class TrainingController:
             training.terminal_reason = 'orphaned_replica'
             training.terminal_at = time.time()
             await self.store.retire(training)
-        await self.store.state.rebuild_model_indexes()
+        await self.store.models.rebuild_indexes()
         if old_controller:
-            await self.store.state.unregister_replica(old_controller['epoch'])
-        await self.store.state.register_replica(self.epoch, 0)
-        await self.store.state.touch_replica_last_seen(self.epoch)
+            await self.store.models.unregister_replica(old_controller['epoch'])
+        await self.store.models.register_replica(self.epoch, 0)
+        await self.store.models.touch_replica_last_seen(self.epoch)
         try:
-            for spec in self.catalog.specs():
+            for spec in self.config.models:
                 for _ in range(spec.config.min_replicas):
                     async with self._lock:
                         instance = await self._new_instance(spec, resident=True)
@@ -154,9 +157,9 @@ class TrainingController:
 
     @property
     def residents_ready(self) -> bool:
-        return all(self.residents_ready_for(spec) for spec in self.catalog.specs())
+        return all(self.residents_ready_for(spec) for spec in self.config.models)
 
-    def residents_ready_for(self, spec: TrainingSpec) -> bool:
+    def residents_ready_for(self, spec: TrainingModelConfig) -> bool:
         return sum(
             instance.resident and instance.instance_id not in self._failed_instances and (
                 instance.base_model, instance.mode) == spec.key and instance.state in ('READY', 'RESETTING')
@@ -188,14 +191,14 @@ class TrainingController:
         if not active or active['epoch'] != self.epoch:
             raise ResourceNotFoundError('Training controller epoch is no longer active')
 
-    async def _new_instance(self, spec: TrainingSpec, *, resident: bool = False) -> InstanceRecord:
+    async def _new_instance(self, spec: TrainingModelConfig, *, resident: bool = False) -> InstanceRecord:
         matching = [item for item in self.instances.values() if (item.base_model, item.mode) == spec.key]
         if not self.lifecycle.headroom(matching, spec.config.max_replicas):
             raise CapacityUnavailableError('Training replica limit reached')
         instance = InstanceRecord(
             instance_id='instance_' + uuid.uuid4().hex,
             controller_epoch=self.epoch,
-            base_model=spec.model.name,
+            base_model=spec.name,
             mode=spec.mode,
             resident=resident,
             startup_deadline=self.clock() + self.config.startup_timeout_s)
@@ -206,9 +209,9 @@ class TrainingController:
         return instance
 
     async def _start_instance(self, instance: InstanceRecord) -> None:
-        spec = self.catalog.get(instance.base_model, instance.mode)
+        spec = self.config.get(instance.base_model, instance.mode)
         started, status = time.monotonic(), 'error'
-        tags = {'backend': spec.model.backend, 'mode': spec.mode}
+        tags = {'backend': spec.backend, 'mode': spec.mode}
         try:
 
             async def startup():
@@ -246,7 +249,7 @@ class TrainingController:
         finally:
             self._metrics.startup_seconds.observe(time.monotonic() - started, tags={**tags, 'status': status})
 
-    def _select(self, spec: TrainingSpec) -> InstanceRecord | None:
+    def _select(self, spec: TrainingModelConfig) -> InstanceRecord | None:
         candidates = [
             instance for instance in self.instances.values()
             if instance.instance_id not in self._failed_instances and (instance.base_model, instance.mode) == spec.key
@@ -259,7 +262,7 @@ class TrainingController:
 
     async def create(self, request: CreateTraining) -> dict[str, str]:
         # Catalog/mode errors are rejected before a future or any resource exists.
-        spec = self.catalog.get(request.base_model, request.mode)
+        spec = self.config.get(request.base_model, request.mode)
         identity, fingerprint = self.store.create_identity(request)
         async with self._lock:
             await self._assert_epoch()
@@ -336,17 +339,17 @@ class TrainingController:
         try:
             await asyncio.shield(self.lifecycle.startups[instance.instance_id])
             async with self._lock:
-                future = await self.store.state.get_future(training.create_request_id)
-                if future and future['status'] == 'cancelled':
+                future = await self.store.futures.get(training.create_request_id)
+                if future and future.status == 'cancelled':
                     training.state = 'CLOSING'
                     training.terminal_reason = 'cancelled'
                 if training.state != 'PENDING' or instance.state != 'READY':
                     raise RequestRejectedError('Training creation is no longer pending')
                 training.creation_deadline = self.clock() + self.config.startup_timeout_s
                 await self.store.save_training(training)
-                if not await self.store.state.try_start_future(training.create_request_id):
-                    future = await self.store.state.get_future(training.create_request_id)
-                    if future and future['status'] == 'cancelled':
+                if not await self.store.futures.try_start(training.create_request_id):
+                    future = await self.store.futures.get(training.create_request_id)
+                    if future and future.status == 'cancelled':
                         training.terminal_reason = 'cancelled'
                     raise RequestRejectedError('Training creation did not acquire execution')
             remaining = training.creation_deadline - self.clock()
@@ -380,23 +383,14 @@ class TrainingController:
                 await self._cleanup_user(training)
 
     async def _expired(self, training: TrainingRecord) -> bool:
-        heartbeat = await self.store.state.get_session_last_heartbeat(training.session_id)
+        heartbeat = await self.store.sessions.get_last_heartbeat(training.session_id)
         return self._expired_with_heartbeat(training, heartbeat)
 
     def _expired_with_heartbeat(self, training: TrainingRecord, heartbeat: float | None) -> bool:
-        spec = self.catalog.get(training.base_model, training.mode)
-        config, legacy = spec.config, spec.model.legacy_expiration
+        spec = self.config.get(training.base_model, training.mode)
         if heartbeat is None:
             return True
-        if legacy is not None:
-            now = time.time()
-            if legacy.session_timeout_s is not None and now - heartbeat >= legacy.session_timeout_s:
-                return True
-            if legacy.max_lifetime_s is not None:
-                created_at = datetime.fromisoformat(training.created_at).timestamp()
-                if now - created_at >= legacy.max_lifetime_s:
-                    return True
-        return config.idle_timeout_s is not None and self.clock() - training.last_activity_at >= config.idle_timeout_s
+        return self.clock() - training.last_activity_at >= spec.config.idle_timeout_s
 
     async def _authorized(self, training_id: str, token: str, session_id: str | None) -> TrainingRecord:
         await self._assert_epoch()
@@ -408,7 +402,7 @@ class TrainingController:
             raise TrainingExpiredError('Training handle expired; create a new handle and explicitly load a checkpoint.')
         if training.state != 'ACTIVE' or training.instance_id in self._failed_instances:
             raise ResourceNotFoundError('Training handle is no longer active')
-        if await self.store.state.get_session_last_heartbeat(training.session_id) is None:
+        if await self.store.sessions.get_last_heartbeat(training.session_id) is None:
             raise TrainingExpiredError('Training session expired; create a new training handle')
         return training
 
@@ -418,7 +412,7 @@ class TrainingController:
                     session_id: str | None,
                     request_id: str,
                     *,
-                    renew: bool = True) -> dict[str, str]:
+                    renew: bool = True) -> RuntimeOwner:
         async with self._lock:
             training = await self._authorized(training_id, token, session_id)
             if not training.pending_operation_ids and await self._expired(training):
@@ -467,7 +461,7 @@ class TrainingController:
         if cleanup:
             self.lifecycle.spawn(self._cleanup_user(training))
 
-    async def route(self, training_id: str, token: str, session_id: str | None = None) -> dict[str, str]:
+    async def route(self, training_id: str, token: str, session_id: str | None = None) -> TrainingRoute:
         async with self._lock:
             training = await self._authorized(training_id, token, session_id)
             return {'instance_id': training.instance_id, 'base_model': training.base_model, 'epoch': self.epoch}
@@ -481,7 +475,7 @@ class TrainingController:
             cleanup = not training.pending_operation_ids
         if cleanup:
             await self._cleanup_user(training)
-        config = self.catalog.get(training.base_model, training.mode).config.queue_config
+        config = self.config.get(training.base_model, training.mode).config.queue_config
         deadline = asyncio.get_running_loop().time() + config.absolute_future_ttl(1) + self.config.shutdown_timeout_s
         while training.state == 'CLOSING' or self.instances[training.instance_id].state in ('DRAINING', 'QUARANTINED'):
             if self.instances[training.instance_id].state == 'QUARANTINED':
@@ -519,7 +513,7 @@ class TrainingController:
                 await self._close_instance(instance)
                 return
             try:
-                spec = self.catalog.get(training.base_model, training.mode)
+                spec = self.config.get(training.base_model, training.mode)
                 await asyncio.wait_for(
                     self.driver.release_training(instance, training),
                     spec.config.queue_config.absolute_future_ttl(spec.config.num_devices))
@@ -584,17 +578,20 @@ class TrainingController:
 
         async def quarantined(exc):
             async with self._lock:
+                entered_quarantine = instance.state != 'QUARANTINED'
                 quarantined = instance.model_copy(update={'state': 'QUARANTINED', 'failure': str(exc)})
                 await self.store.save_instance(quarantined)
                 instance.state = 'QUARANTINED'
                 instance.failure = str(exc)
                 self._report_instance_metrics()
                 tags = self._instance_metric_tags(instance)
-                self._metrics.quarantined_total.inc(tags={
-                    'backend': tags['backend'],
-                    'mode': tags['mode'],
-                    'reason': quarantine_reason(exc),
-                })
+                if entered_quarantine:
+                    self._metrics.quarantined_total.inc(
+                        tags={
+                            'backend': tags['backend'],
+                            'mode': tags['mode'],
+                            'reason': TrainingInstanceMetrics.quarantine_reason(exc),
+                        })
             self._metrics.shutdown_seconds.observe(time.monotonic() - started, tags={**timing_tags, 'status': 'error'})
 
         async def stopped():
@@ -687,7 +684,7 @@ class TrainingController:
             training.session_id
             for training in self.trainings.values() if training.state == 'ACTIVE' and not training.pending_operation_ids
         })
-        heartbeats = await self.store.state.get_session_last_heartbeats(session_ids)
+        heartbeats = await self.store.sessions.get_last_heartbeats(session_ids)
         async with self._lock:
             await self._assert_epoch()
             for training in self.trainings.values():
@@ -719,7 +716,7 @@ class TrainingController:
             elif instance.state in ('DRAINING', 'QUARANTINED'):
                 self.lifecycle.spawn(self._close_instance(instance))
         # Rebuilding one specification must not stop expiry or other models.
-        for spec in self.catalog.specs():
+        for spec in self.config.models:
             async with self._lock:
                 matching = [item for item in self.instances.values() if (item.base_model, item.mode) == spec.key]
                 missing = self.lifecycle.missing(
@@ -731,7 +728,7 @@ class TrainingController:
         # Terminal diagnostics expire like their backend tombstones. Repeated
         # model creation must not grow controller memory for the server lifetime.
         async with self._lock:
-            cutoff = time.time() - self.store.state.expiration_timeout
+            cutoff = time.time() - self.store.expiration_timeout
             for identity, training in list(self.trainings.items()):
                 if training.state in TERMINAL_TRAINING and training.terminal_at is not None:
                     if training.terminal_at <= cutoff:

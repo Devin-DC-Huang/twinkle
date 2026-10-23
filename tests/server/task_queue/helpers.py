@@ -2,6 +2,7 @@ from twinkle.server.config.task_queue import TaskQueueConfig
 from twinkle.server.task_queue.mixin import TaskQueueMixin
 from twinkle.server.task_queue.worker import ComputeWorker
 
+
 class _DummyState:
 
     def __init__(self):
@@ -30,12 +31,10 @@ class _DummyState:
         return self._latest.get(request_id)
 
 
-
 class _AllowingRateLimiter:
 
     async def check_and_record(self, token, input_tokens):
         return True, None
-
 
 
 class _DummyQueue(TaskQueueMixin):

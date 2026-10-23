@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import time
 from copy import deepcopy
 
-from twinkle.server.env_propagation import build_propagated_env_vars
+from twinkle.server.config.resources import build_worker_env_vars
+from twinkle.server.exceptions import ResourceReleaseError
 from .allocation import DevicePool
+from .instances import InstanceLifecycle
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +22,7 @@ class RayRuntime:
         self.namespace = namespace
         self.pool = DevicePool(namespace, allocation_timeout=allocation_timeout, shutdown_timeout=shutdown_timeout)
         self.deployments = {}
-        self.cleanup_tasks = set()
+        self.lifecycle = InstanceLifecycle('Ray deployment cleanup')
 
     def deployment_options(self, options, name, env_vars=None):
         options = deepcopy(options)
@@ -30,10 +31,7 @@ class RayRuntime:
         actor = options.setdefault('ray_actor_options', {})
         actor.setdefault('num_cpus', 0.1)
         runtime_env = actor.setdefault('runtime_env', {})
-        env = build_propagated_env_vars()
-        for key in ('PYTHONPATH', 'TWINKLE_DEFAULT_SAVE_DIR', 'TMPDIR', 'OMP_NUM_THREADS'):
-            if key in os.environ:
-                env.setdefault(key, os.environ[key])
+        env = build_worker_env_vars()
         env.update(runtime_env.get('env_vars', {}))
         env.update(env_vars or {})
         env.update(TWINKLE_RAY_NAMESPACE=self.namespace, TWINKLE_RAY_REGISTRY_NAME=name + '-registry')
@@ -49,32 +47,17 @@ class RayRuntime:
         except asyncio.CancelledError:
 
             async def clean_late():
-                try:
-                    await deployment
-                except Exception:
-                    pass
+                await asyncio.gather(deployment, return_exceptions=True)
                 await cleanup()
 
-            task = asyncio.create_task(clean_late())
-            self.cleanup_tasks.add(task)
-
-            def done(completed):
-                self.cleanup_tasks.discard(completed)
-                if not completed.cancelled():
-                    error = completed.exception()
-                    if error is not None:
-                        logger.error(
-                            'Late deployment cleanup failed', exc_info=(type(error), error, error.__traceback__))
-
-            task.add_done_callback(done)
+            self.lifecycle.spawn(clean_late())
             raise
         finally:
             if deployment.done():
                 self.deployments.pop(identity, None)
 
     async def wait_for_cleanup(self):
-        while self.cleanup_tasks:
-            await asyncio.gather(*tuple(self.cleanup_tasks), return_exceptions=True)
+        await self.lifecycle.join()
 
     @staticmethod
     async def handle(name):
@@ -93,10 +76,7 @@ class RayRuntime:
         from ray.util import list_named_actors
         deployment = self.deployments.get(identity)
         if deployment is not None:
-            try:
-                await asyncio.shield(deployment)
-            except Exception:
-                pass
+            await asyncio.gather(asyncio.shield(deployment), return_exceptions=True)
             self.deployments.pop(identity, None)
         # Both features give workers the controller identity, not a Serve replica ID.
         actors = []
@@ -113,6 +93,13 @@ class RayRuntime:
             actors.append(handle)
             await asyncio.to_thread(ray.kill, handle, no_restart=True)
         await asyncio.to_thread(serve.delete, name)
+        for handle in actors:
+            try:
+                await asyncio.wait_for(handle.__ray_ready__.remote(), 5)
+            except ray.exceptions.RayActorError:
+                continue
+            raise ResourceReleaseError('Owned worker death could not be confirmed', phase='worker_death')
+
         started, status = time.monotonic(), 'error'
         try:
             await self.pool.remove(name)
@@ -120,12 +107,6 @@ class RayRuntime:
         finally:
             if observe_removal is not None:
                 observe_removal(time.monotonic() - started, status)
-        for handle in actors:
-            try:
-                await asyncio.wait_for(handle.__ray_ready__.remote(), 5)
-            except ray.exceptions.RayActorError:
-                continue
-            raise RuntimeError('Owned worker death could not be confirmed')
 
     async def recover_orphans(self, decode, shutdown):
         """Decode only this owner's names; never sweep another service's resources."""

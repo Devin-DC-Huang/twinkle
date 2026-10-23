@@ -21,10 +21,10 @@ from typing import Any
 from twinkle.server.exceptions import ConfigParseError
 from .application_spec import ApplicationSpec, HttpOptions
 from .persistence import PersistenceConfig
+from .resources import ResourceOptions
 from .task_queue import TaskQueueConfig
 from .telemetry import TelemetryConfig
-from .training import TrainingConfig, TrainingOptions
-from .training_normalization import normalize_model_application
+from .training import TrainingConfig, TrainingModelConfig
 
 
 class ServerConfig(BaseModel):
@@ -38,7 +38,7 @@ class ServerConfig(BaseModel):
     telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
     persistence: PersistenceConfig = Field(default_factory=PersistenceConfig)
     task_queue: TaskQueueConfig = Field(default_factory=TaskQueueConfig)
-    training: TrainingOptions = Field(default_factory=TrainingOptions)
+    resources: ResourceOptions = Field(default_factory=ResourceOptions)
     applications: list[ApplicationSpec] = Field(default_factory=list)
 
     # ---- loading ---------------------------------------------------------- #
@@ -72,6 +72,8 @@ class ServerConfig(BaseModel):
 
     @model_validator(mode='after')
     def _validate_cross_field(self) -> ServerConfig:
+        if sum(app.import_path == 'server' for app in self.applications) > 1:
+            raise ValueError('configure one gateway per server')
         if self.persistence.mode == 'redis' and not self.persistence.redis_url:
             raise ValueError("persistence.redis_url is required when persistence.mode == 'redis'", )
         if self.training_config.models:
@@ -89,8 +91,10 @@ class ServerConfig(BaseModel):
     def training_config(self) -> TrainingConfig:
         """Normalize model application args into the internal runtime catalog."""
         return TrainingConfig(
-            **self.training.model_dump(),
-            models=[normalize_model_application(app) for app in self.applications if app.import_path == 'model'])
+            **self.resources.model_dump(),
+            models=[
+                TrainingModelConfig.from_application(app) for app in self.applications if app.import_path == 'model'
+            ])
 
     # ---- round-trip / serialization -------------------------------------- #
 

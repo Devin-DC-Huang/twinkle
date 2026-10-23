@@ -84,10 +84,9 @@ def test_generated_server_config_matches_launcher_schema(tmp_path, monkeypatch, 
     application = next(app for app in config.applications if app.import_path == 'model')
     assert application.args.train_mode == 'lora'
     model = config.training_config.models[0]
-    assert model.modes.full is None
-    assert model.modes.lora.min_replicas == 0 and model.modes.lora.max_replicas == 1
-    assert model.modes.lora.num_devices == 2 and model.modes.lora.idle_timeout_s == 600
-    assert model.legacy_expiration.session_timeout_s == 600
+    assert model.mode == 'lora'
+    assert model.config.min_replicas == 0 and model.config.max_replicas == 1
+    assert model.config.num_devices == 2 and model.config.idle_timeout_s == 600
     if samplers:
         sampler = next(app for app in config.applications if app.import_path == 'sampler')
         assert sampler.args.nproc_per_node == 4

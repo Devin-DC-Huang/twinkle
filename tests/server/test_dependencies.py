@@ -15,13 +15,13 @@ _LAYERS = (
     frozenset({'exceptions'}),
     frozenset({'config', 'middleware', 'runtime', 'task_errors', 'utils', 'validation'}),
     frozenset({'telemetry'}),
-    frozenset({'env_propagation', 'service_proxy', 'state'}),
+    frozenset({'state'}),
     frozenset({'resources'}),
     frozenset({'deployment', 'lifecycle', 'session_resource'}),
     frozenset({'task_queue'}),
     frozenset({'checkpoint', 'data_plane'}),
-    frozenset({'gateway', 'model', 'processor'}),
-    frozenset({'sampler', 'training'}),
+    frozenset({'gateway', 'training.execution', 'sampling.execution', 'processor'}),
+    frozenset({'sampling', 'training'}),
     frozenset({'launcher'}),
     frozenset({'cli'}),
     frozenset({'__main__', _ROOT_COMPONENT}),
@@ -31,7 +31,11 @@ _LAYERS = (
 def _component(module: str) -> str:
     if module == _ROOT:
         return _ROOT_COMPONENT
-    return module.removeprefix(f'{_ROOT}.').split('.', 1)[0]
+    relative = module.removeprefix(f'{_ROOT}.')
+    for execution in ('training.execution', 'sampling.execution'):
+        if relative == execution or relative.startswith(execution + '.'):
+            return execution
+    return relative.split('.', 1)[0]
 
 
 @pytest.mark.parametrize('statement', [
@@ -100,7 +104,7 @@ def test_server_components_form_declared_dag():
         f'invalid edges={violations}')
 
 
-@pytest.mark.parametrize('component', ['training', 'sampler'])
+@pytest.mark.parametrize('component', ['training', 'sampling'])
 def test_controller_import_does_not_load_ray_composition(component):
     code = f'''import twinkle.server.{component}.controller
 import sys

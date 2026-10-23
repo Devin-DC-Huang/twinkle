@@ -16,17 +16,15 @@ from twinkle.hub import HubOperation
 from twinkle.protocol.types import model as native
 from twinkle.server.checkpoint import _resolve_client_save_dir, create_checkpoint_manager, validate_user_path
 from twinkle.server.deployment import LazyCleanupMixin, bind_deployment, build_deployment_app
-from twinkle.server.exceptions import RequestRejectedError, ResourceNotFoundError
+from twinkle.server.exceptions import ProtocolMismatchError, RequestRejectedError, ResourceNotFoundError
 from twinkle.server.lifecycle.envelope import envelope_from_record
+from twinkle.server.lifecycle.proxy import ServiceProxy
 from twinkle.server.middleware.auth import get_session_id_from_request, get_token_from_request
-from twinkle.server.service_proxy import ServiceProxy
 from twinkle.server.state import get_server_state
 from twinkle.server.state.training_records import CreateTraining
 from twinkle.server.task_queue import TaskQueueMixin
 from twinkle.server.validation import assert_request_supported
 from .actor import controller_name
-from .catalog import TrainingCatalog
-from .errors import ProtocolMismatchError
 
 NATIVE_REQUESTS = {
     'forward': native.ForwardRequest,
@@ -75,7 +73,7 @@ TINKER_REQUESTS = {
 class TrainingRouter(TaskQueueMixin, LazyCleanupMixin):
 
     async def __init__(self, config, model, namespace, http_options):
-        self.catalog = TrainingCatalog(config)
+        self.config = config
         self.model = model
         self.backend = model.backend
         self.state = get_server_state()
@@ -126,7 +124,7 @@ class TrainingRouter(TaskQueueMixin, LazyCleanupMixin):
             except (ValueError, TypeError) as exc:
                 raise RequestRejectedError('Expected a serialized LoRA config') from exc
             mode = 'full' if config is None else 'lora'
-            spec = self.catalog.get(self.model.name, mode)
+            spec = self.config.get(self.model.name, mode)
             if config is not None:
                 rank = config.get('r') if isinstance(config, dict) else None
                 if (not isinstance(config, dict) or config.get('_TWINKLE_TYPE_') != 'LoraConfig'
@@ -167,8 +165,6 @@ class TrainingRouter(TaskQueueMixin, LazyCleanupMixin):
 
             ref = await self.schedule_background_task(upload, task_type=endpoint, token=token)
             return envelope_from_record(ref['request_id'], await self.state.get_future(ref['request_id']))
-        if not body.training_id:
-            raise ProtocolMismatchError('Upgrade Twinkle SDK: training_id is required')
         session = get_session_id_from_request(request)
         await self._check_session(session)
         if endpoint == 'remove_adapter':
@@ -193,7 +189,7 @@ class TrainingRouter(TaskQueueMixin, LazyCleanupMixin):
             if body.base_model != self.model.name:
                 raise RequestRejectedError('Model does not match the catalog endpoint')
             mode = 'lora' if body.lora_config is not None else 'full'
-            spec = self.catalog.get(self.model.name, mode)
+            spec = self.config.get(self.model.name, mode)
             if body.lora_config is not None and not 0 < body.lora_config.rank <= spec.config.max_r:
                 raise RequestRejectedError('LoRA rank exceeds the training specification')
             await self._check_session(body.session_id)

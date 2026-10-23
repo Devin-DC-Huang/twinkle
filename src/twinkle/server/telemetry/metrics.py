@@ -17,9 +17,11 @@ for the life of the process.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pydantic import BaseModel, ConfigDict
 from typing import Any
 
+from twinkle.server.exceptions import ResourceReleaseError
 from .provider import get_meter
 
 try:
@@ -224,7 +226,8 @@ class MetricsRegistry:
             description='Placement group removal duration',
             unit='s')
         self.training_quarantined_total = meter.create_counter(
-            'twinkle.training.quarantined.total', description='Training instances quarantined during cleanup')
+            'twinkle.training.quarantined.total',
+            description='Transitions to quarantine during cleanup; retries in quarantine are excluded')
         self.training_sweep_total = meter.create_counter(
             'twinkle.training.sweep.total', description='Training lifecycle sweep runs by status')
         self.training_sweep_seconds = meter.create_histogram(
@@ -373,3 +376,52 @@ def get_training_metrics() -> TrainingMetrics:
 def get_state_backend_metrics() -> StateBackendMetrics:
     """Return persistent state backend metric adapters."""
     return MetricsRegistry.get().state_backend_metrics()
+
+
+@dataclass(frozen=True)
+class TrainingInstanceSnapshot:
+    """Known resource ownership, including draining/quarantined instances."""
+
+    backend: str
+    mode: str
+    state: str
+    resident: str
+    device_type: str
+    device_count: int
+    placement_group_count: int
+
+
+class TrainingInstanceMetrics:
+    """Aggregate snapshots and clear retired label sets; never own scheduling state."""
+
+    def __init__(self, metrics: TrainingMetrics):
+        self.metrics = metrics
+        self._instance_keys = set()
+        self._resource_keys = set()
+
+    def report(self, snapshots):
+        counts, resources = {}, {}
+        for snapshot in snapshots:
+            key = snapshot.backend, snapshot.mode, snapshot.state, snapshot.resident
+            counts[key] = counts.get(key, 0) + 1
+            resource_key = snapshot.backend, snapshot.mode, snapshot.device_type
+            devices, groups = resources.get(resource_key, (0, 0))
+            resources[resource_key] = devices + snapshot.device_count, groups + snapshot.placement_group_count
+        for key in self._instance_keys | counts.keys():
+            tags = dict(zip(('backend', 'mode', 'state', 'resident'), key))
+            self.metrics.instances_active.set(counts.get(key, 0), tags=tags)
+        for key in self._resource_keys | resources.keys():
+            tags = dict(zip(('backend', 'mode', 'device_type'), key))
+            devices, groups = resources.get(key, (0, 0))
+            self.metrics.devices_allocated.set(devices, tags=tags)
+            self.metrics.placement_groups_active.set(groups, tags=tags)
+        self._instance_keys = set(counts)
+        self._resource_keys = set(resources)
+
+    @staticmethod
+    def quarantine_reason(exc: Exception) -> str:
+        if isinstance(exc, TimeoutError):
+            return 'timeout'
+        if isinstance(exc, ResourceReleaseError):
+            return exc.phase
+        return 'other'

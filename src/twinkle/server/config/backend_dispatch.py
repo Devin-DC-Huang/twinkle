@@ -5,7 +5,7 @@ The Model backend selector (``mock | transformers | megatron``) and the Sampler
 type selector (``mock | vllm | torch``) share one validate-then-dispatch shape.
 ``BackendSelector`` expresses it once, parameterized by the permitted value set
 and the per-value construction callbacks. The callbacks stay defined in
-``model/app.py`` and ``sampler/app.py`` so the lazy backend imports remain local
+``training/execution/app.py`` and ``sampling/execution/app.py`` so the lazy backend imports remain local
 — importing the mock backend on a CPU-only host must not pull in
 torch/vllm/megatron.
 """

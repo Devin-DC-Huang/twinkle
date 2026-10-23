@@ -11,7 +11,7 @@ from tests.server.training.helpers import create, request, setup
 from tests.server.training.helpers import RPC, RuntimeQueue, settle
 from twinkle.protocol.types.errors import ErrorCategory
 from twinkle.server.exceptions import ResourceExhaustedError, ResourceNotFoundError
-from twinkle.server.state.models import FAILURE_REASON_CODES, FutureFailureRecord
+from twinkle.server.state.models import FutureFailureRecord
 
 
 async def wait_idle(queue):
@@ -41,14 +41,14 @@ async def test_warm_idle_worker_wakes_after_enqueue_failure(monkeypatch):
         await settle(state, warmup['request_id'])
         await wait_idle(queue)
         executed.clear()
-        previous = state.store_future_status
+        previous = state.futures.store_status
 
         async def broken(request_id, status, *args, **kwargs):
             if status == 'queued':
                 raise RuntimeError('injected queued write failure')
             return await previous(request_id, status, *args, **kwargs)
 
-        monkeypatch.setattr(state, 'store_future_status', broken)
+        monkeypatch.setattr(state.futures, 'store_status', broken)
         with pytest.raises(RuntimeError, match='queued write'):
             await queue.schedule_task(operation, model_id=identity, token='owner', task_type='step',
                                       request_id='queued-failure')
@@ -227,13 +227,12 @@ async def test_cleanup_error_is_not_classified_as_startup_failure():
 
 
 @pytest.mark.asyncio
-async def test_unready_service_is_503_server_and_reason_sets_have_no_dead_codes():
+async def test_unready_service_is_503_server():
     controller, _, _, _ = await setup(backend=FakeBackend())
     controller._ready = False
     with pytest.raises(ResourceExhaustedError) as error:
         await controller.create(request('unready'))
     assert error.value.error_code == 503 and error.value.category is ErrorCategory.Server
-    assert not {'protocol_mismatch', 'training_expired'} & FAILURE_REASON_CODES
     await controller.shutdown()
 
 
@@ -242,14 +241,14 @@ async def test_sweep_heartbeat_io_does_not_hold_route_lock(monkeypatch):
     controller, state, _, _ = await setup(backend=FakeBackend())
     identity = await create(controller, state, 'slow-heartbeat')
     entered, resume = asyncio.Event(), asyncio.Event()
-    original = state.get_session_last_heartbeats
+    original = state.sessions.get_last_heartbeats
 
     async def slow(identities):
         entered.set()
         await resume.wait()
         return await original(identities)
 
-    monkeypatch.setattr(state, 'get_session_last_heartbeats', slow)
+    monkeypatch.setattr(state.sessions, 'get_last_heartbeats', slow)
     sweeping = asyncio.create_task(controller.sweep())
     try:
         await entered.wait()
@@ -263,19 +262,18 @@ async def test_sweep_heartbeat_io_does_not_hold_route_lock(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_explicit_tinker_request_id_is_preserved():
-    from twinkle.server.model.managed_runtime import _tinker_operation
+    from twinkle.server.lifecycle.submit import submit_training_task
     controller, state, _, _ = await setup(backend=FakeBackend())
     identity = await create(controller, state, 'explicit-id')
     instance = controller.instances[controller.trainings[identity].instance_id]
     queue = RuntimeQueue(controller, state, instance)
-    context = _tinker_operation.set((identity, 10))
     try:
-        ref = await queue.schedule_task(AsyncMock(return_value='ok'), model_id=identity, token='owner',
+        ref = await submit_training_task(queue, AsyncMock(return_value='ok'), training_id=identity, seq_id=10,
+                                        stream='tinker::step', token='owner',
                                         task_type='step', request_id='explicit-id')
         assert ref['request_id'] == 'explicit-id'
         assert (await settle(state, 'explicit-id'))['status'] == 'completed'
     finally:
-        _tinker_operation.reset(context)
         await queue.shutdown_task_queue()
         await controller.shutdown()
 
@@ -289,11 +287,8 @@ async def test_shutdown_waits_for_late_serve_deployment_before_confirming_releas
     from twinkle.server.state.training_records import InstanceRecord
     from twinkle.server.training.driver import RayInstanceDriver
     from ray import serve
-    config = TrainingConfig(models=[{
-        'name': 'small', 'model_id': 'weights', 'backend': 'mock', 'device_type': 'cpu',
-        'modes': {'lora': {'num_devices': 1, 'device_mesh': {'dp_size': 1}}}
-    }])
-    store = SimpleNamespace(state=SimpleNamespace(unregister_replica_capacity=AsyncMock()))
+    config = TrainingConfig(models=[{'name': 'small', 'model_id': 'weights', 'backend': 'mock', 'device_type': 'cpu', 'mode': 'lora', 'config': {'num_devices': 1, 'device_mesh': {'dp_size': 1}}}])
+    store = SimpleNamespace(models=SimpleNamespace(unregister_replica_capacity=AsyncMock()))
     driver = RayInstanceDriver(config, store, 'test-late', 'controller')
     instance = InstanceRecord(instance_id='instance', controller_epoch='epoch', base_model='small',
                               mode='lora', startup_deadline=0)
@@ -305,13 +300,13 @@ async def test_shutdown_waits_for_late_serve_deployment_before_confirming_releas
         if not release.wait(10):
             raise TimeoutError('test did not release Serve')
 
-    monkeypatch.setattr('twinkle.server.model.app.build_model_app', lambda **kwargs: 'app')
+    monkeypatch.setattr('twinkle.server.training.execution.app.build_model_app', lambda **kwargs: 'app')
     monkeypatch.setattr(importlib.import_module('ray.util.placement_group'), 'get_placement_group', lambda name: 'pg')
     monkeypatch.setattr('ray.util.list_named_actors', lambda **kwargs: [])
     monkeypatch.setattr(serve, 'run', deploy)
     monkeypatch.setattr(serve, 'delete', lambda name: None)
     monkeypatch.setattr(driver.runtime.pool, 'remove', remove)
-    deploying = asyncio.create_task(driver.deploy(instance, driver._catalog.get('small', 'lora')))
+    deploying = asyncio.create_task(driver.deploy(instance, driver.config.get('small', 'lora')))
     closing = None
     try:
         assert await asyncio.to_thread(entered.wait, 2)
@@ -321,15 +316,15 @@ async def test_shutdown_waits_for_late_serve_deployment_before_confirming_releas
         await asyncio.sleep(0.01)
         assert not closing.done()
         remove.assert_not_awaited()
-        store.state.unregister_replica_capacity.assert_not_awaited()
+        store.models.unregister_replica_capacity.assert_not_awaited()
     finally:
         release.set()
         await asyncio.gather(deploying, return_exceptions=True)
         if closing is not None:
             await closing
         await driver.runtime.wait_for_cleanup()
-    assert not driver.runtime.deployments and not driver.runtime.cleanup_tasks
-    store.state.unregister_replica_capacity.assert_awaited()
+    assert not driver.runtime.deployments and not driver.runtime.lifecycle.jobs
+    store.models.unregister_replica_capacity.assert_awaited()
 
 
 @pytest.mark.asyncio
@@ -338,7 +333,7 @@ async def test_capacity_unregister_does_not_retire_managed_model():
     identity = await create(controller, state, 'capacity-only')
     instance = controller.instances[controller.trainings[identity].instance_id]
     await state.register_replica(instance.instance_id, 5)
-    await state.unregister_replica_capacity(instance.instance_id)
+    await state.models.unregister_replica_capacity(instance.instance_id)
     assert await state.get_model_metadata(identity) is not None
     assert await state._backend.get('token_count::owner') == 1
     await controller.release(identity, 'owner')
@@ -352,13 +347,11 @@ async def test_capacity_unregister_does_not_retire_managed_model():
 @pytest.mark.parametrize('failure_stage', ['stopped', 'quarantined', 'persist_draining'])
 async def test_late_release_ack_cannot_retire_a_failed_instance_user(mode, failure_stage, monkeypatch):
     from twinkle.server.config.training import TrainingConfig
-    from twinkle.server.training.catalog import TrainingCatalog
 
     controller, state, runtime, _ = await setup(backend=FakeBackend())
     config = controller.config.model_dump()
-    config['models'][0]['modes'][mode].update(min_replicas=1, max_replicas=1)
+    next(model['config'] for model in config['models'] if model['mode'] == mode).update(min_replicas=1, max_replicas=1)
     controller.config = TrainingConfig.model_validate(config)
-    controller.catalog = TrainingCatalog(controller.config)
     await controller.sweep()
     await controller.wait_for_jobs()
     identity = await create(controller, state, 'late-release', mode=mode)

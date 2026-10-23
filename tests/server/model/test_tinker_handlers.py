@@ -5,12 +5,13 @@ from starlette.requests import Request
 from tinker import types
 from unittest.mock import ANY, AsyncMock, MagicMock
 
-from twinkle.server.model.app import ModelManagement
-from twinkle.server.model.tinker_handlers import _register_model_tinker_routes
+from twinkle.server.training.execution.app import ModelManagement
+from twinkle.server.training.execution.tinker_handlers import _register_model_tinker_routes
 from twinkle.server.deployment import twinkle_server_error_handler
 from twinkle.server.exceptions import BatchSizeError, TwinkleServerError
 from twinkle.server.config.task_queue import TaskQueueConfig
 from twinkle.server.task_queue.mixin import TaskQueueMixin
+from twinkle.server.training.execution.runtime import TrainingExecutionState
 
 
 class _DummyManagement:
@@ -190,6 +191,7 @@ class _SaveWeightsDummyManagement:
     is_full_mode = ModelManagement.is_full_mode
 
     def __init__(self):
+        self.training_state = TrainingExecutionState(grad_ready=True)
         self.model = MagicMock()
         self.state = MagicMock()
         self.state.get_model_metadata = AsyncMock(return_value={'base_model': 'test-model'})
@@ -198,8 +200,8 @@ class _SaveWeightsDummyManagement:
     async def _on_request_start(self, request):
         return 'token1'
 
-    def get_adapter_name(self, adapter_name=None):
-        return adapter_name
+    def get_training_state(self, training_id):
+        return self.training_state
 
     resolve_model_adapter_name = ModelManagement.resolve_model_adapter_name
 
@@ -218,7 +220,7 @@ class _SaveWeightsDummyManagement:
                          ids=['lora', 'full-model', 'backend-failure'])
 async def test_training_save_records_metadata_only_after_backend_success(monkeypatch, tmp_path, fail_backend, full_mode):
     from pathlib import Path
-    import twinkle.server.model.tinker_handlers as handlers
+    import twinkle.server.training.execution.tinker_handlers as handlers
     from twinkle.server.checkpoint.tinker import TinkerCheckpointManager, TinkerTrainingRunManager
 
     monkeypatch.setattr('twinkle.server.checkpoint.training_run_manager.TWINKLE_DEFAULT_SAVE_DIR', str(tmp_path))
@@ -260,7 +262,7 @@ async def test_training_save_records_metadata_only_after_backend_success(monkeyp
 @pytest.mark.asyncio
 @pytest.mark.parametrize('path,output_dir', [('org/model', None), ('twinkle://model1/weights/step', 'local')])
 async def test_load_weights_resolves_location_and_preserves_optimizer_flag(monkeypatch, tmp_path, path, output_dir):
-    import twinkle.server.model.tinker_handlers as handlers
+    import twinkle.server.training.execution.tinker_handlers as handlers
     from twinkle.server.checkpoint.tinker import TinkerCheckpointManager, TinkerTrainingRunManager
     monkeypatch.setattr('twinkle.server.checkpoint.training_run_manager.TWINKLE_DEFAULT_SAVE_DIR', str(tmp_path))
     manager = TinkerCheckpointManager('token1', TinkerTrainingRunManager('token1'))
@@ -269,7 +271,6 @@ async def test_load_weights_resolves_location_and_preserves_optimizer_flag(monke
         output_dir = manager.get_save_dir('model1')
     monkeypatch.setattr(handlers, 'create_checkpoint_manager', lambda *args, **kwargs: manager)
     management = _SaveWeightsDummyManagement()
-    management.set_resource_state = MagicMock()
     app = FastAPI()
     _register_model_tinker_routes(app, lambda: management)
     endpoint = next(r.endpoint for r in app.routes if getattr(r, 'path', '') == '/tinker/load_weights')
@@ -278,7 +279,7 @@ async def test_load_weights_resolves_location_and_preserves_optimizer_flag(monke
     management.model.tinker_load.assert_called_once_with(
         checkpoint_name='step' if output_dir else path, output_dir=output_dir,
         load_optimizer=True, adapter_name='model1')
-    management.set_resource_state.assert_called_once_with('model1', 'grad_ready', False)
+    assert management.training_state.grad_ready is False
     assert response.path == path and response.type == 'load_weights'
 
 
@@ -289,7 +290,6 @@ async def test_tinker_loss_metric_survives_sdk_reduction(backward):
 
     management = _SaveWeightsDummyManagement()
     management.data_world_size = 1
-    management.set_resource_state = MagicMock()
     outputs = [{'logprobs': types.TensorData(data=[-0.25, -0.5], dtype='float32', shape=[2])}]
     management.model.tinker_forward_only.return_value = (outputs, 0.375)
     management.model.tinker_forward_backward.return_value = (outputs, 0.375)
@@ -321,7 +321,7 @@ async def test_tinker_loss_metric_survives_sdk_reduction(backward):
 async def test_sampler_save_materializes_weights_and_returns_sdk_mode(monkeypatch, tmp_path, name, sequence_id, full_mode):
     from pathlib import Path
     from twinkle.server.checkpoint import create_checkpoint_manager
-    import twinkle.server.model.tinker_handlers as handlers
+    import twinkle.server.training.execution.tinker_handlers as handlers
     monkeypatch.setattr('twinkle.server.checkpoint.training_run_manager.TWINKLE_DEFAULT_SAVE_DIR', str(tmp_path))
     manager = create_checkpoint_manager('token1', client_type='tinker')
     manager.training_run_manager._write_info('model1', {'base_model': 'test-model'})

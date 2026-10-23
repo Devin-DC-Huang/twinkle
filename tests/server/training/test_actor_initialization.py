@@ -81,7 +81,7 @@ async def test_heartbeat_keeps_healthy_peer_alive_while_probe_and_close_block():
 
     actor = SimpleNamespace(
         store=SimpleNamespace(backend=SimpleNamespace(get=AsyncMock(return_value='active')),
-                              key=lambda *args: 'active', state=SimpleNamespace(touch_replica_last_seen=touch)),
+                              key=lambda *args: 'active', models=SimpleNamespace(touch_replica_last_seen=touch)),
         core=SimpleNamespace(epoch='controller', instances={'bad': bad, 'good': good}, fail_instance=fail,
                              lifecycle=InstanceLifecycle('Training')),
         driver=SimpleNamespace(health=health), _unreachable_since={}, _failures={})

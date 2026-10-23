@@ -61,7 +61,7 @@ class TrainingControllerActor:
                 if active is None:
                     await self._recover_lost_state()
                     return
-                await self.store.state.touch_replica_last_seen(self.core.epoch)
+                await self.store.models.touch_replica_last_seen(self.core.epoch)
             except Exception:
                 logger.exception('Training state heartbeat failed; admission remains fenced by the state backend')
                 await asyncio.sleep(5)
@@ -76,7 +76,7 @@ class TrainingControllerActor:
         async def probe():
             identity = await self.driver.health(instance)
             if not identity['unhealthy']:
-                await self.store.state.touch_replica_last_seen(instance.instance_id)
+                await self.store.models.touch_replica_last_seen(instance.instance_id)
             return identity
 
         healthy = await self.core.lifecycle.health(instance.instance_id, probe)

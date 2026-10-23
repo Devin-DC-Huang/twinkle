@@ -93,8 +93,8 @@ class ModelManager(BaseManager[ModelRecord]):
 
     async def get_capacity_info(self) -> dict[str, int]:
         """Return global LoRA capacity across all registered replicas."""
-        replicas = await self._replicas.get_all()
-        replicas = {identity: capacity for identity, capacity in replicas.items() if capacity > 0}
+        capacities = await self._replicas.get_all()
+        replicas = {identity: capacity for identity, capacity in capacities.items() if capacity > 0}
         loaded_per_replica = await self._loaded_per_replica()
         total_max = sum(replicas.values())
         total_used = sum(loaded_per_replica.get(rid, 0) for rid in replicas)

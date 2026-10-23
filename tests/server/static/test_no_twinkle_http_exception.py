@@ -6,8 +6,8 @@ from pathlib import Path
 _SERVER = Path(__file__).resolve().parents[3] / 'src' / 'twinkle' / 'server'
 _TWINKLE_HANDLERS = (
     _SERVER / 'gateway' / 'twinkle_handlers.py',
-    _SERVER / 'model' / 'twinkle_handlers.py',
-    _SERVER / 'sampler' / 'twinkle_handlers.py',
+    _SERVER / 'training' / 'execution' / 'twinkle_handlers.py',
+    _SERVER / 'sampling' / 'execution' / 'twinkle_handlers.py',
     _SERVER / 'processor' / 'twinkle_handlers.py',
 )
 

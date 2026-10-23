@@ -761,7 +761,7 @@ from tinker import ServiceClient
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.preprocessor import SelfCognitionProcessor
-from twinkle.server.model.tinker_datum import input_feature_to_datum
+from twinkle.server.training.execution.tinker_datum import input_feature_to_datum
 
 # The base model to fine-tune / evaluate
 base_model = 'ms://Qwen/Qwen3.5-4B'

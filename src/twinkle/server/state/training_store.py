@@ -1,25 +1,29 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Controller-owned persistence; other key-spaces are accessed through ServerState."""
+"""Training persistence and retry receipts, composed from shared state managers."""
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import time
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
+from twinkle.server.exceptions import RequestRejectedError
 from .backend.base import StateBackend
+from .future_manager import FutureManager
+from .model_manager import ModelManager
 from .models import FutureFailureRecord
+from .session_manager import SessionManager
 from .training_records import CreateTraining, InstanceRecord, TrainingRecord
-
-if TYPE_CHECKING:
-    from .server_state import ServerState
 
 
 class TrainingStore:
 
-    def __init__(self, state: ServerState, namespace: str, backend: StateBackend):
-        self.state = state
+    def __init__(self, namespace: str, backend: StateBackend, *, models: ModelManager, sessions: SessionManager,
+                 futures: FutureManager, sequences: TrainingSequences, expiration_timeout: float):
         self.backend = backend
+        self.models, self.sessions, self.futures, self.sequences = models, sessions, futures, sequences
+        self.expiration_timeout = expiration_timeout
         self.prefix = f'training::{namespace}::'
 
     def key(self, kind: str, identity: str) -> str:
@@ -32,22 +36,20 @@ class TrainingStore:
         return hashlib.sha256(identity.encode()).hexdigest(), hashlib.sha256(fingerprint.encode()).hexdigest()
 
     async def reserve(self, record: TrainingRecord) -> None:
-        await self.state.register_model_record(record.training_id, record)
+        await self.models.add(record.training_id, record)
 
     async def save_training(self, record: TrainingRecord) -> None:
-        await self.state.save_model_record(record.training_id, record)
+        await self.models.save_record(record.training_id, record)
 
     async def retire(self, record: TrainingRecord) -> None:
         await self.backend.set(
-            self.key('terminal', record.training_id),
-            record.model_dump(),
-            ttl=max(1, int(self.state.expiration_timeout)))
-        await self.state.delete_training_sequences(record.training_id)
+            self.key('terminal', record.training_id), record.model_dump(), ttl=max(1, int(self.expiration_timeout)))
+        await self.sequences.delete(record.training_id)
         # Release the quota row last so a failed earlier step can be idempotently retried.
-        await self.state.unload_model(record.training_id)
+        await self.models.remove(record.training_id)
 
     async def save_instance(self, record: InstanceRecord) -> None:
-        ttl = max(1, int(self.state.expiration_timeout)) if record.state == 'STOPPED' else None
+        ttl = max(1, int(self.expiration_timeout)) if record.state == 'STOPPED' else None
         await self.backend.set(self.key('instance', record.instance_id), record.model_dump(), ttl=ttl)
 
     async def instances(self) -> list[InstanceRecord]:
@@ -55,7 +57,7 @@ class TrainingStore:
         return [InstanceRecord.model_validate(value) for value in await self.backend.mget(keys) if value is not None]
 
     async def trainings(self) -> list[TrainingRecord]:
-        return await self.state.get_training_records(self.prefix)
+        return await self.models.get_training_records(self.prefix)
 
     async def get_create(self, identity: str) -> dict[str, str] | None:
         return await self.backend.get(self.key('create', identity))
@@ -71,7 +73,7 @@ class TrainingStore:
     async def cleanup_receipts(self) -> None:
         for key in await self.backend.keys(self.key('create', '*')):
             receipt = await self.backend.get(key)
-            if receipt and await self.state.get_session_last_heartbeat(receipt['session_id']) is None:
+            if receipt and await self.sessions.get_last_heartbeat(receipt['session_id']) is None:
                 await self.backend.delete(key)
 
     async def future(self,
@@ -84,7 +86,7 @@ class TrainingStore:
                      failure: FutureFailureRecord | None = None,
                      deadline: float | None = None,
                      owner_token: str | None = None) -> None:
-        await self.state.store_future_status(
+        await self.futures.store_status(
             request_id,
             status,
             model_id,
@@ -96,3 +98,59 @@ class TrainingStore:
 
     async def begin_epoch(self, epoch: str) -> None:
         await self.backend.set(self.key('controller', 'active'), {'epoch': epoch, 'started_at': time.time()})
+
+
+class TrainingSequences:
+    """Atomic retry receipts and an expired-sequence fence, scoped to a training handle.
+
+    Expiration compacts receipts but retains the sequence floor until that handle is
+    retired. An old update therefore cannot be applied twice after its receipt ages out.
+    """
+
+    def __init__(self, backend: StateBackend):
+        self.backend = backend
+
+    async def claim(self, training_id: str, stream: str, sequence: int, request_id: str,
+                    retention: float) -> str | None:
+        ledger = await self.backend.update_atomic(
+            f'seq_ledger::{training_id}::{stream}',
+            functools.partial(
+                self.claim_transform, sequence=sequence, request_id=request_id, now=time.time(), retention=retention))
+        receipt = ledger['receipts'].get(str(sequence))
+        if receipt is None:
+            raise RequestRejectedError('Sequence retry window expired; the operation will not be executed again')
+        return None if receipt['request_id'] == request_id else receipt['request_id']
+
+    async def release(self, training_id: str, stream: str, sequence: int, request_id: str) -> None:
+        await self.backend.update_atomic(
+            f'seq_ledger::{training_id}::{stream}',
+            functools.partial(self.release_transform, sequence=sequence, request_id=request_id))
+
+    async def delete(self, training_id: str) -> None:
+        for key in await self.backend.keys(f'seq_ledger::{training_id}::*'):
+            await self.backend.delete(key)
+
+    @staticmethod
+    def claim_transform(current, *, sequence, request_id, now, retention):
+        floor = current.get('floor') if current else None
+        receipts = {}
+        for key, receipt in (current or {}).get('receipts', {}).items():
+            if receipt['expires_at'] <= now:
+                floor = int(key) if floor is None else max(floor, int(key))
+            else:
+                receipts[key] = receipt
+        key = str(sequence)
+        # Unexpired receipts remain retryable even if another sequence expired first.
+        if key not in receipts and (floor is None or sequence > floor):
+            receipts[key] = {'request_id': request_id, 'expires_at': now + retention}
+        return {'floor': floor, 'receipts': receipts}
+
+    @staticmethod
+    def release_transform(current, *, sequence, request_id):
+        if current is None:
+            return None
+        receipts = dict(current['receipts'])
+        key = str(sequence)
+        if receipts.get(key, {}).get('request_id') == request_id:
+            receipts.pop(key)
+        return {'floor': current['floor'], 'receipts': receipts}

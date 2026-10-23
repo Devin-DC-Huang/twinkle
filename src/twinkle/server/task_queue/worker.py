@@ -16,19 +16,20 @@ from dataclasses import replace
 from ray.exceptions import RayTaskError
 from typing import TYPE_CHECKING, Any, Callable, Deque
 
-from twinkle.protocol.types.errors import ErrorCategory
+from twinkle.protocol.types.errors import ErrorCategory, QueueState
+from twinkle.protocol.types.lifecycle import TaskStatus
 from twinkle.server.config.task_queue import TaskQueueConfig
-from twinkle.server.exceptions import (BatchSizeError, EndpointUnavailableError, FullModeBusyError,
+from twinkle.server.exceptions import (BackendBusyError, BatchSizeError, EndpointUnavailableError, FullModeBusyError,
                                        InputTokensExceededError, RateLimitExceededError, RequestRejectedError,
                                        ResourceExhaustedError, ResourceNotFoundError, ResourceQuotaExceededError,
                                        StateBackendError, TrainModeMismatchError, TwinkleServerError)
 from twinkle.server.state.backend.base import ConcurrencyError
 from twinkle.server.state.models import FutureFailureRecord
+from twinkle.server.task_queue.backend_gate import BACKEND_TIMEOUT_EXCEPTIONS
 from twinkle.server.telemetry.correlation import MODEL_ID, TOKEN_ID
 from twinkle.server.telemetry.tracing import traced_operation
 from twinkle.utils.logger import get_logger
-from .types import (BACKEND_TIMEOUT_EXCEPTIONS, BackendBusyError, QueuedTask, QueueState, TaskStatus, UserTaskError,
-                    execution_scope)
+from .types import QueuedTask
 
 if TYPE_CHECKING:
     from twinkle.server.state import ServerState
@@ -422,10 +423,9 @@ class ComputeWorker:
 
         running = asyncio.create_task(run())
         self._detached_tasks[running] = task
-        scope = execution_scope.get()
+        scope = task.execution_scope
         if scope is not None:
-            scope.jobs.add(running)
-            scope.request_ids.add(task.request_id)
+            scope.track(running, task.request_id)
 
         def done(completed: asyncio.Task) -> None:
             self._detached_tasks.pop(completed, None)
@@ -509,16 +509,6 @@ class ComputeWorker:
                     await self._on_backend_timeout()
                 except Exception:
                     logger.error(f'[ComputeWorker] backend-timeout probe failed:\n{traceback.format_exc(limit=3)}')
-        except UserTaskError as exc:
-            task_status = 'failed'
-            exec_time = time.monotonic() - exec_start
-            await self._store_task_failed(
-                task,
-                f'{type(exc).__name__}: {exc}',
-                QueueState.UNKNOWN.value,
-                reason_code='request_rejected',
-                attribution='user',
-            )
         except BackendBusyError as exc:
             task_status = 'failed'
             exec_time = time.monotonic() - exec_start

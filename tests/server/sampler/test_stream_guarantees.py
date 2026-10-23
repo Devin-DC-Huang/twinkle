@@ -9,8 +9,8 @@ from unittest.mock import AsyncMock
 import pytest
 from fastapi import FastAPI
 
-from twinkle.server.sampler.app import SamplerManagement
-from twinkle.server.sampler.twinkle_handlers import _await_generation, _register_twinkle_sampler_routes, _stream_queue
+from twinkle.server.sampling.execution.app import SamplerManagement
+from twinkle.server.sampling.execution.twinkle_handlers import _await_generation, _register_twinkle_sampler_routes, _stream_queue
 
 
 class _BlockingQueue:
@@ -89,7 +89,7 @@ async def test_stream_timeout_returns_error_payload_and_closes_queue():
 class _GenerationService:
 
     def __init__(self) -> None:
-        from twinkle.server.sampler.concurrency import SamplerConcurrency
+        from twinkle.server.sampling.execution.concurrency import SamplerConcurrency
         self.sampling_guard = SamplerConcurrency()
         self.cancelled = False
         self.sampler = SimpleNamespace(
@@ -113,6 +113,6 @@ async def test_generation_poll_has_total_timeout_and_cancels():
         await asyncio.wait_for(_await_generation(service, 'submission'), timeout=0.05)
 
     assert service.cancelled is True
-    from twinkle.server.task_queue.types import BackendBusyError
+    from twinkle.server.exceptions import BackendBusyError
     with pytest.raises(BackendBusyError, match='restarting'):
         service.sampling_guard.check_available()

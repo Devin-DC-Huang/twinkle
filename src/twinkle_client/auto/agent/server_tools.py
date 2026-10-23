@@ -440,9 +440,6 @@ class _ServerTools:
                 'max_replicas': 1,
                 'max_length': 500000,
                 'idle_timeout_s': 600,
-                'adapter_config': {
-                    'adapter_timeout': 600
-                },
                 'queue_config': {
                     'rps_limit': 100,
                     'tps_limit': 100000,

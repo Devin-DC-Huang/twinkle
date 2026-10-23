@@ -31,7 +31,7 @@ persistence:
   redis_url: redis://localhost:6380
 
 # Independent allocation, startup and confirmed-shutdown budgets.
-training:
+resources:
   allocation_timeout_s: 3
   startup_timeout_s: 1800
   shutdown_timeout_s: 180
@@ -140,9 +140,6 @@ applications:
         rps_limit: 20                               # Max requests per second
         tps_limit: 131072                            # Max tokens per second
         max_input_tokens: 32768
-      adapter_config:
-        adapter_timeout: 120                       # Session heartbeat timeout, not business idle
-        adapter_max_lifetime: 36000               # Maximum lifetime of an adapter in seconds (e.g., 10 hours)
     deployments:
       - name: ModelManagement
         autoscaling_config:

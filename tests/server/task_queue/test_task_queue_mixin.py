@@ -5,7 +5,7 @@ import pytest_asyncio
 
 from twinkle.server.config.task_queue import TaskQueueConfig
 from twinkle.server.task_queue.mixin import TaskQueueMixin
-from twinkle.server.task_queue.types import UserTaskError
+from twinkle.server.exceptions import RequestRejectedError
 from twinkle.server.task_queue.worker import ComputeWorker, _exception_summary
 
 
@@ -285,7 +285,7 @@ async def test_user_task_error_is_stored_as_user_failure():
     queue.enable_compute_worker()
 
     async def work():
-        raise UserTaskError('invalid request')
+        raise RequestRejectedError('invalid request')
 
     try:
         await queue.schedule_task(work, model_id='model1', token='token1')
@@ -421,7 +421,7 @@ async def test_concurrent_task_keeps_queue_failure_mapping(make_concurrent_queue
     queue = make_concurrent_queue()
 
     async def work():
-        raise UserTaskError('invalid request')
+        raise RequestRejectedError('invalid request')
 
     await queue.schedule_concurrent_task(work, token='token1')
     for _ in range(100):
@@ -741,3 +741,23 @@ async def test_admission_persists_future_and_owner_together(method):
     finally:
         finish.set()
         await queue.shutdown_task_queue()
+
+
+@pytest.mark.asyncio
+async def test_backend_cancellation_is_an_explicit_server_failure(make_concurrent_queue):
+    from twinkle.server.lifecycle.envelope import envelope_from_record
+    from twinkle.server.task_queue.types import ExecutionScope
+    queue = make_concurrent_queue()
+    scope = ExecutionScope()
+
+    async def work():
+        raise asyncio.CancelledError()
+
+    ref = await queue.schedule_concurrent_task(work, token='token1', execution_scope=scope)
+    await scope.wait()
+    record = await queue.state.get_future(ref['request_id'])
+    assert record['status'] == 'failed'
+    assert record['failure']['reason_code'] == 'backend_cancelled'
+    envelope = envelope_from_record(ref['request_id'], record)
+    assert envelope.error.error_code == 503
+    assert envelope.error.category == 'server'

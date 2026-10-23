@@ -414,9 +414,9 @@ async def test_sampler_update_does_not_rewrite_existing_save_dir_pointer(monkeyp
 @pytest.mark.asyncio
 async def test_reserved_sampler_name_is_rejected_before_backend_or_file_io(manager):
     from unittest.mock import AsyncMock
-    from twinkle.server.task_queue.types import UserTaskError
+    from twinkle.server.exceptions import RequestRejectedError
     save = AsyncMock()
-    with pytest.raises(UserTaskError, match='reserved'):
+    with pytest.raises(RequestRejectedError, match='reserved'):
         await manager.save_sampler('run', 'latest', save)
     save.assert_not_awaited()
     assert not Path(manager.get_save_dir('run', is_sampler=True)).exists()

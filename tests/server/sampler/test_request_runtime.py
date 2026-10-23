@@ -10,8 +10,8 @@ import pytest
 
 from tests.server.task_queue.helpers import _DummyQueue
 from twinkle.server.config.task_queue import TaskQueueConfig
-from twinkle.server.sampler.concurrency import SamplerConcurrency
-from twinkle.server.task_queue.types import ExecutionScope, execution_scope
+from twinkle.server.sampling.execution.concurrency import SamplerConcurrency
+from twinkle.server.task_queue.types import ExecutionScope
 
 
 @pytest.mark.asyncio
@@ -28,11 +28,7 @@ async def test_worker_exports_actual_completion_handle_without_private_task_look
         await exit_gate.wait()
         return 'late result'
 
-    token = execution_scope.set(scope)
-    try:
-        ref = await queue.schedule_concurrent_task(lambda: guard.run(backend))
-    finally:
-        execution_scope.reset(token)
+    ref = await queue.schedule_concurrent_task(lambda: guard.run(backend), execution_scope=scope)
     try:
         await asyncio.wait_for(entered.wait(), 1)
         completion = asyncio.create_task(scope.wait())
@@ -104,13 +100,14 @@ def test_stream_iterator_close_joins_the_real_engine_loop_task():
 
 @pytest.mark.asyncio
 async def test_runtime_does_not_certify_an_unconfirmed_cancel_ack():
-    from twinkle.server.sampler.runtime import SamplerRuntime
-    from twinkle.server.task_queue.types import BackendBusyError
+    from twinkle.server.sampling.execution.runtime import SamplerRuntime
+    from twinkle.server.exceptions import BackendBusyError
     guard = SamplerConcurrency()
     runtime = SamplerRuntime(SimpleNamespace(sampling_guard=guard))
     task = asyncio.create_task(asyncio.sleep(0))
     await task
-    runtime._operations['cancelled'] = {'task': task, 'scope': ExecutionScope()}
+    from twinkle.server.sampling.execution.runtime import SamplingOperation
+    runtime._operations['cancelled'] = SamplingOperation(ExecutionScope(), task)
     guard.invalidate_weights(RuntimeError('cancel ACK preceded actual generation exit'))
     with pytest.raises(BackendBusyError):
         await runtime.wait_operation('cancelled')
@@ -121,7 +118,7 @@ async def test_runtime_does_not_certify_an_unconfirmed_cancel_ack():
 async def test_cold_lora_config_does_not_block_sampler_health(monkeypatch):
     import json
     import sys
-    from twinkle.server.sampler.runtime import SamplerRuntime
+    from twinkle.server.sampling.execution.runtime import SamplerRuntime
     entered, release = threading.Event(), threading.Event()
     calls = []
 
@@ -176,7 +173,7 @@ async def test_managed_compute_http_cannot_bypass_pool_admission(monkeypatch):
     import httpx
     from fastapi import FastAPI
     from twinkle.server.exceptions import RequestRejectedError
-    from twinkle.server.sampler import app as module
+    from twinkle.server.sampling.execution import app as module
 
     def scaffold(title, register_routes, **kwargs):
         app = FastAPI()
@@ -206,3 +203,31 @@ async def test_managed_compute_http_cannot_bypass_pool_admission(monkeypatch):
     standalone = module.build_sampler_app(**args)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=standalone), base_url='http://test') as client:
         assert (await client.post('/twinkle/create', json={})).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_scope_waits_for_jobs_registered_by_an_earlier_job():
+    scope = ExecutionScope()
+    child_started, child_release, parent_release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def child():
+        child_started.set()
+        await child_release.wait()
+
+    async def parent():
+        await parent_release.wait()
+        scope.track(asyncio.create_task(child()))
+
+    scope.track(asyncio.create_task(parent()))
+    waiter = asyncio.create_task(scope.wait())
+    try:
+        await asyncio.sleep(0)
+        parent_release.set()
+        await child_started.wait()
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(waiter), 0.05)
+        child_release.set()
+        await waiter
+    finally:
+        child_release.set()
+        await asyncio.gather(waiter, return_exceptions=True)

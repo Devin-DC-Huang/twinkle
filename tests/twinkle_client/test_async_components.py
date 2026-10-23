@@ -321,3 +321,31 @@ def test_concurrent_duplicate_and_failed_creation_leave_reusable_name(monkeypatc
     monkeypatch.setattr(model, '_submit', original)
     model.add_adapter_to_model('same', None)
     assert model._training_ids['same'] == 'training-test'
+
+
+def test_unknown_training_rejected_before_handshake(monkeypatch):
+    import pytest
+    from twinkle_client.model.multi_lora_transformers import MultiLoraTransformersModel
+    calls = []
+    _patch_transport(monkeypatch, calls, lambda url: _completed({}))
+    model = MultiLoraTransformersModel('base')
+    with pytest.raises(RuntimeError, match='add_adapter_to_model'):
+        model.step()
+    assert not calls
+
+
+def test_sequence_and_handle_selection_are_object_local(monkeypatch):
+    from twinkle_client.model.multi_lora_transformers import MultiLoraTransformersModel
+    calls = []
+    _patch_transport(monkeypatch, calls, lambda url: _completed({}))
+    first, second = MultiLoraTransformersModel('base'), MultiLoraTransformersModel('base')
+    for model in (first, second):
+        model._created = True
+        model.adapter_name = 'default'
+    first._training_ids = {'default': 'first-default', 'other': 'first-other'}
+    second._training_ids = {'default': 'second-default'}
+    first.step()
+    first.step(adapter_name='other')
+    second.step()
+    assert [(body['adapter_name'], body['training_id'], body['seq_id']) for _, body in calls] == [
+        ('default', 'first-default', 1), ('other', 'first-other', 2), ('default', 'second-default', 1)]

@@ -1,16 +1,19 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
+
 import asyncio
+from types import SimpleNamespace
+
+from twinkle.server.config.task_queue import TaskQueueConfig
 from twinkle.server.config.training import TrainingConfig
+from twinkle.server.resources.allocation import CapacityUnavailableError
 from twinkle.server.state import ServerState
 from twinkle.server.state.backend.memory_backend import RayActorBackend
-from twinkle.server.training.controller import TrainingController
-from twinkle.server.resources.allocation import CapacityUnavailableError
 from twinkle.server.state.training_records import CreateTraining
-from types import SimpleNamespace
-from twinkle.server.config.task_queue import TaskQueueConfig
 from twinkle.server.task_queue import TaskQueueMixin
-from twinkle.server.model.managed_runtime import ManagedTrainingRuntime
+from twinkle.server.training.controller import TrainingController
+from twinkle.server.training.execution.runtime import TrainingRuntime
+
 
 class Clock:
     now = 0.0
@@ -49,7 +52,11 @@ class Runtime:
     async def create_training(self, instance, training, request):
         assert instance.instance_id in self.allocations
         assert training.training_id not in self.users
-        self.users[training.training_id] = {'instance': instance.instance_id, 'label': training.adapter_label, 'steps': 0}
+        self.users[training.training_id] = {
+            'instance': instance.instance_id,
+            'label': training.adapter_label,
+            'steps': 0
+        }
 
     async def release_training(self, instance, training):
         self.users.pop(training.training_id, None)
@@ -69,11 +76,36 @@ class Runtime:
 
 
 async def setup(*, devices=16, min_replicas=0, max_replicas=None, quota=100, backend=None):
-    mode = {'num_devices': 2, 'device_mesh': {'fsdp_size': 2}, 'max_loras': 5,
-            'idle_timeout_s': 10, 'min_replicas': min_replicas, 'max_replicas': max_replicas}
+    mode = {
+        'num_devices': 2,
+        'device_mesh': {
+            'fsdp_size': 2
+        },
+        'max_loras': 5,
+        'idle_timeout_s': 10,
+        'min_replicas': min_replicas,
+        'max_replicas': max_replicas
+    }
     config = TrainingConfig(models=[{
-        'name': 'small', 'model_id': 'ms://small', 'backend': 'mock', 'device_type': 'cuda',
-        'modes': {'lora': mode, 'full': {'num_devices': 2, 'device_mesh': {'fsdp_size': 2}, 'idle_timeout_s': 10}},
+        'name': 'small',
+        'model_id': 'ms://small',
+        'backend': 'mock',
+        'device_type': 'cuda',
+        'mode': 'lora',
+        'config': mode,
+    }, {
+        'name': 'small-full',
+        'model_id': 'ms://small',
+        'backend': 'mock',
+        'device_type': 'cuda',
+        'mode': 'full',
+        'config': {
+            'num_devices': 2,
+            'device_mesh': {
+                'fsdp_size': 2
+            },
+            'idle_timeout_s': 10
+        },
     }])
     state = ServerState(backend=backend or RayActorBackend(), per_token_model_limit=quota)
     await state.create_session({'session_id': 'session'})
@@ -84,8 +116,15 @@ async def setup(*, devices=16, min_replicas=0, max_replicas=None, quota=100, bac
 
 
 def request(key, *, mode='lora', label='same', token='owner'):
-    return CreateTraining(base_model='small', mode=mode, token=token, session_id='session', create_key=str(key),
-                          client_type='twinkle', payload={}, adapter_label=label)
+    return CreateTraining(
+        base_model='small-full' if mode == 'full' else 'small',
+        mode=mode,
+        token=token,
+        session_id='session',
+        create_key=str(key),
+        client_type='twinkle',
+        payload={},
+        adapter_label=label)
 
 
 async def create(controller, state, key, **kwargs):
@@ -97,6 +136,7 @@ async def create(controller, state, key, **kwargs):
 
 
 class RPC:
+
     def __init__(self, method):
         self.method = method
 
@@ -104,17 +144,23 @@ class RPC:
         return asyncio.create_task(self.method(*args, **kwargs))
 
 
-class RuntimeQueue(ManagedTrainingRuntime, TaskQueueMixin):
+class RuntimeQueue(TrainingRuntime, TaskQueueMixin):
+
     def __init__(self, controller, state, instance):
         self.state, self.replica_id = state, instance.instance_id
-        self.training_context = {'instance_id': instance.instance_id, 'epoch': controller.epoch}
+        from twinkle.server.state.training_records import TrainingRuntimeContext
+        self.training_context = TrainingRuntimeContext(
+            instance_id=instance.instance_id,
+            epoch=controller.epoch,
+            namespace='test',
+            registry_name='test',
+            controller_name='test')
         self._model_unhealthy = False
-        self._training_controller = SimpleNamespace(**{
-            name: RPC(getattr(controller, name))
-            for name in ('admit', 'finish_operation', 'fail_instance')
-        })
-        self._init_task_queue(TaskQueueConfig(execution_timeout=0.1, inline_fast_path_timeout=0.01),
-                              enable_admission_gate=True)
+        self._training_controller = SimpleNamespace(
+            **{name: RPC(getattr(controller, name))
+               for name in ('admit', 'finish_operation', 'fail_instance')})
+        self._init_task_queue(
+            TaskQueueConfig(execution_timeout=0.1, inline_fast_path_timeout=0.01), enable_admission_gate=True)
 
 
 async def settle(state, request_id):

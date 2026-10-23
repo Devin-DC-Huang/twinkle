@@ -37,3 +37,47 @@ def test_failed_initialization_does_not_leave_an_actor_that_blocks_a_retry():
         assert diagnostic['ready'] and diagnostic['instances'] == []
     finally:
         launcher._shutdown()
+
+
+def test_cleanup_attempts_all_owners_and_reports_the_original_failure():
+    calls = []
+    error = ConnectionError('shutdown ACK unknown')
+
+    def failed():
+        calls.append('failed')
+        raise error
+
+    def healthy():
+        calls.append('healthy')
+
+    with pytest.raises(RuntimeError, match='cleanup is incomplete') as caught:
+        ServerLauncher._run_cleanup([('first', failed), ('second', healthy)], raise_errors=True)
+    assert calls == ['failed', 'healthy']
+    assert caught.value.__cause__ is error
+
+
+def test_startup_rollback_preserves_startup_error_and_cleans_all_owners(monkeypatch):
+    config = ServerConfig.model_validate({'applications': [
+        {'name': 'gateway', 'import_path': 'server', 'route_prefix': '/api/v1'}]})
+    launcher = ServerLauncher(config)
+    calls = []
+    error = ValueError('invalid application')
+    monkeypatch.setattr('twinkle.server.launcher.server_launcher.apply_ray_serve_patches', lambda: None)
+    monkeypatch.setattr(launcher, '_configure_environment', lambda: None)
+    monkeypatch.setattr(launcher, '_init_ray', lambda: None)
+    monkeypatch.setattr(launcher, '_start_serve', lambda: None)
+
+    def deploy(app):
+        raise error
+
+    def failed_cleanup():
+        calls.append('training')
+        raise ConnectionError('cleanup pending')
+
+    monkeypatch.setattr(launcher, '_deploy_application', deploy)
+    monkeypatch.setattr(launcher, '_stop_training_controller', failed_cleanup)
+    monkeypatch.setattr('twinkle.server.telemetry.flush_telemetry_safely', lambda: calls.append('telemetry'))
+    with pytest.raises(ValueError) as caught:
+        launcher.launch()
+    assert caught.value is error
+    assert calls == ['training', 'telemetry']

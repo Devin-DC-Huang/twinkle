@@ -123,7 +123,7 @@ def test_no_direct_backend_call_in_server():
 
 
 def test_exemptions_are_read_from_shared_file():
-    assert ('sampler/twinkle_handlers.py', '_stream_queue') in BACKEND_CALL_EXEMPTIONS
+    assert ('sampling/execution/twinkle_handlers.py', '_stream_queue') in BACKEND_CALL_EXEMPTIONS
 
 
 def test_checker_detects_indirect_backend_calls():

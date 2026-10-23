@@ -9,14 +9,14 @@ import pytest
 
 from tests.server.state.fake_backend import FakeBackend
 from tests.server.training.helpers import create, setup
-from twinkle.server.model.managed_runtime import ManagedTrainingRuntime
+from twinkle.server.training.execution.runtime import TrainingRuntime
 from twinkle.server.state.training_records import CreateTraining
 
 
 @pytest.mark.asyncio
 async def test_configuration_deserialization_does_not_block_event_loop(monkeypatch):
-    controller, _, _, _ = await setup(backend=FakeBackend())
-    identity = await create(controller, controller.store.state, 'configuration-import', mode='full')
+    controller, state, _, _ = await setup(backend=FakeBackend())
+    identity = await create(controller, state, 'configuration-import', mode='full')
     training = controller.trainings[identity]
     entered, resume, finished = threading.Event(), threading.Event(), threading.Event()
 
@@ -26,18 +26,18 @@ async def test_configuration_deserialization_does_not_block_event_loop(monkeypat
         finished.set()
         return None
 
-    monkeypatch.setattr('twinkle.server.model.managed_runtime.deserialize_object', deserialize)
+    monkeypatch.setattr('twinkle.server.training.execution.runtime.deserialize_object', deserialize)
     manager = SimpleNamespace(save=Mock())
-    monkeypatch.setattr('twinkle.server.model.managed_runtime.create_training_run_manager', lambda *args, **kw: manager)
+    monkeypatch.setattr('twinkle.server.training.execution.runtime.create_training_run_manager', lambda *args, **kw: manager)
 
     async def serial(factory, task_type):
         return await factory()
 
-    runtime = SimpleNamespace(_managed_serial=serial, resolve_model_adapter_name=lambda _: '',
-                              register_resource=Mock(), set_resource_state=Mock(), is_full_mode=True)
+    runtime = SimpleNamespace(_run_lifecycle_operation=serial, resolve_model_adapter_name=lambda _: '',
+                              _training_states={}, is_full_mode=True)
     request = CreateTraining(base_model='small', mode='full', token='owner', session_id='session', create_key='key',
                              client_type='twinkle', payload={'adapter_name': 'same', 'config': None})
-    initializing = asyncio.create_task(ManagedTrainingRuntime.initialize_training(
+    initializing = asyncio.create_task(TrainingRuntime.initialize_training(
         runtime, training.model_dump(), request.model_dump()))
     try:
         assert await asyncio.to_thread(entered.wait, 2)

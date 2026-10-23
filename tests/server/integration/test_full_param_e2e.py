@@ -46,7 +46,7 @@ from twinkle import init_tinker_client  # noqa: E402
 from twinkle.dataloader import DataLoader  # noqa: E402
 from twinkle.dataset import Dataset, DatasetMeta  # noqa: E402
 from twinkle.preprocessor import SelfCognitionProcessor  # noqa: E402
-from twinkle.server.model.tinker_datum import input_feature_to_datum  # noqa: E402
+from twinkle.server.training.execution.tinker_datum import input_feature_to_datum  # noqa: E402
 
 init_tinker_client()
 

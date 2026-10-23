@@ -129,7 +129,7 @@ async def test_serve_handle_lookup_cannot_block_driver_deadlines(monkeypatch, ki
     from types import SimpleNamespace
     from ray import serve
     from twinkle.server.resources.runtime import RayRuntime
-    from twinkle.server.sampler.driver import SamplerDriver
+    from twinkle.server.sampling.driver import SamplerDriver
     from twinkle.server.training.driver import RayInstanceDriver
 
     entered, resume, returned = threading.Event(), threading.Event(), threading.Event()
@@ -197,3 +197,44 @@ async def test_orphan_inventory_cannot_block_recovery_deadlines(monkeypatch, kin
         resume.set()
         await asyncio.gather(operation, return_exceptions=True)
         await asyncio.to_thread(returned.wait, 3)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('outcome', ['unconfirmed_worker', 'removed', 'removal_failed'])
+async def test_worker_death_precedes_group_release_and_removal_timing(monkeypatch, outcome):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+    import ray
+    from ray import serve
+    from twinkle.server.exceptions import ResourceReleaseError
+    from twinkle.server.resources.runtime import RayRuntime
+
+    async def ready():
+        return None  # Worker can still answer: death has not been confirmed.
+
+    handle = SimpleNamespace(__ray_ready__=SimpleNamespace(remote=ready))
+    rows = [{'namespace': 'test', 'name': 'owned-worker'}] if outcome == 'unconfirmed_worker' else []
+    monkeypatch.setattr(ray.util, 'list_named_actors', lambda **kwargs: rows)
+    monkeypatch.setattr(ray, 'get_actor', lambda *args, **kwargs: handle)
+    monkeypatch.setattr(ray, 'kill', lambda *args, **kwargs: None)
+    monkeypatch.setattr(serve, 'delete', lambda name: None)
+    runtime = RayRuntime('test', allocation_timeout=1, shutdown_timeout=1)
+    runtime.pool.remove = AsyncMock(side_effect=RuntimeError('PG removal failed')
+                                    if outcome == 'removal_failed' else None)
+    observe = Mock()
+    if outcome == 'unconfirmed_worker':
+        with pytest.raises(ResourceReleaseError) as failure:
+            await runtime.shutdown('owned', 'app', observe_removal=observe)
+        assert failure.value.phase == 'worker_death'
+        runtime.pool.remove.assert_not_awaited()
+        observe.assert_not_called()
+    else:
+        if outcome == 'removal_failed':
+            with pytest.raises(RuntimeError, match='PG removal failed'):
+                await runtime.shutdown('owned', 'app', observe_removal=observe)
+        else:
+            await runtime.shutdown('owned', 'app', observe_removal=observe)
+        runtime.pool.remove.assert_awaited_once_with('app')
+        assert observe.call_count == 1
+        duration, status = observe.call_args.args
+        assert duration >= 0 and status == ('error' if outcome == 'removal_failed' else 'success')

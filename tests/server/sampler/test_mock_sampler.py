@@ -17,8 +17,8 @@ from hypothesis import strategies as st
 
 from twinkle.data_format import InputFeature, SamplingParams
 from twinkle.server.exceptions import ConfigError
-from twinkle.server.sampler.app import SAMPLER_SELECTOR, _construct_sampler_backend
-from twinkle.server.sampler.backends.mock_sampler import MockSampler
+from twinkle.server.sampling.execution.app import SAMPLER_SELECTOR, _construct_sampler_backend
+from twinkle.server.sampling.execution.backends.mock_sampler import MockSampler
 
 _SAMPLER_TYPES = tuple(SAMPLER_SELECTOR.builders)
 
@@ -121,7 +121,7 @@ def test_explicit_async_vllm_uses_non_blocking_sampler(monkeypatch) -> None:
     # in the `async-rl` extra, so skip when it is absent instead of failing a sampler test
     # for a data-path dependency it does not use.
     pytest.importorskip('transfer_queue')
-    from twinkle.server.sampler.backends import vllm_async as module
+    from twinkle.server.sampling.execution.backends import vllm_async as module
 
     captured = {}
 
@@ -268,7 +268,7 @@ def test_server_concurrency_does_not_change_native_async_rl_defaults(monkeypatch
     import twinkle.infra as infra
     from twinkle.infra._ray import RayHelper
     from twinkle.sampler.vllm_sampler.vllm_sampler import SAMPLER_MAX_CONCURRENCY
-    from twinkle.server.sampler.backends.vllm_async import ServerVLLMSampler
+    from twinkle.server.sampling.execution.backends.vllm_async import ServerVLLMSampler
     from twinkle.utils.device_mesh import DeviceMesh
     from twinkle_agentic.async_rl.vllm_sampler_tq import VLLMSamplerTQ
 

@@ -21,7 +21,7 @@ from pydantic import ValidationError
 from twinkle.server.config import ApplicationSpec, ServerConfig
 from twinkle.server.exceptions import ConfigParseError
 from twinkle.server.launcher import ServerLauncher
-from twinkle.server.sampler.app import SAMPLER_SELECTOR, build_sampler_app
+from twinkle.server.sampling.execution.app import SAMPLER_SELECTOR, build_sampler_app
 
 # ---------- minimal valid config strategy ---------------------------------- #
 

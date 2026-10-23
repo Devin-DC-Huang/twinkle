@@ -60,7 +60,7 @@ class RedisBackend(StateBackend):
         else:
             await self._client.set(real_key, data)
 
-    async def _read_with_reconnect(self, operation, *args):
+    async def _retry_read(self, operation, *args):
         """Retry only read commands after a stale pooled connection is discarded.
 
         Writes/EXEC are deliberately excluded: a lost acknowledgement does not
@@ -80,7 +80,7 @@ class RedisBackend(StateBackend):
     async def get(self, key: str) -> Any | None:
         """Retrieve value, return None if not found or expired."""
         real_key = self._make_key(key)
-        raw = await self._read_with_reconnect(self._client.get, real_key)
+        raw = await self._retry_read(self._client.get, real_key)
         if raw is None:
             return None
         return json.loads(raw)
@@ -93,7 +93,7 @@ class RedisBackend(StateBackend):
     async def exists(self, key: str) -> bool:
         """Check if key exists and is not expired."""
         real_key = self._make_key(key)
-        return bool(await self._read_with_reconnect(self._client.exists, real_key))
+        return bool(await self._retry_read(self._client.exists, real_key))
 
     async def keys(self, pattern: str) -> list[str]:
         """Return all key names matching the pattern using SCAN.
@@ -191,7 +191,7 @@ class RedisBackend(StateBackend):
         if not keys:
             return []
         real_keys = [self._make_key(k) for k in keys]
-        raw_values = await self._read_with_reconnect(self._client.mget, real_keys)
+        raw_values = await self._retry_read(self._client.mget, real_keys)
         return [json.loads(v) if v is not None else None for v in raw_values]
 
     async def close(self) -> None:
@@ -201,7 +201,7 @@ class RedisBackend(StateBackend):
     async def health_check(self) -> bool:
         """Check if Redis is healthy and available."""
         try:
-            healthy = bool(await self._read_with_reconnect(self._client.ping))
+            healthy = bool(await self._retry_read(self._client.ping))
         except Exception:
             healthy = False
         self._metrics.redis_health.set(1 if healthy else 0)

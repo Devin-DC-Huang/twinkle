@@ -32,6 +32,8 @@ applications:
     args:
       backend: megatron
       model_id: "ms://Qwen/Qwen3.5-4B"
+      min_replicas: 1
+      max_replicas: 1
       max_length: 10240
       max_loras: 10
       nproc_per_node: 4
@@ -46,8 +48,6 @@ applications:
       queue_config:
         rps_limit: 100
         tps_limit: 100000
-      adapter_config:
-        adapter_timeout: 30
     deployments:
       - name: ModelManagement
         autoscaling_config:

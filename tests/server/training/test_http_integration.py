@@ -26,6 +26,8 @@ def test_installed_native_and_tinker_sdks_use_managed_http_routes():
     assert result.returncode == 0, result.stdout + result.stderr
     evidence = next(json.loads(line) for line in result.stdout.splitlines() if line.startswith('{"passed":'))
     assert evidence['passed'] and evidence['native_recreation'] and evidence['tinker_shared']
+    assert len(set(evidence['native_stable_routing'].values())) == 2
+    assert len(set(evidence['tinker_stable_routing'].values())) == 2
     assert evidence['native_lora']
     assert evidence['runtime_lifecycle_rejected']
     assert evidence['tinker_full']

@@ -2,11 +2,12 @@
 """Server configuration package — aggregate root and per-deployment specs."""
 
 from .application_spec import (ApplicationSpec, DataPlaneArgs, HttpOptions, ModelArgs, ProcessorArgs, SamplerArgs,
-                               ServerArgs, SpectralHybridArgs)
+                               ServerArgs)
 from .persistence import PersistenceConfig
 from .server_config import ServerConfig
 from .task_queue import TaskQueueConfig
 from .telemetry import TelemetryConfig
+from .training import SpectralHybridArgs
 
 __all__ = [
     'ApplicationSpec',

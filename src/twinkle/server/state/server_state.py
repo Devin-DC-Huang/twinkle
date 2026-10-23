@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import Any
 
 from twinkle.server.config.persistence import PersistenceConfig
-from twinkle.server.exceptions import RequestRejectedError, ResourceNotFoundError, ResourceQuotaExceededError
+from twinkle.server.exceptions import ResourceNotFoundError, ResourceQuotaExceededError
 from twinkle.server.telemetry.correlation import (BASE_MODEL, MODEL_ID, REPLICA_ID, SAMPLING_SESSION_ID, SESSION_ID,
                                                   TOKEN_ID)
 from twinkle.server.telemetry.tracing import traced_operation
@@ -24,6 +24,7 @@ from .model_manager import ModelManager
 from .models import FutureFailureRecord, ModelRecord, SamplingSessionRecord, SessionRecord
 from .sampling_manager import SamplingSessionManager
 from .session_manager import SessionManager
+from .training_store import TrainingSequences, TrainingStore
 
 logger = get_logger()
 
@@ -131,6 +132,7 @@ class ServerState:
         self._model_mgr = ModelManager(self._backend, expiration_timeout, per_token_model_limit)
         self._sampling_mgr = SamplingSessionManager(self._backend, expiration_timeout)
         self._future_mgr = FutureManager(self._backend, expiration_timeout)
+        self.training_sequences = TrainingSequences(self._backend)
 
         self.expiration_timeout = expiration_timeout
         self.cleanup_interval = cleanup_interval
@@ -173,29 +175,32 @@ class ServerState:
     async def get_capacity_info(self) -> dict[str, int]:
         return await self._model_mgr.get_capacity_info()
 
-    def create_training_store(self, namespace: str):
-        from .training_store import TrainingStore
-        return TrainingStore(self, namespace, self._backend)
+    @property
+    def models(self) -> ModelManager:
+        return self._model_mgr
 
-    async def save_model_record(self, model_id: str, record: ModelRecord) -> None:
-        await self._model_mgr.save_record(model_id, record)
+    @property
+    def sessions(self) -> SessionManager:
+        return self._session_mgr
 
-    async def get_training_records(self, namespace: str):
-        return await self._model_mgr.get_training_records(namespace)
+    @property
+    def futures(self) -> FutureManager:
+        return self._future_mgr
 
-    async def delete_training_sequences(self, training_id: str) -> None:
-        for key in await self._backend.keys(f'seq_ledger::{training_id}::*'):
-            await self._backend.delete(key)
+    @property
+    def sampling_sessions(self) -> SamplingSessionManager:
+        return self._sampling_mgr
 
-    async def unregister_replica_capacity(self, replica_id: str) -> None:
-        await self._model_mgr.unregister_replica_capacity(replica_id)
-
-    async def register_model_record(self, model_id: str, record: ModelRecord) -> None:
-        """Reserve quota for a complete model record, including managed training state."""
-        await self._model_mgr.add(model_id, record)
-
-    async def rebuild_model_indexes(self) -> None:
-        await self._model_mgr.rebuild_indexes()
+    def create_training_store(self, namespace: str) -> TrainingStore:
+        """Compose a namespaced repository; construction performs no I/O."""
+        return TrainingStore(
+            namespace,
+            self._backend,
+            models=self.models,
+            sessions=self.sessions,
+            futures=self.futures,
+            sequences=self.training_sequences,
+            expiration_timeout=self.expiration_timeout)
 
     # ----- Session Management -----
 
@@ -481,20 +486,10 @@ class ServerState:
 
     async def claim_training_seq(self, training_id: str, stream: str, sequence: int, request_id: str,
                                  retention: float) -> str | None:
-        from .sequence import claim_sequence
-        ledger = await self._backend.update_atomic(
-            f'seq_ledger::{training_id}::{stream}',
-            functools.partial(
-                claim_sequence, sequence=sequence, request_id=request_id, now=time.time(), retention=retention))
-        receipt = ledger['receipts'].get(str(sequence))
-        if receipt is None:
-            raise RequestRejectedError('Sequence retry window expired; the operation will not be executed again')
-        return None if receipt['request_id'] == request_id else receipt['request_id']
+        return await self.training_sequences.claim(training_id, stream, sequence, request_id, retention)
 
     async def release_training_seq(self, training_id: str, stream: str, sequence: int, request_id: str) -> None:
-        from .sequence import release_sequence
-        await self._backend.update_atomic(f'seq_ledger::{training_id}::{stream}',
-                                          functools.partial(release_sequence, sequence=sequence, request_id=request_id))
+        await self.training_sequences.release(training_id, stream, sequence, request_id)
 
     async def try_start_future(self, request_id: str) -> bool:
         """Acquire task execution atomically, without inferring ownership from reads."""
@@ -669,7 +664,7 @@ def get_server_state(cache_key: str = 'twinkle_server_state',
     # launcher-propagated env (so a non-gateway worker honours the operator's
     # YAML instead of the hardcoded default), else the module default.
     from twinkle.server.config.application_spec import ServerStateArgs
-    env_policy = ServerStateArgs.from_env()
+    env_policy = ServerStateArgs.from_env() or ServerStateArgs()
 
     def _resolve(explicit, env_value, default):
         if explicit is not None:
@@ -678,13 +673,11 @@ def get_server_state(cache_key: str = 'twinkle_server_state',
             return env_value
         return default
 
-    expiration_timeout = _resolve(expiration_timeout, getattr(env_policy, 'expiration_timeout', None),
-                                  _DEFAULT_EXPIRATION_TIMEOUT)
-    cleanup_interval = _resolve(cleanup_interval, getattr(env_policy, 'cleanup_interval', None),
-                                _DEFAULT_CLEANUP_INTERVAL)
-    per_token_model_limit = _resolve(per_token_model_limit, getattr(env_policy, 'per_token_model_limit', None),
+    expiration_timeout = _resolve(expiration_timeout, env_policy.expiration_timeout, _DEFAULT_EXPIRATION_TIMEOUT)
+    cleanup_interval = _resolve(cleanup_interval, env_policy.cleanup_interval, _DEFAULT_CLEANUP_INTERVAL)
+    per_token_model_limit = _resolve(per_token_model_limit, env_policy.per_token_model_limit,
                                      _DEFAULT_PER_TOKEN_MODEL_LIMIT)
-    metrics_update_interval = _resolve(metrics_update_interval, getattr(env_policy, 'metrics_update_interval', None),
+    metrics_update_interval = _resolve(metrics_update_interval, env_policy.metrics_update_interval,
                                        _DEFAULT_METRICS_UPDATE_INTERVAL)
 
     state = ServerState(

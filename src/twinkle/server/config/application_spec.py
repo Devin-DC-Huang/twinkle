@@ -15,8 +15,8 @@ import os
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing import Any, Literal
 
-from .hybrid import SpectralHybridArgs
 from .task_queue import TaskQueueConfig
+from .training import ModelArgs
 
 # Env var keys the launcher sets from the gateway ``server_config`` so that any
 # Ray worker (model / sampler / processor), not just the gateway, applies the
@@ -53,46 +53,6 @@ class HttpOptions(BaseModel):
 
 
 # ---------- per-deployment args schemas ------------------------------------ #
-
-
-class ModelArgs(_ArgsBase):
-    """Args for the ``model`` deployment.
-
-    The ``backend`` field selects the model implementation (transformers /
-    megatron / mock) — see ``model/app.py`` for the dispatch site that picks
-    the runtime class based on this value.
-    """
-
-    model_id: str
-    nproc_per_node: int = 1
-    device_group: dict[str, Any]
-    device_mesh: dict[str, Any]
-    backend: Literal['mock', 'transformers', 'megatron']
-    env_vars: dict[str, str] = Field(default_factory=dict)
-    min_replicas: int | None = Field(default=None, ge=0, strict=True)
-    max_replicas: int | None = Field(default=None, gt=0, strict=True)
-    idle_timeout_s: float | None = Field(default=None, gt=0, allow_inf_nan=False)
-    train_mode: Literal['lora', 'hybrid', 'full'] = 'lora'
-    strategy: Literal['accelerate', 'native_fsdp'] | None = None
-    adapter_config: dict[str, Any] | None = None
-    queue_config: TaskQueueConfig = Field(default_factory=TaskQueueConfig)
-    max_loras: int = 5
-    max_r: int = Field(default=32, gt=0)
-    max_length: int | None = None
-    target_modules: str | list[str] = 'all-linear'
-    hybrid: SpectralHybridArgs | None = None
-    data_plane_url: str | None = None
-
-    @model_validator(mode='after')
-    def _validate_spectral_backend(self):
-        if self.strategy is not None and self.backend != 'transformers':
-            raise ValueError('strategy is only supported by the transformers backend')
-        if self.hybrid is not None:
-            if self.backend != 'transformers':
-                raise ValueError('hybrid is only supported by the transformers backend')
-            if self.train_mode == 'full':
-                raise ValueError('hybrid is not supported with train_mode="full"')
-        return self
 
 
 class SamplerArgs(_ArgsBase):
@@ -253,7 +213,7 @@ class ApplicationSpec(BaseModel):
     # ``import_path`` and defaults a missing block to ``{}``), so the field is
     # required here — the validator runs first and fills it.
     args: ServerArgs | ModelArgs | SamplerArgs | ProcessorArgs | DataPlaneArgs
-    deployments: list[dict[str, Any]] = Field(default_factory=list)
+    deployments: list[dict[str, Any]] = Field(default_factory=list, max_length=1)
 
     @model_validator(mode='before')
     @classmethod

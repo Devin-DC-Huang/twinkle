@@ -41,7 +41,8 @@ class CreateRequest(StrictRequest):
 class TrainingRequest(StrictRequest):
     """A training handle is control metadata, never a backend kwarg."""
 
-    training_id: str | None = None
+    training_id: str = Field(min_length=1)
+    adapter_name: str
 
 
 class AdapterRequest(TrainingRequest):
@@ -54,7 +55,6 @@ class AdapterRequest(TrainingRequest):
     which would silently disable that dedup.
     """
 
-    adapter_name: str
     seq_id: int | None = None
     gradient_accumulation_steps: int | None = backend_kwarg(default=None, ge=1)
 
@@ -94,7 +94,6 @@ class ClipGradAndStepRequest(ClipGradNormRequest):
 class CalculateMetricRequest(TrainingRequest):
     """Body of ``POST /twinkle/calculate_metric``."""
 
-    adapter_name: str
     is_training: bool = True
 
 
@@ -135,7 +134,6 @@ class _InlineForwardBase(TrainingRequest):
 class ForwardRequest(_InlineForwardBase):
     """Body of ``POST /twinkle/forward``: keeps the graph, mutates no gradients."""
 
-    adapter_name: str
     disable_lora: bool | None = backend_kwarg(default=None)
 
 
@@ -147,14 +145,12 @@ class ForwardOnlyRequest(_InlineForwardBase):
     nothing is mutated to be idempotent about.
     """
 
-    adapter_name: str
     disable_lora: bool | None = backend_kwarg(default=None)
 
 
 class ForwardBackwardTaskRequest(_InlineForwardBase):
     """Body of ``POST /twinkle/forward_backward``: accumulates gradients."""
 
-    adapter_name: str
     seq_id: int | None = None
     sync_gradients: bool | None = backend_kwarg(default=None)
     loss_scale: float | None = backend_kwarg(default=None)
@@ -177,7 +173,6 @@ class DataPlaneForwardRequest(TrainingRequest):
     # Values are *field paths*, not parameter values, so this is not a passthrough
     # region: nothing in it is forwarded verbatim.
     kwarg_fields: dict[str, str] = Field(default_factory=dict)
-    adapter_name: str
     seq_id: int | None = None
     task: str | None = backend_kwarg(default=None)
     temperature: float | None = backend_kwarg(default=None, gt=0)
@@ -199,7 +194,6 @@ class DataPlaneForwardOnlyRequest(TrainingRequest):
     input_refs: list[DataRef] = Field(min_length=1)
     input_field: str | None = None
     kwarg_fields: dict[str, str] = Field(default_factory=dict)
-    adapter_name: str
     task: str | None = backend_kwarg(default=None)
     temperature: float | None = backend_kwarg(default=None, gt=0)
     return_logits: bool | None = backend_kwarg(default=None)
@@ -232,19 +226,16 @@ class DataPlaneForwardOnlyRequest(TrainingRequest):
 
 class SetLossRequest(TrainingRequest):
     loss_cls: str
-    adapter_name: str
     init_kwargs: dict[str, JsonValue] = passthrough()
 
 
 class SetOptimizerRequest(TrainingRequest):
     optimizer_cls: str
-    adapter_name: str
     init_kwargs: dict[str, JsonValue] = passthrough()
 
 
 class SetLrSchedulerRequest(TrainingRequest):
     scheduler_cls: str
-    adapter_name: str
     init_kwargs: dict[str, JsonValue] = passthrough()
 
 
@@ -258,26 +249,22 @@ class SetTemplateRequest(TrainingRequest):
     """
 
     template_cls: str
-    adapter_name: str
     init_kwargs: dict[str, JsonValue] = passthrough()
 
 
 class SetProcessorRequest(TrainingRequest):
     processor_cls: str
-    adapter_name: str
     init_kwargs: dict[str, JsonValue] = passthrough()
 
 
 class AddMetricRequest(TrainingRequest):
     metric_cls: str
-    adapter_name: str
     is_training: bool | None = None
     init_kwargs: dict[str, JsonValue] = passthrough()
 
 
 class ApplyPatchRequest(TrainingRequest):
     patch_cls: str
-    adapter_name: str
     init_kwargs: dict[str, JsonValue] = passthrough()
 
 
@@ -287,7 +274,6 @@ class ApplyPatchRequest(TrainingRequest):
 
 
 class SaveRequest(TrainingRequest):
-    adapter_name: str
     name: str | None = None
     save_optimizer: bool = False
     is_sampler: bool = False  # If True, delete existing sampler weights before saving
@@ -296,7 +282,6 @@ class SaveRequest(TrainingRequest):
 
 
 class LoadRequest(TrainingRequest):
-    adapter_name: str
     name: str
     load_optimizer: bool = False
     no_load_optim: bool | None = backend_only('megatron', default=None)

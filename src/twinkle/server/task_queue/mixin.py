@@ -13,7 +13,8 @@ import uuid
 from collections.abc import Callable, Coroutine
 from typing import TYPE_CHECKING, Any
 
-from twinkle.protocol.types.lifecycle import TERMINAL_STATUSES, TaskEnvelope
+from twinkle.protocol.types.errors import QueueState
+from twinkle.protocol.types.lifecycle import TERMINAL_STATUSES, TaskEnvelope, TaskStatus
 from twinkle.server.config.task_queue import TaskQueueConfig
 from twinkle.server.exceptions import BatchSizeError, ConfigError, InputTokensExceededError, RateLimitExceededError
 from twinkle.server.lifecycle.envelope import envelope_from_record
@@ -23,7 +24,7 @@ from twinkle.server.telemetry.metrics import get_task_metrics
 from twinkle.utils.logger import get_logger
 from .backend_gate import BackendGate
 from .rate_limiter import RateLimiter
-from .types import QueuedTask, QueueState, TaskStatus
+from .types import ExecutionScope, QueuedTask
 from .worker import ComputeWorker
 
 if TYPE_CHECKING:
@@ -352,6 +353,7 @@ class TaskQueueMixin:
         input_tokens: int = 0,
         task_type: str | None = None,
         request_id: str | None = None,
+        execution_scope: ExecutionScope | None = None,
     ) -> dict[str, Any]:
         """Schedule a compute task that runs now instead of in serial order.
 
@@ -376,7 +378,8 @@ class TaskQueueMixin:
                 token=token,
                 input_tokens=input_tokens,
                 task_type=task_type,
-                created_at=time.monotonic()),
+                created_at=time.monotonic(),
+                execution_scope=execution_scope),
             self._queue_key(model_id=model_id, token=token),
             replica_id=getattr(self, 'replica_id', None),
             absolute_deadline=self._future_deadline())

@@ -11,7 +11,6 @@ from tests.server.training.helpers import settle
 from twinkle.hub import HubOperation
 from twinkle.server.state import ServerState
 from twinkle.server.training.router import TrainingRouter
-from twinkle.server.training.catalog import TrainingCatalog
 from twinkle.server.config.training import TrainingConfig
 
 
@@ -59,10 +58,7 @@ async def test_native_lora_admission_does_not_import_peft(monkeypatch, rank):
     router.model = SimpleNamespace(name='small')
     router.state = ServerState(backend=FakeBackend())
     await router.state.create_session({'session_id': 'session'})
-    router.catalog = TrainingCatalog(TrainingConfig(models=[{
-        'name': 'small', 'model_id': 'weights', 'backend': 'transformers', 'device_type': 'cuda',
-        'modes': {'lora': {'num_devices': 1, 'device_mesh': {'dp_size': 1}}},
-    }]))
+    router.config = TrainingConfig(models=[{'name': 'small', 'model_id': 'weights', 'backend': 'transformers', 'device_type': 'cuda', 'mode': 'lora', 'config': {'num_devices': 1, 'device_mesh': {'dp_size': 1}}}])
     async def create(payload):
         await router.state.store_future_status('created', 'pending', None)
         return {'request_id': 'created'}
@@ -88,8 +84,8 @@ async def test_native_lora_admission_does_not_import_peft(monkeypatch, rank):
 
 def test_router_schemas_match_model_runtime_routes():
     from fastapi import FastAPI
-    from twinkle.server.model.tinker_handlers import _register_model_tinker_routes
-    from twinkle.server.model.twinkle_handlers import _register_model_twinkle_routes
+    from twinkle.server.training.execution.tinker_handlers import _register_model_tinker_routes
+    from twinkle.server.training.execution.twinkle_handlers import _register_model_twinkle_routes
     from twinkle.server.training.router import NATIVE_REQUESTS, TINKER_REQUESTS
 
     app = FastAPI()

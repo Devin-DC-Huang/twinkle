@@ -133,7 +133,7 @@ def test_gateway_builder_characterization(monkeypatch) -> None:
 
 
 def test_model_builder_characterization(monkeypatch) -> None:
-    from twinkle.server.model import app as model_mod
+    from twinkle.server.training.execution import app as model_mod
 
     res = _capture_builder(
         monkeypatch,
@@ -152,7 +152,7 @@ def test_model_builder_characterization(monkeypatch) -> None:
 
 
 def test_sampler_builder_characterization(monkeypatch) -> None:
-    from twinkle.server.sampler import app as sampler_mod
+    from twinkle.server.sampling.execution import app as sampler_mod
 
     res = _capture_builder(
         monkeypatch,

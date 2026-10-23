@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from twinkle.server.config.application_spec import SamplerArgs
-from twinkle.server.sampler.controller import SamplerController
+from twinkle.server.sampling.controller import SamplerController
 
 
 @pytest.fixture(scope='session', autouse=True)
@@ -303,7 +303,7 @@ async def test_replaying_config_has_the_same_startup_deadline():
     pool, driver, _ = setup(minimum=0, maximum=1)
     await pool.initialize()
     pool._actions.append(request('twinkle/set_template'))
-    pool.budgets['startup_timeout_s'] = 0.05
+    pool.budgets = pool.budgets.model_copy(update={'startup_timeout_s': 0.05})
     instance = pool._new_instance()
     with pytest.raises(TimeoutError):
         await pool.lifecycle.startups[instance.identity]

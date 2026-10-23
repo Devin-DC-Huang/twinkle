@@ -42,8 +42,7 @@ _FULL = {
     "max_replicas": 1,
     # Full-parameter training holds the deployment exclusively; use long
     # timeouts so the tenant is not expired mid-test.
-    "adapter_config.adapter_timeout": 3600,
-    "adapter_config.adapter_max_lifetime": 36000,
+    "idle_timeout_s": 3600,
 }
 VARIANTS = {
     "lora": (TRANSFORMERS_BASE, {}),

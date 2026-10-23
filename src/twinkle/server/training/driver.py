@@ -7,10 +7,9 @@ import re
 import time
 
 from twinkle.server.resources.runtime import RayRuntime
-from twinkle.server.state.training_records import InstanceRecord
+from twinkle.server.state.training_records import InstanceRecord, TrainingRuntimeContext
 from twinkle.server.telemetry.metrics import get_training_metrics
 from twinkle.utils.logger import get_logger
-from .catalog import TrainingCatalog
 
 logger = get_logger()
 
@@ -21,7 +20,6 @@ class RayInstanceDriver:
         self.config, self.store = config, store
         self.namespace, self.controller_name = namespace, controller_name
         self._metrics = get_training_metrics()
-        self._catalog = TrainingCatalog(config)
         self.runtime = RayRuntime(
             namespace, allocation_timeout=config.allocation_timeout_s, shutdown_timeout=config.shutdown_timeout_s)
 
@@ -30,9 +28,9 @@ class RayInstanceDriver:
 
     async def allocate(self, instance, spec):
         started, status = time.monotonic(), 'error'
-        tags = {'backend': spec.model.backend, 'mode': spec.mode, 'device_type': spec.model.device_type}
+        tags = {'backend': spec.backend, 'mode': spec.mode, 'device_type': spec.device_type}
         try:
-            allocation = await self.runtime.pool.allocate(spec.config.num_devices, spec.model.device_type,
+            allocation = await self.runtime.pool.allocate(spec.config.num_devices, spec.device_type,
                                                           instance.controller_epoch, instance.instance_id)
             status = 'success'
             return {
@@ -47,38 +45,37 @@ class RayInstanceDriver:
     async def deploy(self, instance, spec):
         from ray.util.placement_group import get_placement_group
 
-        from twinkle.server.model.app import build_model_app
+        from twinkle.server.training.execution.app import build_model_app
 
         name = self.application_name(instance)
-        context = {
-            'instance_id': instance.instance_id,
-            'epoch': instance.controller_epoch,
-            'namespace': self.namespace,
-            'controller_name': self.controller_name,
-            'registry_name': name + '-registry'
-        }
+        context = TrainingRuntimeContext(
+            instance_id=instance.instance_id,
+            epoch=instance.controller_epoch,
+            namespace=self.namespace,
+            controller_name=self.controller_name,
+            registry_name=name + '-registry')
         kwargs = spec.config.model_dump(
             exclude={'num_devices', 'device_mesh', 'min_replicas', 'max_replicas', 'idle_timeout_s', 'queue_config'},
             exclude_none=True)
         if 'hybrid' in kwargs:
             kwargs['hybrid'] = spec.config.hybrid
         kwargs['train_mode'] = 'hybrid' if kwargs.get('hybrid') else spec.mode
-        options = self.runtime.deployment_options(spec.model.deploy_options, name, spec.model.env_vars)
+        options = self.runtime.deployment_options(spec.deploy_options, name, spec.env_vars)
         app = build_model_app(
-            model_id=spec.model.model_id,
-            backend=spec.model.backend,
+            model_id=spec.model_id,
+            backend=spec.backend,
             nproc_per_node=spec.config.num_devices,
             device_group={
                 'name': 'model',
                 'ranks': spec.config.num_devices,
-                'device_type': spec.model.device_type
+                'device_type': spec.device_type
             },
             device_mesh={
-                **spec.config.device_mesh.model_dump(exclude_none=True), 'device_type': spec.model.device_type
+                **spec.config.device_mesh.model_dump(exclude_none=True), 'device_type': spec.device_type
             },
             deploy_options=options,
             queue_config=spec.config.queue_config,
-            data_plane_url=spec.model.data_plane_url,
+            data_plane_url=spec.data_plane_url,
             training_context=context,
             placement_group=await asyncio.to_thread(get_placement_group, name),
             allocation_devices=list(instance.devices),
@@ -104,17 +101,17 @@ class RayInstanceDriver:
     async def shutdown(self, instance: InstanceRecord):
         name = instance.application_name or self.application_name(instance)
         try:
-            spec = self._catalog.get(instance.base_model, instance.mode)
+            spec = self.config.get(instance.base_model, instance.mode)
         except Exception:
             tags = {'backend': 'unknown', 'mode': instance.mode, 'device_type': 'unknown'}
         else:
-            tags = {'backend': spec.model.backend, 'mode': spec.mode, 'device_type': spec.model.device_type}
+            tags = {'backend': spec.backend, 'mode': spec.mode, 'device_type': spec.device_type}
 
         def observe_removal(duration, status):
             self._metrics.removal_seconds.observe(duration, tags={**tags, 'status': status})
 
         await self.runtime.shutdown(instance.instance_id, name, observe_removal=observe_removal)
-        await self.store.state.unregister_replica_capacity(instance.instance_id)
+        await self.store.models.unregister_replica_capacity(instance.instance_id)
 
     async def health(self, instance):
         async with asyncio.timeout(5):

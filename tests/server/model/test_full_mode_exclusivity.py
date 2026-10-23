@@ -13,7 +13,6 @@ from starlette.requests import Request
 from tests.server.state.fake_backend import FakeBackend
 from tests.server.training.helpers import request, setup
 from twinkle.server.config.training import TrainingConfig
-from twinkle.server.training.catalog import TrainingCatalog
 from twinkle.server.training.router import TrainingRouter
 
 
@@ -21,9 +20,8 @@ async def _setup_full_instance():
     """Full-mode slots belong to the controller, not the retired model create route."""
     controller, state, runtime, _ = await setup(backend=FakeBackend())
     raw = controller.config.model_dump()
-    raw['models'][0]['modes']['full']['max_replicas'] = 1
+    raw['models'][1]['config']['max_replicas'] = 1
     controller.config = TrainingConfig.model_validate(raw)
-    controller.catalog = TrainingCatalog(controller.config)
     runtime.start_gate.clear()
     return controller, state, runtime
 
@@ -79,8 +77,8 @@ async def test_concurrent_handler_creates_have_exactly_one_winner():
     controller, state, runtime = await _setup_full_instance()
     router = TrainingRouter.__new__(TrainingRouter)
     router.state = state
-    router.catalog = controller.catalog
-    router.model = SimpleNamespace(name='small')
+    router.config = controller.config
+    router.model = SimpleNamespace(name='small-full')
     router.controller = SimpleNamespace(create=SimpleNamespace(remote=AsyncMock(side_effect=controller.create)))
 
     async def create_remote(payload):

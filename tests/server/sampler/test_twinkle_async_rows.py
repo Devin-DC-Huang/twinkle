@@ -8,7 +8,7 @@ from starlette.requests import Request
 
 import twinkle.protocol.types as types
 from twinkle.data_format import SampledSequence, SampleResponse
-from twinkle.server.sampler.twinkle_handlers import (
+from twinkle.server.sampling.execution.twinkle_handlers import (
     _register_twinkle_sampler_routes,
     _build_rollout_rows_and_tags,
 )
@@ -64,7 +64,7 @@ def test_async_sampler_rejects_group_id_count_mismatch() -> None:
 class _SamplerManagement:
 
     def __init__(self):
-        from twinkle.server.sampler.concurrency import SamplerConcurrency
+        from twinkle.server.sampling.execution.concurrency import SamplerConcurrency
         self.sampling_guard = SamplerConcurrency()
         self.sampler = self
         self.data_plane = self
@@ -76,7 +76,7 @@ class _SamplerManagement:
     async def _on_request_start(self, _request):
         return 'token'
 
-    async def submit_concurrent_and_peek(self, coro_factory, *, model_id=None, task_type=None):
+    async def submit_concurrent_and_peek(self, coro_factory, *, model_id=None, task_type=None, execution_scope=None):
         self.scheduled.append({'model_id': model_id, 'task_type': task_type})
         result = await coro_factory()
         from twinkle.protocol.types.lifecycle import TaskEnvelope

@@ -9,7 +9,8 @@ import pytest
 
 from twinkle.server.config.task_queue import TaskQueueConfig
 from twinkle.server.task_queue import TaskQueueMixin
-from twinkle.server.model.managed_runtime import ManagedTrainingRuntime, _tinker_operation
+from twinkle.server.training.execution.runtime import TrainingRuntime
+from twinkle.server.lifecycle.submit import submit_training_task
 from tests.server.training.helpers import create, setup
 
 
@@ -56,19 +57,19 @@ async def test_tinker_seq_retry_runs_once_and_different_operations_do_not_collid
     async def operation():
         counter.append('executed')
         return {'ok': True}
-    context = _tinker_operation.set((identity, 1))
     try:
         first, retry = await asyncio.gather(*(
-            queue.schedule_task(operation, model_id=identity, token='owner', task_type='forward_backward')
+            submit_training_task(queue, operation, training_id=identity, seq_id=1,
+                                 stream='tinker::forward_backward', token='owner', task_type='forward_backward')
             for _ in range(2)))
         assert first == retry
         assert (await settle(state, first['request_id']))['status'] == 'completed'
-        step = await queue.schedule_task(operation, model_id=identity, token='owner', task_type='optim_step')
+        step = await submit_training_task(queue, operation, training_id=identity, seq_id=1,
+                                          stream='tinker::optim_step', token='owner', task_type='optim_step')
         assert step['request_id'] != first['request_id']
         await settle(state, step['request_id'])
         assert len(counter) == 2
     finally:
-        _tinker_operation.reset(context)
         await queue.shutdown_task_queue()
         await controller.shutdown()
 
@@ -124,7 +125,7 @@ async def test_readiness_waits_for_real_ray_worker_constructor():
         def is_loaded(self):
             return self.loaded
     worker = Worker.remote()
-    runtime = ManagedTrainingRuntime()
+    runtime = TrainingRuntime()
     runtime.model = SimpleNamespace(_actors=[worker])
     try:
         await runtime.wait_for_training_workers()

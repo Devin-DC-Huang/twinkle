@@ -15,8 +15,8 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from twinkle.server.exceptions import ConfigError
-from twinkle.server.model.app import MODEL_SELECTOR
-from twinkle.server.model.backends.mock_model import TwinkleCompatMockModel
+from twinkle.server.training.execution.app import MODEL_SELECTOR
+from twinkle.server.training.execution.backends.mock_model import TwinkleCompatMockModel
 
 _MODEL_BACKENDS = tuple(MODEL_SELECTOR.builders)
 

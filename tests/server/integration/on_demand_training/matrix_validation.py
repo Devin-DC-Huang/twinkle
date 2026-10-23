@@ -277,7 +277,7 @@ def main():
     source = root / 'tests/server/config' / ('server_config_4b_e2e.yaml' if args.backend == 'transformers' else
                                              'server_config_4b_e2e_megatron.yaml')
     raw = yaml.safe_load(source.read_text())
-    raw.setdefault('training', {}).update({
+    raw.setdefault('resources', {}).update({
         'startup_timeout_s': args.startup_timeout_s,
         'shutdown_timeout_s': args.shutdown_timeout_s,
     })
@@ -435,8 +435,8 @@ def main():
                 base_url, launcher._training_controller, model_name)
             evidence['capacity_checked'] = validate_capacity(
                 base_url, launcher._training_controller, model_name,
-                next(model.name for model in config.training_config.models if model.modes.full is not None),
-                config.training_config.models[0].modes.lora.max_loras)
+                next(model.name for model in config.training_config.models if model.mode == 'full'),
+                config.training_config.models[0].config.max_loras)
         if args.stress_iterations or args.soak_seconds:
             from tests.server.integration.on_demand_training.acceptance_support import assert_released
             controller = launcher._training_controller

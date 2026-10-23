@@ -5,7 +5,7 @@ Processor management application.
 Provides a Ray Serve deployment for managing distributed processors
 (datasets, dataloaders, preprocessors, rewards, templates, weight loaders, etc.).
 
-Follows the same structural pattern as model/app.py:
+Follows the same structural pattern as training/execution/app.py:
 - ProcessorManagement is a top-level class inheriting ProcessorManagerMixin
 - Routes are registered in build_processor_app() via _register_processor_routes()
 - serve.ingress(app)(ProcessorManagement) applied before deployment

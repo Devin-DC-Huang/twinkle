@@ -10,7 +10,6 @@ from twinkle import DeviceGroup
 from twinkle.infra._ray.resource_manager import ResourceManager
 from twinkle.server.config.training import TrainingConfig
 from twinkle.server.resources.allocation import CapacityUnavailableError, DevicePool
-from twinkle.server.training.catalog import TrainingCatalog
 
 
 async def main():
@@ -30,28 +29,15 @@ async def main():
     allocations = []
     try:
         for index, count in enumerate((2, 2, 4)):
-            config = TrainingConfig(models=[{
-                'name': str(index),
-                'model_id': str(index),
-                'backend': 'mock',
-                'device_type': 'cuda',
-                'modes': {
-                    'full': {
-                        'num_devices': count,
-                        'device_mesh': {
-                            'fsdp_size': count
-                        }
-                    }
-                },
-            }])
-            spec = TrainingCatalog(config).get(str(index), 'full')
-            allocation = await pool.allocate(spec.config.num_devices, spec.model.device_type, 'epoch', str(index))
+            config = TrainingConfig(models=[{'name': str(index), 'model_id': str(index), 'backend': 'mock', 'device_type': 'cuda', 'mode': 'full', 'config': {'num_devices': count, 'device_mesh': {'fsdp_size': count}}}])
+            spec = config.get(str(index), 'full')
+            allocation = await pool.allocate(spec.config.num_devices, spec.device_type, 'epoch', str(index))
             allocations.append(allocation)
         devices = [device for allocation in allocations for device in allocation.devices]
         assert len(set(devices)) == 8, devices
         assert len({allocation.node_id for allocation in allocations}) == 1
         try:
-            await pool.allocate(spec.config.num_devices, spec.model.device_type, 'epoch', 'overflow')
+            await pool.allocate(spec.config.num_devices, spec.device_type, 'epoch', 'overflow')
             raise AssertionError('over-allocation was admitted')
         except CapacityUnavailableError:
             pass
@@ -66,22 +52,8 @@ async def main():
         assert get_placement_group(allocations[0].name).id == owned_pg.id
         freed = allocations[0]
         await pool.remove(freed.name)
-        two = TrainingCatalog(
-            TrainingConfig(models=[{
-                'name': 'replacement',
-                'model_id': 'replacement',
-                'backend': 'mock',
-                'device_type': 'cuda',
-                'modes': {
-                    'full': {
-                        'num_devices': 2,
-                        'device_mesh': {
-                            'fsdp_size': 2
-                        }
-                    }
-                },
-            }])).get('replacement', 'full')
-        replacement = await pool.allocate(two.config.num_devices, two.model.device_type, 'epoch', 'replacement')
+        two = TrainingConfig(models=[{'name': 'replacement', 'model_id': 'replacement', 'backend': 'mock', 'device_type': 'cuda', 'mode': 'full', 'config': {'num_devices': 2, 'device_mesh': {'fsdp_size': 2}}}]).get('replacement', 'full')
+        replacement = await pool.allocate(two.config.num_devices, two.device_type, 'epoch', 'replacement')
         allocations.append(replacement)
         assert set(replacement.devices) == set(freed.devices)
         print(json.dumps({'passed': True, 'devices': devices, 'reused': list(replacement.devices)}))

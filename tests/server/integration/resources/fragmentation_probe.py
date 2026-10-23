@@ -10,7 +10,6 @@ from ray.util.placement_group import placement_group, placement_group_table, rem
 
 from twinkle.server.config.training import TrainingConfig
 from twinkle.server.resources.allocation import CapacityUnavailableError, DevicePool
-from twinkle.server.training.catalog import TrainingCatalog
 
 
 async def main():
@@ -27,28 +26,14 @@ async def main():
         # Keep fragmentation rejection fast, but allow a cold Ray worker to
         # import the allocation probe before confirming a successful placement.
         pool = DevicePool(ray.get_runtime_context().namespace, allocation_timeout=1, shutdown_timeout=60)
-        spec = TrainingCatalog(
-            TrainingConfig(models=[{
-                'name': 'two',
-                'model_id': 'two',
-                'backend': 'mock',
-                'device_type': 'cuda',
-                'modes': {
-                    'full': {
-                        'num_devices': 2,
-                        'device_mesh': {
-                            'fsdp_size': 2
-                        }
-                    }
-                },
-            }])).get('two', 'full')
+        spec = TrainingConfig(models=[{'name': 'two', 'model_id': 'two', 'backend': 'mock', 'device_type': 'cuda', 'mode': 'full', 'config': {'num_devices': 2, 'device_mesh': {'fsdp_size': 2}}}]).get('two', 'full')
         for marker in ('left', 'right'):
             pg = placement_group([{'GPU': 3, marker: 0.01}], strategy='STRICT_PACK')
             occupied.append(pg)
             await asyncio.wait_for(pg.ready(), 20)
         assert ray.available_resources()['GPU'] == 2
         try:
-            await pool.allocate(spec.config.num_devices, spec.model.device_type, 'epoch', 'fragmented')
+            await pool.allocate(spec.config.num_devices, spec.device_type, 'epoch', 'fragmented')
         except CapacityUnavailableError:
             pass
         else:
@@ -63,7 +48,7 @@ async def main():
             await asyncio.sleep(0.05)
         else:
             raise AssertionError('Owned GPU reservation was not released')
-        allocated = await pool.allocate(spec.config.num_devices, spec.model.device_type, 'epoch', 'available')
+        allocated = await pool.allocate(spec.config.num_devices, spec.device_type, 'epoch', 'available')
         assert len(set(allocated.devices)) == 2
         print(
             json.dumps({

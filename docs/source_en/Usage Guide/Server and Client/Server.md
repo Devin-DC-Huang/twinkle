@@ -233,9 +233,6 @@ applications:
         rps_limit: 100                                 # Max requests per second
         tps_limit: 10000                               # Max tokens per second per user
         max_input_tokens: 10000                        # Maximum input tokens per request
-      adapter_config:
-        adapter_timeout: 30                            # Idle adapter timeout unload time (seconds)
-        adapter_max_lifetime: 36000                    # Maximum adapter lifetime (seconds)
       max_loras: 1                                     # Maximum number of LoRA adapters per model
     deployments:
       - name: ModelManagement
@@ -328,9 +325,6 @@ The difference from the Megatron backend is only in the `backend` parameter of t
       device_mesh:
         device_type: cuda
         dp_size: 2
-      adapter_config:
-        adapter_timeout: 1800                          # Idle adapter timeout unload time (seconds)
-        adapter_max_lifetime: 36000
     deployments:
       - name: ModelManagement
         autoscaling_config:

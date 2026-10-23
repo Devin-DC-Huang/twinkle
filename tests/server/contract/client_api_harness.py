@@ -66,8 +66,8 @@ def build_gateway_app() -> FastAPI:
 
 
 def build_model_app() -> FastAPI:
-    from twinkle.server.model.tinker_handlers import _register_model_tinker_routes
-    from twinkle.server.model.twinkle_handlers import _register_model_twinkle_routes
+    from twinkle.server.training.execution.tinker_handlers import _register_model_tinker_routes
+    from twinkle.server.training.execution.twinkle_handlers import _register_model_twinkle_routes
 
     app = FastAPI()
     _register_model_tinker_routes(app, _noop_self)
@@ -76,8 +76,8 @@ def build_model_app() -> FastAPI:
 
 
 def build_sampler_app() -> FastAPI:
-    from twinkle.server.sampler.tinker_handlers import _register_tinker_sampler_routes
-    from twinkle.server.sampler.twinkle_handlers import _register_twinkle_sampler_routes
+    from twinkle.server.sampling.execution.tinker_handlers import _register_tinker_sampler_routes
+    from twinkle.server.sampling.execution.twinkle_handlers import _register_twinkle_sampler_routes
 
     app = FastAPI()
     _register_tinker_sampler_routes(app, _noop_self)

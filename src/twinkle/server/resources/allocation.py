@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 from twinkle import Platform
 from twinkle.infra._ray.resource_manager import _gpu_placement_group_cpus
-from twinkle.server.exceptions import RequestRejectedError
+from twinkle.server.exceptions import RequestRejectedError, ResourceReleaseError
 
 
 class CapacityUnavailableError(RequestRejectedError):
@@ -97,26 +97,41 @@ class DevicePool:
             if creating.done() and self._creating.get(name) is creating:
                 self._creating.pop(name)
 
-    async def remove(self, name: str) -> None:
-        from ray.util.placement_group import get_placement_group, placement_group_table, remove_placement_group
+    async def _finish_creation(self, name):
+        creating = self._creating.get(name)
+        if creating is None:
+            return
+        # A failed create has no result to free. A pending create must stay tracked
+        # across cancellation, so do not remove it until this await has completed.
         try:
-            async with asyncio.timeout(self.shutdown_timeout):
-                creating = self._creating.get(name)
-                if creating is not None:
-                    try:
-                        await asyncio.shield(creating)
-                    except Exception:
-                        pass
-                    if self._creating.get(name) is creating:
-                        self._creating.pop(name)
-                try:
-                    pg = await asyncio.to_thread(get_placement_group, name)
-                except ValueError:
-                    return
-                await asyncio.to_thread(remove_placement_group, pg)
-                while True:
-                    if (await asyncio.to_thread(placement_group_table, pg)).get('state') == 'REMOVED':
-                        return
-                    await asyncio.sleep(0.05)
+            await asyncio.shield(creating)
+        except Exception:
+            pass  # A failed create has no allocation result; cancellation remains unsafe.
+        if self._creating.get(name) is creating:
+            self._creating.pop(name)
+
+    @staticmethod
+    async def _find_group(name):
+        from ray.util.placement_group import get_placement_group
+        try:
+            return await asyncio.to_thread(get_placement_group, name)
+        except ValueError:
+            return None  # A missing named group is already released.
+
+    async def _remove(self, name):
+        from ray.util.placement_group import placement_group_table, remove_placement_group
+        await self._finish_creation(name)
+        pg = await self._find_group(name)
+        if pg is None:
+            return
+        await asyncio.to_thread(remove_placement_group, pg)
+        while (await asyncio.to_thread(placement_group_table, pg)).get('state') != 'REMOVED':
+            await asyncio.sleep(0.05)
+
+    async def remove(self, name: str) -> None:
+        try:
+            await asyncio.wait_for(self._remove(name), self.shutdown_timeout)
         except TimeoutError as exc:
             raise TimeoutError(f'Placement group removal was not confirmed: {name}') from exc
+        except Exception as exc:
+            raise ResourceReleaseError(f'Placement group removal failed: {name}', phase='pg_removal') from exc

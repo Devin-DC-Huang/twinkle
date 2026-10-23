@@ -13,8 +13,8 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from twinkle.server.config.application_spec import SamplerArgs
 from twinkle.server.deployment import bind_deployment, build_deployment_app
 from twinkle.server.resources.allocation import CapacityUnavailableError, DevicePool
-from twinkle.server.sampler.controller import SamplerController
-from twinkle.server.sampler.driver import SamplerDriver
+from twinkle.server.sampling.controller import SamplerController
+from twinkle.server.sampling.driver import SamplerDriver
 
 
 @ray.remote(num_cpus=0.01, num_gpus=1)

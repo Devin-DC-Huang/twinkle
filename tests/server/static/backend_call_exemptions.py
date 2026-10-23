@@ -27,6 +27,6 @@ from __future__ import annotations
 
 # (module_relpath under src/twinkle/server, innermost enclosing function name)
 BACKEND_CALL_EXEMPTIONS: frozenset[tuple[str, str]] = frozenset({
-    ('sampler/twinkle_handlers.py', '_stream_queue'),
-    ('sampler/twinkle_handlers.py', '_stream_generation'),
+    ('sampling/execution/twinkle_handlers.py', '_stream_queue'),
+    ('sampling/execution/twinkle_handlers.py', '_stream_generation'),
 })

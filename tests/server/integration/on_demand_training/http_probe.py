@@ -43,7 +43,7 @@ def main():
             'host': '127.0.0.1',
             'port': port
         },
-        'training': {
+        'resources': {
             'startup_timeout_s': 600,
             'shutdown_timeout_s': 180
         },
@@ -78,6 +78,13 @@ def main():
                 'autoscaling_config': {'min_replicas': 1, 'max_replicas': 1, 'target_ongoing_requests': 4},
                 'ray_actor_options': {'num_cpus': 0.1, 'runtime_env': {'env_vars': {'LEGACY_CONFIG_PROBE': '1'}}},
             }],
+        }, {
+            'name': 'routed', 'import_path': 'model', 'route_prefix': '/api/v1/model/routed',
+            'args': {
+                'model_id': 'small', 'backend': 'mock', 'train_mode': 'lora',
+                'device_group': {'ranks': 1, 'device_type': 'cpu'}, 'device_mesh': {'dp_size': 1},
+                'max_loras': 1, 'max_replicas': 2,
+            },
         }, {
             'name': 'gateway',
             'import_path': 'server',
@@ -118,6 +125,24 @@ def main():
         first = MultiLoraTransformersModel('small', transport=transport)
         second = MultiLoraTransformersModel('small', transport=transport)
         from peft import LoraConfig
+
+        def assert_separate_instances(identities):
+            diagnostic = ray.get(controller.diagnostics.remote())
+            owners = {identity: item['instance_id'] for item in diagnostic['instances']
+                      for identity in item['training_ids'] if identity in identities}
+            assert set(owners) == set(identities) and len(set(owners.values())) == 2, owners
+            return owners
+
+        routed = [MultiLoraTransformersModel('routed', transport=transport) for _ in range(2)]
+        for client in routed:
+            client.add_adapter_to_model('same', LoraConfig(r=8, target_modules='all-linear'))
+        native_owners = assert_separate_instances([client._training_ids['same'] for client in routed])
+        for _ in range(3):
+            for client in reversed(routed):
+                assert json.loads(client.get_train_configs().result) == {}
+                client.zero_grad()
+        for client in routed:
+            client.remove_adapter()
         first.add_adapter_to_model('same', LoraConfig(r=8, target_modules='all-linear'))
         instance = next(
             item for item in ray.get(controller.diagnostics.remote())['instances']
@@ -148,6 +173,13 @@ def main():
         init_tinker_client()
         from tinker import ServiceClient
         service = ServiceClient(base_url=base, api_key='probe-tinker')
+        routed_tinker = [service.create_lora_training_client(base_model='routed', rank=8) for _ in range(2)]
+        tinker_owners = assert_separate_instances([client.model_id for client in routed_tinker])
+        for _ in range(3):
+            for client in reversed(routed_tinker):
+                assert client.get_info().model_id == client.model_id
+        for client in routed_tinker:
+            assert unload_tinker_model(service, client.model_id).model_id == client.model_id
         shared1 = service.create_lora_training_client(base_model='small', rank=8)
         shared2 = service.create_lora_training_client(base_model='small', rank=8)
         assert shared1.model_id != shared2.model_id
@@ -220,6 +252,8 @@ def main():
             json.dumps({
                 'passed': True,
                 'native_recreation': True,
+                'native_stable_routing': native_owners,
+                'tinker_stable_routing': tinker_owners,
                 'native_lora': True,
                 'tinker_shared': True,
                 'tinker_full': True,

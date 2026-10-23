@@ -7,7 +7,7 @@ import pytest
 
 from twinkle.server.telemetry import metrics
 from twinkle.server.training.controller import TrainingController
-from twinkle.server.telemetry.training_metrics import TrainingInstanceMetrics
+from twinkle.server.telemetry.metrics import TrainingInstanceMetrics
 
 _ALLOWED_ATTRIBUTES = {'backend', 'mode', 'state', 'status', 'reason', 'device_type', 'resident'}
 
@@ -103,9 +103,9 @@ def test_training_metric_adapters_rebind_after_registry_reset(monkeypatch):
 @pytest.mark.parametrize('backend', ['transformers', 'megatron'])
 def test_controller_metrics_clear_old_states_and_released_resources(monkeypatch, backend):
     registry, meter = build_registry(monkeypatch)
-    spec = SimpleNamespace(model=SimpleNamespace(backend=backend, device_type='cuda'))
+    spec = SimpleNamespace(backend=backend, device_type='cuda')
     controller = TrainingController.__new__(TrainingController)
-    controller.catalog = SimpleNamespace(get=lambda base_model, mode: spec)
+    controller.config = SimpleNamespace(get=lambda base_model, mode: spec)
     controller._metrics = registry.training_metrics()
     controller._instance_metrics = TrainingInstanceMetrics(controller._metrics)
     controller.instances = {
@@ -148,3 +148,112 @@ def test_controller_metrics_clear_old_states_and_released_resources(monkeypatch,
     controller._report_instance_metrics()
     for name in (instances_name, devices_name, groups_name):
         assert all(value == 0 for value in totals(name).values())
+
+
+@pytest.mark.asyncio
+async def test_repeated_failed_cleanup_is_one_quarantine_transition():
+    from unittest.mock import MagicMock
+    from tests.server.state.fake_backend import FakeBackend
+    from tests.server.training.helpers import create, setup
+
+    controller, state, driver, _ = await setup(backend=FakeBackend())
+    identity = await create(controller, state, 'metric-retry')
+    instruments = MagicMock()
+    controller._metrics = instruments
+    driver.fail_shutdown = True
+    try:
+        with pytest.raises(RuntimeError, match='quarantined'):
+            await controller.release(identity, 'owner', 'session')
+        for _ in range(2):
+            await controller.sweep()
+            await controller.wait_for_jobs()
+        assert instruments.quarantined_total.inc.call_count == 1
+        assert instruments.shutdown_seconds.observe.call_count == 3
+    finally:
+        driver.fail_shutdown = False
+        await controller.shutdown()
+
+
+@pytest.mark.parametrize('phase', ['worker_death', 'pg_removal'])
+def test_quarantine_classification_uses_typed_phase(phase):
+    from twinkle.server.exceptions import ResourceReleaseError
+    assert TrainingInstanceMetrics.quarantine_reason(ResourceReleaseError('unconfirmed', phase=phase)) == phase
+    assert TrainingInstanceMetrics.quarantine_reason(RuntimeError('user text: worker death')) == 'other'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('fail_start', [False, True])
+async def test_startup_and_shutdown_histograms_follow_real_attempts(fail_start):
+    from unittest.mock import MagicMock
+    from tests.server.state.fake_backend import FakeBackend
+    from tests.server.training.helpers import setup, request
+
+    controller, state, driver, _ = await setup(backend=FakeBackend())
+    controller._metrics = MagicMock()
+    driver.fail_start = fail_start
+    try:
+        ref = await controller.create(request('timed-start'))
+        await controller.wait_for_jobs()
+        future = await state.get_future(ref['request_id'])
+        assert future['status'] == ('failed' if fail_start else 'completed')
+        call = controller._metrics.startup_seconds.observe.call_args
+        assert call.args[0] >= 0
+        assert call.kwargs['tags'] == {'backend': 'mock', 'mode': 'lora',
+                                       'status': 'error' if fail_start else 'success'}
+        if not fail_start:
+            await controller.release(future['result']['training_id'], 'owner', 'session')
+        call = controller._metrics.shutdown_seconds.observe.call_args
+        assert call.args[0] >= 0 and call.kwargs['tags']['status'] == 'success'
+    finally:
+        await controller.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failed', [False, True])
+async def test_sweep_instruments_one_iteration_and_its_outcome(monkeypatch, failed):
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+    from twinkle.server.training.actor import TrainingControllerActor
+
+    async def stop_after_iteration(delay):
+        raise asyncio.CancelledError
+
+    actor = SimpleNamespace(core=SimpleNamespace(sweep=AsyncMock(
+        side_effect=RuntimeError('state unavailable') if failed else None)),
+        config=SimpleNamespace(sweep_interval_s=5), _metrics=MagicMock())
+    monkeypatch.setattr('twinkle.server.training.actor.asyncio.sleep', stop_after_iteration)
+    with pytest.raises(asyncio.CancelledError):
+        await TrainingControllerActor.__ray_metadata__.modified_class._sweep(actor)
+    tags = {'status': 'error' if failed else 'success'}
+    actor._metrics.sweep_total.inc.assert_called_once_with(tags=tags)
+    call = actor._metrics.sweep_seconds.observe.call_args
+    assert call.args[0] >= 0 and call.kwargs['tags'] == tags
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failed', [False, True])
+async def test_driver_records_allocation_attempts(failed):
+    from unittest.mock import AsyncMock, MagicMock
+    from twinkle.server.config.training import TrainingConfig
+    from twinkle.server.resources.allocation import DeviceAllocation
+    from twinkle.server.training.driver import RayInstanceDriver
+
+    config = TrainingConfig(models=[{'name': 'tiny', 'model_id': 'tiny', 'backend': 'mock',
+        'device_type': 'cpu', 'mode': 'full', 'config': {'num_devices': 1, 'device_mesh': {'device_type': 'cpu'}}}])
+    store = SimpleNamespace(models=SimpleNamespace(unregister_replica_capacity=AsyncMock()))
+    driver = RayInstanceDriver(config, store, 'test', 'controller')
+    driver._metrics = MagicMock()
+    allocation = DeviceAllocation('owned', 'pg', 'node', ('0',))
+    driver.runtime.pool.allocate = AsyncMock(return_value=allocation,
+        side_effect=RuntimeError('allocation failed') if failed else None)
+    instance = SimpleNamespace(instance_id='instance', controller_epoch='epoch', application_name='owned',
+                               base_model='tiny', mode='full')
+    if failed:
+        with pytest.raises(RuntimeError, match='allocation failed'):
+            await driver.allocate(instance, config.models[0])
+    else:
+        assert (await driver.allocate(instance, config.models[0]))['devices'] == ['0']
+    call = driver._metrics.allocation_seconds.observe.call_args
+    assert call.args[0] >= 0
+    assert call.kwargs['tags'] == {'backend': 'mock', 'mode': 'full', 'device_type': 'cpu',
+                                   'status': 'error' if failed else 'success'}
