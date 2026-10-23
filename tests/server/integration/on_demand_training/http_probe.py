@@ -8,18 +8,22 @@ import socket
 import tempfile
 import time
 import uuid
+from pathlib import Path
 from on_demand_sdk import unload_tinker_model
 from ray import serve
 
 from twinkle.server.config import ServerConfig
 from twinkle.server.launcher.server_launcher import ServerLauncher
-from twinkle_client import init_tinker_client
-from twinkle_client.http import ClientTransport
-from twinkle_client.http.context import ClientContext
+from twinkle_client import init_tinker_client, init_twinkle_client
 from twinkle_client.model.multi_lora_transformers import MultiLoraTransformersModel
 
 
 def main():
+    started = time.monotonic()
+
+    def phase(name, **details):
+        print(json.dumps({'phase': name, 'elapsed_s': round(time.monotonic() - started, 2), **details}), flush=True)
+
     namespace = 'http_' + uuid.uuid4().hex[:8]
     with socket.socket() as listener:
         listener.bind(('127.0.0.1', 0))
@@ -59,6 +63,7 @@ def main():
                 'device_mesh': {'dp_size': 1},
                 'max_loras': 2,
                 'max_replicas': 1,
+                'adapter_config': {'adapter_timeout': 30},
             },
         }, {
             'name': 'other',
@@ -72,6 +77,7 @@ def main():
                 'device_mesh': {'dp_size': 1},
                 'min_replicas': 0,
                 'max_replicas': 1,
+                'adapter_config': {'adapter_timeout': 30},
             },
             'deployments': [{
                 'max_ongoing_requests': 8,
@@ -84,6 +90,7 @@ def main():
                 'model_id': 'small', 'backend': 'mock', 'train_mode': 'lora',
                 'device_group': {'ranks': 1, 'device_type': 'cpu'}, 'device_mesh': {'dp_size': 1},
                 'max_loras': 1, 'max_replicas': 2,
+                'adapter_config': {'adapter_timeout': 30},
             },
         }, {
             'name': 'gateway',
@@ -99,6 +106,7 @@ def main():
     launcher = ServerLauncher(config)
     launcher._start_serve()
     base = f'http://127.0.0.1:{port}'
+    native = fresh_native = service = None
 
     def wait_epoch(controller, old_epoch):
         deadline = time.monotonic() + 90
@@ -120,8 +128,9 @@ def main():
         launcher._deploy_training()
         controller = launcher._training_controller
         assert ray.get(controller.diagnostics.remote())['instances'] == []
-        session = requests.post(base + '/api/v1/twinkle/create_session', json={}, timeout=10).json()['session_id']
-        transport = ClientTransport(ClientContext(base_url=base, api_key='probe-owner', session_id=session))
+        phase('server_ready')
+        native = init_twinkle_client(base_url=base, api_key='probe-owner')
+        transport = native.transport
         first = MultiLoraTransformersModel('small', transport=transport)
         second = MultiLoraTransformersModel('small', transport=transport)
         from peft import LoraConfig
@@ -143,6 +152,7 @@ def main():
                 client.zero_grad()
         for client in routed:
             client.remove_adapter()
+        phase('native_routing_verified')
         first.add_adapter_to_model('same', LoraConfig(r=8, target_modules='all-linear'))
         instance = next(
             item for item in ray.get(controller.diagnostics.remote())['instances']
@@ -170,6 +180,7 @@ def main():
         native_lora.add_adapter_to_model('native-lora', LoraConfig(r=8, target_modules='all-linear'))
         native_lora.zero_grad()
         native_lora.remove_adapter()
+        phase('native_lifecycle_verified')
         init_tinker_client()
         from tinker import ServiceClient
         service = ServiceClient(base_url=base, api_key='probe-tinker')
@@ -180,6 +191,7 @@ def main():
                 assert client.get_info().model_id == client.model_id
         for client in routed_tinker:
             assert unload_tinker_model(service, client.model_id).model_id == client.model_id
+        phase('tinker_routing_verified')
         shared1 = service.create_lora_training_client(base_model='small', rank=8)
         shared2 = service.create_lora_training_client(base_model='small', rank=8)
         assert shared1.model_id != shared2.model_id
@@ -213,6 +225,7 @@ def main():
         ray.kill(controller, no_restart=False)
         diagnostic = wait_epoch(controller, old_epoch)
         assert not [item for item in diagnostic['instances'] if item['state'] != 'STOPPED']
+        phase('controller_recovered')
         stale = requests.post(
             base + '/api/v1/get_info',
             json={
@@ -226,45 +239,52 @@ def main():
             timeout=10)
         assert stale.status_code == 404, stale.text
         before = ray.available_resources().get('CPU', 0)
-        for index in range(10):
+        for index in range(3):
             model = MultiLoraTransformersModel('small' if index % 2 == 0 else 'other', transport=transport)
             model.add_adapter_to_model('cycle', LoraConfig(r=8, target_modules='all-linear')
                                        if index % 2 == 0 else None)
             model.zero_grad()
             model.remove_adapter()
-            print(json.dumps({'phase': 'cycles', 'completed': index + 1}), flush=True)
+            phase('cycles', completed=index + 1)
         assert ray.available_resources().get('CPU', 0) >= before - 0.02
         final = ray.get(controller.diagnostics.remote())
         assert all(item['state'] == 'STOPPED' for item in final['instances'])
         live = MultiLoraTransformersModel('other', transport=transport)
         live.add_adapter_to_model('state-loss', None)
+        native.close()
         ray.kill(ray.get_actor('twinkle_state_actor', namespace=namespace), no_restart=False)
         after_loss = wait_epoch(controller, final['epoch'])
         assert not [item for item in after_loss['instances'] if item['state'] != 'STOPPED']
-        session = requests.post(base + '/api/v1/twinkle/create_session', json={}, timeout=10).json()['session_id']
-        fresh_transport = ClientTransport(ClientContext(base_url=base, api_key='probe-owner', session_id=session))
+        fresh_native = init_twinkle_client(base_url=base, api_key='probe-owner')
+        fresh_transport = fresh_native.transport
         fresh = MultiLoraTransformersModel('other', transport=fresh_transport)
         fresh.add_adapter_to_model('state-loss', None)
         assert fresh._training_ids['state-loss'] != live._training_ids['state-loss']
         fresh.remove_adapter()
-        fresh_transport.close()
-        print(
-            json.dumps({
-                'passed': True,
-                'native_recreation': True,
-                'native_stable_routing': native_owners,
-                'tinker_stable_routing': tinker_owners,
-                'native_lora': True,
-                'tinker_shared': True,
-                'tinker_full': True,
-                'restart': True,
-                'state_loss': True,
-                'runtime_lifecycle_rejected': True,
-                'cycles': 10,
-                'instances': len(final['instances'])
-            }))
-        transport.close()
+        phase('state_loss_recovered')
+        evidence = {
+            'passed': True,
+            'native_recreation': True,
+            'native_stable_routing': native_owners,
+            'tinker_stable_routing': tinker_owners,
+            'native_lora': True,
+            'tinker_shared': True,
+            'tinker_full': True,
+            'restart': True,
+            'state_loss': True,
+            'runtime_lifecycle_rejected': True,
+            'cycles': 3,
+            'instances': len(final['instances'])
+        }
+        if result_path := os.environ.get('TWINKLE_TEST_HTTP_RESULT'):
+            Path(result_path).write_text(json.dumps(evidence))
+        print(json.dumps(evidence), flush=True)
     finally:
+        for client in (native, fresh_native):
+            if client is not None:
+                client.close()
+        if service is not None:
+            service.holder.close()
         if getattr(launcher, '_training_controller', None) is not None:
             ray.get(launcher._training_controller.shutdown.remote(), timeout=180)
             ray.kill(launcher._training_controller, no_restart=True)

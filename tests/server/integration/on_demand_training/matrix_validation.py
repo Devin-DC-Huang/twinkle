@@ -353,6 +353,7 @@ def main():
         'cases': [],
         'lazy_start': False,
     }
+    started = time.monotonic()
     ray.init(
         address='local',
         namespace=namespace,
@@ -360,14 +361,20 @@ def main():
         num_gpus=args.training_devices + (0 if args.recovery_only else 1),
         _temp_dir='/tmp/twm-' + namespace[-8:],
         include_dashboard=False)
+    evidence['ray_startup_seconds'] = time.monotonic() - started
     launcher = ServerLauncher(config)
     try:
+        started = time.monotonic()
         launcher._start_serve()
         for app in config.applications:
-            launcher._deploy_application(app)
+            if app.import_path != 'sampler':
+                launcher._deploy_application(app)
         launcher._deploy_training()
         assert ray.get(launcher._training_controller.diagnostics.remote())['instances'] == []
         evidence['lazy_start'] = True
+        evidence['server_startup_seconds'] = time.monotonic() - started
+        print(json.dumps({'phase': 'training_server_ready', 'seconds': evidence['server_startup_seconds'],
+                          'sampler_running': False}), flush=True)
         filenames = ['test_sft_e2e.py', 'test_dpo_e2e.py', 'test_grpo_e2e.py']
         if not args.skip_full_cycle:
             filenames.append('test_full_cycle_e2e.py')
@@ -383,7 +390,19 @@ def main():
             (run_dir / (filename + '.collect.log')).write_text(collection.stdout + collection.stderr)
             expected = sum('::test_' in line for line in collection.stdout.splitlines())
             assert collection.returncode == 0 and expected > 0, collection.stdout + collection.stderr
+            if filename in ('test_grpo_e2e.py', 'test_full_cycle_e2e.py') and not launcher._sampler_controllers:
+                started = time.monotonic()
+                print(json.dumps({'phase': 'sampler_starting', 'needed_by': filename}), flush=True)
+                for app in config.applications:
+                    if app.import_path == 'sampler':
+                        launcher._deploy_application(app)
+                evidence['sampler_startup_seconds'] = time.monotonic() - started
+                evidence['sampler_started_for'] = filename
+                print(json.dumps({'phase': 'sampler_ready', 'seconds': evidence['sampler_startup_seconds'],
+                                  'needed_by': filename}), flush=True)
             start = time.monotonic()
+            print(json.dumps({'phase': 'case_start', 'file': filename,
+                              'sampler_running': bool(launcher._sampler_controllers)}), flush=True)
             with (run_dir / (filename + '.log')).open('w') as output:
                 result = subprocess.run([
                     sys.executable,
@@ -407,6 +426,7 @@ def main():
                 'returncode': result.returncode,
                 'tests': len(cases),
                 'skipped': skipped,
+                'sampler_running': bool(launcher._sampler_controllers),
                 'seconds': time.monotonic() - start
             })
             (run_dir / 'results.json').write_text(json.dumps(evidence, indent=2))
@@ -456,6 +476,7 @@ def main():
                     progress_path=run_dir / (name + '.json')))
                 (run_dir / 'results.json').write_text(json.dumps(evidence, indent=2))
     finally:
+        cleanup_started = time.monotonic()
         try:
             controller = getattr(launcher, '_training_controller', None)
             if controller is not None:
@@ -479,9 +500,10 @@ def main():
                         client.delete(*keys)
                 finally:
                     client.close()
-            (run_dir / 'results.json').write_text(json.dumps(evidence, indent=2))
             if managed is not None:
                 managed.stop()
+            evidence['cleanup_seconds'] = time.monotonic() - cleanup_started
+            (run_dir / 'results.json').write_text(json.dumps(evidence, indent=2))
     evidence['passed'] = True
     (run_dir / 'results.json').write_text(json.dumps(evidence, indent=2))
     return 0
