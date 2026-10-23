@@ -80,7 +80,7 @@ class RayInstanceDriver:
             queue_config=spec.config.queue_config,
             data_plane_url=spec.model.data_plane_url,
             training_context=context,
-            placement_group=get_placement_group(name),
+            placement_group=await asyncio.to_thread(get_placement_group, name),
             allocation_devices=list(instance.devices),
             **kwargs)
         await self.runtime.deploy(instance.instance_id, name, app, f'/api/v1/training-runtime/{instance.instance_id}',

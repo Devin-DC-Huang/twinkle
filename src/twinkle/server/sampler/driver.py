@@ -50,7 +50,7 @@ class SamplerDriver:
                 'registry_name': allocation.name + '-registry',
                 'instance_id': instance.identity
             },
-            placement_group=get_placement_group(allocation.name),
+            placement_group=await asyncio.to_thread(get_placement_group, allocation.name),
             allocation_devices=list(allocation.devices))
         await self.runtime.deploy(instance.identity, allocation.name, app,
                                   f'/api/v1/sampling-runtime/{instance.identity}', lambda: self.shutdown(instance))
