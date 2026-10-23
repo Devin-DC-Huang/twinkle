@@ -52,10 +52,13 @@ async def test_managed_memory_actor_restart_reconnects_existing_handles():
         ray.kill(backend._actor, no_restart=False)
         for _ in range(100):
             try:
-                if await backend.health_check() and await backend.get('before') is None:break
-            except ray.exceptions.RayError:pass
+                if await backend.health_check() and await backend.get('before') is None:
+                    break
+            except ray.exceptions.RayError:
+                pass
             await asyncio.sleep(0.1)
-        else:raise AssertionError('State actor did not restart')
+        else:
+            raise AssertionError('State actor did not restart')
         assert await backend.get('before') is None
         await backend.set('after', 'new')
         assert await backend.get('after') == 'new'

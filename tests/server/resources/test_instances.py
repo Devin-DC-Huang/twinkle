@@ -20,9 +20,8 @@ async def test_spawn_logs_exception_with_traceback(caplog, monkeypatch):
         await lifecycle.join()
     records = [record for record in caplog.records if record.getMessage() == 'Training background job failed']
     assert records and records[0].exc_info[1].args == ('background sentinel',)
+    assert records[0].exc_info[2] is not None
     assert not lifecycle.jobs
-
-
 
 
 @pytest.mark.asyncio

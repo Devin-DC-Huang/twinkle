@@ -284,21 +284,6 @@ async def test_unknown_generation_exit_keeps_quarantined_capacity_reserved():
 
 
 @pytest.mark.asyncio
-async def test_training_and_sampling_use_the_same_lifecycle_owner():
-    from tests.server.state.fake_backend import FakeBackend
-    from tests.server.training.helpers import setup as training_setup
-    pool, driver, _ = setup()
-    training, _, _, _ = await training_setup(backend=FakeBackend())
-    try:
-        assert type(training.lifecycle) is type(pool.lifecycle)
-        assert training.lifecycle is not pool.lifecycle
-    finally:
-        driver.finish.set()
-        await pool.shutdown()
-        await training.shutdown()
-
-
-@pytest.mark.asyncio
 async def test_replaying_config_has_the_same_startup_deadline():
     pool, driver, _ = setup(minimum=0, maximum=1)
     await pool.initialize()

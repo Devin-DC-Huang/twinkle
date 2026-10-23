@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import ast
 import pathlib
-import typing
 
 import twinkle
 from twinkle.protocol.types import model as model_types

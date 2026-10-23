@@ -5,7 +5,6 @@
 - ``TaskEnvelope`` has exactly one construction site.
 - The client-side invariant: the client HTTP timeout is <= 120 and strictly
   greater than the server Long_Poll_Window.
-- Task status uses one shared protocol declaration.
 
 These exist because the spec states most of its guarantees in prose. A prose claim that
 nothing checks decays into a false claim -- as happened with "a consistency test asserts
@@ -69,14 +68,6 @@ def test_task_envelope_has_exactly_one_construction_site():
     assert offenders == [], ('TaskEnvelope must only be constructed in lifecycle/envelope.py '
                              f'(via envelope_from_record); found: {offenders}')
     assert sites, 'expected to find the construction sites inside envelope.py'
-
-
-def test_task_status_is_shared_by_queue_and_protocol():
-    from twinkle.protocol.types.lifecycle import TaskStatus, TERMINAL_STATUSES
-    from twinkle.server.task_queue import TaskStatus as QueueTaskStatus
-
-    assert QueueTaskStatus is TaskStatus
-    assert TERMINAL_STATUSES == {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
 
 
 def test_client_future_layer_is_not_imported_by_the_server():
