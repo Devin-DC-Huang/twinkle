@@ -11,11 +11,14 @@ def test_installed_native_and_tinker_sdks_use_managed_http_routes():
     import ray
     ray.shutdown()
     try:
+        # Both SDKs, recovery and ten release/recreate cycles start many fresh
+        # workers. Allow cold imports from a shared environment; each service
+        # operation still enforces its own startup/execution deadline.
         result = subprocess.run([
             sys.executable,
             str(Path(__file__).resolve().parents[3]
                 / 'tests/server/integration/on_demand_training/http_probe.py')
-        ], capture_output=True, text=True, timeout=1800)
+        ], capture_output=True, text=True, timeout=2 * 60 * 60)
     finally:
         ray.init(
             ignore_reinit_error=True,
