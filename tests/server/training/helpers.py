@@ -75,7 +75,7 @@ class Runtime:
         pass
 
 
-async def setup(*, devices=16, min_replicas=0, max_replicas=None, quota=100, backend=None):
+async def setup(*, devices=16, min_replicas=0, max_replicas=None, quota=100, backend=None, adapter_config=None):
     mode = {
         'num_devices': 2,
         'device_mesh': {
@@ -86,6 +86,8 @@ async def setup(*, devices=16, min_replicas=0, max_replicas=None, quota=100, bac
         'min_replicas': min_replicas,
         'max_replicas': max_replicas
     }
+    if adapter_config is not None:
+        mode['adapter_config'] = adapter_config
     config = TrainingConfig(models=[{
         'name': 'small',
         'model_id': 'ms://small',

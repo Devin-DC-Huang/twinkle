@@ -8,6 +8,7 @@ import time
 import traceback
 import uuid
 from collections.abc import Callable
+from datetime import datetime
 from typing import Any, Protocol
 
 from twinkle.server.config.training import TrainingConfig, TrainingModelConfig
@@ -386,9 +387,20 @@ class TrainingController:
         heartbeat = await self.store.sessions.get_last_heartbeat(training.session_id)
         return self._expired_with_heartbeat(training, heartbeat)
 
+    def _session_expired(self, training: TrainingRecord, heartbeat: float | None) -> bool:
+        timeout = self.config.get(training.base_model, training.mode).config.adapter_config.adapter_timeout
+        return heartbeat is None or (timeout is not None and time.time() - heartbeat >= timeout)
+
+    def _lifetime_expired(self, training: TrainingRecord) -> bool:
+        lifetime = self.config.get(training.base_model, training.mode).config.adapter_config.adapter_max_lifetime
+        if lifetime is None:
+            return False
+        created_at = datetime.fromisoformat(training.created_at).timestamp()
+        return time.time() - created_at >= lifetime
+
     def _expired_with_heartbeat(self, training: TrainingRecord, heartbeat: float | None) -> bool:
         spec = self.config.get(training.base_model, training.mode)
-        if heartbeat is None:
+        if self._session_expired(training, heartbeat) or self._lifetime_expired(training):
             return True
         return self.clock() - training.last_activity_at >= spec.config.idle_timeout_s
 
@@ -402,7 +414,8 @@ class TrainingController:
             raise TrainingExpiredError('Training handle expired; create a new handle and explicitly load a checkpoint.')
         if training.state != 'ACTIVE' or training.instance_id in self._failed_instances:
             raise ResourceNotFoundError('Training handle is no longer active')
-        if await self.store.sessions.get_last_heartbeat(training.session_id) is None:
+        heartbeat = await self.store.sessions.get_last_heartbeat(training.session_id)
+        if self._session_expired(training, heartbeat):
             raise TrainingExpiredError('Training session expired; create a new training handle')
         return training
 
@@ -415,7 +428,9 @@ class TrainingController:
                     renew: bool = True) -> RuntimeOwner:
         async with self._lock:
             training = await self._authorized(training_id, token, session_id)
-            if not training.pending_operation_ids and await self._expired(training):
+            expired = self._lifetime_expired(training) or (not training.pending_operation_ids
+                                                           and await self._expired(training))
+            if request_id not in training.pending_operation_ids and expired:
                 training.state = 'CLOSING'
                 training.terminal_reason = 'expired'
                 await self.store.save_training(training)

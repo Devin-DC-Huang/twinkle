@@ -66,6 +66,8 @@ applications:
       model_id: ${oc.env:TWINKLE_LOCAL_MODEL_PATH}
       min_replicas: 1
       max_replicas: 1
+      adapter_config:
+        adapter_timeout: 30
       max_loras: 8
       max_length: 10240
       data_plane_url: http://127.0.0.1:8000/api/v1/data-plane

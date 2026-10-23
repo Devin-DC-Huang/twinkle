@@ -55,7 +55,7 @@ def test_existing_yaml_uses_explicit_instance_limits_and_business_idle():
             assert model.config.idle_timeout_s == app.args.idle_timeout_s
             assert model.config.min_replicas == app.args.min_replicas
             assert model.config.max_replicas == app.args.max_replicas
-            assert 'adapter_config' not in type(app.args).model_fields
+            assert model.config.adapter_config == app.args.adapter_config
 
 
 @pytest.mark.parametrize('field,value', [
@@ -211,12 +211,35 @@ def configured_application():
     {'modes': None},
     {'modes': {'lora': {'num_devices': 2, 'device_mesh': {'dp_size': 2}}}},
     {'device_type': 'cpu'},
-    {'adapter_config': {'adapter_timeout': 30}},
 ])
 def test_model_yaml_rejects_alternative_resource_and_mode_syntax(extra):
     app = configured_application()
     app['args'].update(extra)
     with pytest.raises(ValidationError, match='Extra inputs are not permitted'):
+        ServerConfig(applications=[app])
+
+
+@pytest.mark.parametrize('mode', ['lora', 'full'])
+def test_adapter_lifecycle_yaml_reaches_controller_and_round_trips(mode):
+    app = model_application()
+    policy = {'adapter_timeout': 30, 'adapter_max_lifetime': 36000}
+    app['args'].update(train_mode=mode, adapter_config=policy, idle_timeout_s=600)
+    config = ServerConfig(applications=[app])
+    resolved = config.training_config.models[0].config
+    assert resolved.adapter_config.model_dump() == policy
+    assert resolved.idle_timeout_s == 600
+    restored = ServerConfig.model_validate(config.to_yaml_dict())
+    assert restored.training_config == config.training_config
+
+
+@pytest.mark.parametrize('policy', [
+    {'adapter_timeout': 0}, {'adapter_timeout': math.inf}, {'adapter_timeout': math.nan},
+    {'adapter_max_lifetime': -1}, {'adapter_max_lifetime': math.inf}, {'unknown': 30},
+])
+def test_invalid_adapter_lifecycle_is_rejected_before_allocation(policy):
+    app = model_application()
+    app['args']['adapter_config'] = policy
+    with pytest.raises(ValidationError):
         ServerConfig(applications=[app])
 
 
@@ -278,6 +301,7 @@ async def test_configured_options_reach_runtime_with_one_controller_owned_replic
     assert captured['max_length'] == 128
     assert captured['nproc_per_node'] == 2
     assert captured['queue_config'] == model.config.queue_config
+    assert 'adapter_config' not in captured, 'Controller lifecycle policy must not reach model constructors'
     assert not driver.runtime.deployments
 
 

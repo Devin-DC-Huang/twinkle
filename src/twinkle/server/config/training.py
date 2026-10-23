@@ -32,6 +32,15 @@ class SpectralHybridArgs(BaseModel):
         return value
 
 
+class AdapterConfig(BaseModel):
+    """Session liveness and absolute lifetime of a training handle, in seconds."""
+
+    model_config = ConfigDict(extra='forbid', frozen=True)
+
+    adapter_timeout: float | None = Field(default=1800, gt=0, allow_inf_nan=False)
+    adapter_max_lifetime: float | None = Field(default=36000, gt=0, allow_inf_nan=False)
+
+
 class TrainingArguments(BaseModel):
     """Training options shared by model YAML and resolved instance configuration."""
 
@@ -40,6 +49,7 @@ class TrainingArguments(BaseModel):
     min_replicas: int = Field(default=0, ge=0, strict=True)
     max_replicas: int | None = Field(default=None, gt=0, strict=True)
     idle_timeout_s: float = Field(default=1800, gt=0, allow_inf_nan=False)
+    adapter_config: AdapterConfig = Field(default_factory=AdapterConfig)
     strategy: Literal['accelerate', 'native_fsdp'] | None = None
     queue_config: TaskQueueConfig = Field(default_factory=TaskQueueConfig)
     max_length: int | None = Field(default=None, gt=0, strict=True)

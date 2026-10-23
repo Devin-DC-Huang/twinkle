@@ -55,7 +55,10 @@ class RayInstanceDriver:
             controller_name=self.controller_name,
             registry_name=name + '-registry')
         kwargs = spec.config.model_dump(
-            exclude={'num_devices', 'device_mesh', 'min_replicas', 'max_replicas', 'idle_timeout_s', 'queue_config'},
+            exclude={
+                'num_devices', 'device_mesh', 'min_replicas', 'max_replicas', 'idle_timeout_s', 'adapter_config',
+                'queue_config'
+            },
             exclude_none=True)
         if 'hybrid' in kwargs:
             kwargs['hybrid'] = spec.config.hybrid

@@ -47,6 +47,9 @@ applications:
       queue_config:
         rps_limit: 100
         tps_limit: 100000
+      adapter_config:
+        adapter_timeout: 30
+        adapter_max_lifetime: 36000
     deployments:
       - name: ModelManagement
         autoscaling_config:

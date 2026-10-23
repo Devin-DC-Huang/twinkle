@@ -154,9 +154,10 @@ async def test_reconciliation_of_committed_completion_does_not_extend_idle_time(
 
 
 @pytest.mark.asyncio
-async def test_old_creation_time_and_live_heartbeat_do_not_override_business_idle():
+async def test_disabled_max_lifetime_and_live_heartbeat_do_not_override_business_idle():
     from tests.server.state.fake_backend import FakeBackend
-    controller, state, runtime, clock = await setup(backend=FakeBackend())
+    controller, state, runtime, clock = await setup(
+        backend=FakeBackend(), adapter_config={'adapter_max_lifetime': None})
     identity = await create(controller, state, 'idle-only')
     controller.trainings[identity].created_at = '2000-01-01T00:00:00+00:00'
     clock.now = 9
@@ -168,6 +169,62 @@ async def test_old_creation_time_and_live_heartbeat_do_not_override_business_idl
     await controller.sweep()
     await controller.wait_for_jobs()
     assert controller.trainings[identity].state == 'EXPIRED'
+    assert not runtime.allocations
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('reason', ['heartbeat', 'max_lifetime'])
+@pytest.mark.parametrize('busy', [False, True])
+async def test_adapter_lifecycle_expires_independently_and_waits_for_running_work(reason, busy):
+    import time
+    from datetime import datetime, timedelta, timezone
+    from tests.server.state.fake_backend import FakeBackend
+
+    controller, state, runtime, _ = await setup(
+        backend=FakeBackend(), adapter_config={'adapter_timeout': 30, 'adapter_max_lifetime': 60})
+    identity = await create(controller, state, 'lifecycle')
+    if busy:
+        await controller.admit(identity, 'owner', 'session', 'running')
+    if reason == 'heartbeat':
+        session = await state.sessions.get('session')
+        session.last_heartbeat = time.time() - 31
+        await state.sessions.add('session', session)
+    else:
+        controller.trainings[identity].created_at = (datetime.now(timezone.utc) - timedelta(seconds=61)).isoformat()
+    await controller.sweep()
+    await controller.wait_for_jobs()
+    if busy:
+        assert controller.trainings[identity].state == 'ACTIVE'
+        assert identity in runtime.users
+        if reason == 'heartbeat':
+            with pytest.raises(TrainingExpiredError):
+                await controller.admit(identity, 'owner', 'session', 'new-operation')
+        await controller.finish_operation(identity, 'running', controller.epoch, executed=True)
+        await controller.sweep()
+        await controller.wait_for_jobs()
+    assert controller.trainings[identity].state == 'EXPIRED'
+    assert identity not in runtime.users
+    assert not runtime.allocations
+
+
+@pytest.mark.asyncio
+async def test_max_lifetime_stops_new_work_while_admitted_work_finishes():
+    from datetime import datetime, timedelta, timezone
+    from tests.server.state.fake_backend import FakeBackend
+
+    controller, state, runtime, _ = await setup(
+        backend=FakeBackend(), adapter_config={'adapter_max_lifetime': 60})
+    identity = await create(controller, state, 'lifetime-admission')
+    await controller.admit(identity, 'owner', 'session', 'running')
+    training = controller.trainings[identity]
+    training.created_at = (datetime.now(timezone.utc) - timedelta(seconds=61)).isoformat()
+    with pytest.raises(TrainingExpiredError):
+        await controller.admit(identity, 'owner', 'session', 'new-operation')
+    assert set(training.pending_operation_ids) == {'running'}
+    assert identity in runtime.users
+    await controller.finish_operation(identity, 'running', controller.epoch, executed=True)
+    await controller.wait_for_jobs()
+    assert training.state == 'EXPIRED'
     assert not runtime.allocations
 
 

@@ -122,6 +122,9 @@ applications:
       model_id: "ms://Qwen/Qwen3.8-27B"          # ModelScope model identifier
       max_length: 32768                           # model max length
       train_mode: lora
+      adapter_config:
+        adapter_timeout: 120                       # Seconds without a session heartbeat before release
+        adapter_max_lifetime: 36000               # Maximum lifetime of an adapter in seconds (e.g., 10 hours)
       max_loras: 3                                # Handles per instance, not simultaneous backward calls
       min_replicas: 0                             # Do not reserve training GPUs at startup
       max_replicas: 2                             # Up to 2 independent two-GPU instances

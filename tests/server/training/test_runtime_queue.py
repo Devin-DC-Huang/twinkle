@@ -136,6 +136,65 @@ async def test_readiness_waits_for_real_ray_worker_constructor():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('reason', ['heartbeat', 'max_lifetime'])
+async def test_adapter_expiry_preserves_already_queued_work(reason):
+    import time
+    from datetime import datetime, timedelta, timezone
+    from tests.server.state.fake_backend import FakeBackend
+
+    controller, state, runtime, _ = await setup(
+        backend=FakeBackend(), adapter_config={'adapter_timeout': 30, 'adapter_max_lifetime': 60})
+    identity = await create(controller, state, 'queued-expiry')
+    training = controller.trainings[identity]
+    queue = RuntimeQueue(controller, state, controller.instances[training.instance_id])
+    queue._task_queue_config = TaskQueueConfig(execution_timeout=5)
+    queue._compute_worker._config = queue._task_queue_config
+    entered, resume, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    executions = []
+
+    async def first():
+        entered.set()
+        await resume.wait()
+        executions.append('first')
+
+    async def second():
+        executions.append('second')
+
+    async def notify(*args, **kwargs):
+        await controller.finish_operation(*args, **kwargs)
+        if not training.pending_operation_ids:
+            finished.set()
+        return True
+
+    queue._training_controller.finish_operation = RPC(notify)
+    try:
+        active = await queue.schedule_task(first, model_id=identity, token='owner', task_type='forward_backward')
+        await asyncio.wait_for(entered.wait(), 2)
+        queued = await queue.schedule_task(second, model_id=identity, token='owner', task_type='step')
+        if reason == 'heartbeat':
+            session = await state.sessions.get('session')
+            session.last_heartbeat = time.time() - 31
+            await state.sessions.add('session', session)
+        else:
+            training.created_at = (datetime.now(timezone.utc) - timedelta(seconds=61)).isoformat()
+        await controller.sweep()
+        await controller.wait_for_jobs()
+        assert identity in runtime.users and len(training.pending_operation_ids) == 2
+        resume.set()
+        assert (await settle(state, active['request_id']))['status'] == 'completed'
+        assert (await settle(state, queued['request_id']))['status'] == 'completed'
+        await asyncio.wait_for(finished.wait(), 2)
+        await controller.sweep()
+        await controller.wait_for_jobs()
+        assert executions == ['first', 'second']
+        assert training.state == 'EXPIRED' and not runtime.allocations
+    finally:
+        resume.set()
+        await queue.shutdown_task_queue()
+        await controller.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_lost_finish_notification_is_reconciled_without_stopping_compute():
     controller, state, runtime, clock = await setup()
     identity = await create(controller, state, 'lost-notification')
