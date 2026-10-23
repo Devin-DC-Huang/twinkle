@@ -256,8 +256,10 @@ def test_old_remove_completion_does_not_clear_new_same_name_binding():
     model.add_adapter_to_model('same', None)
     errors = []
     def remove():
-        try:model.remove_adapter()
-        except Exception as exc:errors.append(exc)
+        try:
+            model.remove_adapter()
+        except Exception as exc:
+            errors.append(exc)
     releasing = threading.Thread(target=remove)
     releasing.start()
     try:
@@ -335,6 +337,7 @@ def test_unknown_training_rejected_before_handshake(monkeypatch):
 
 
 def test_expired_handle_can_be_removed_and_recreated_on_same_object(monkeypatch):
+    import pytest
     from twinkle_client.exceptions import TwinkleHTTPError
     from twinkle_client.model.multi_lora_transformers import MultiLoraTransformersModel
     calls = []
@@ -347,7 +350,9 @@ def test_expired_handle_can_be_removed_and_recreated_on_same_object(monkeypatch)
         raise TwinkleHTTPError('Training handle expired', status_code=404, error_code=404)
 
     monkeypatch.setattr(model, '_submit', expired)
-    model.remove_adapter('same')
+    with pytest.raises(TwinkleHTTPError) as error:
+        model.remove_adapter('same')
+    assert error.value.status_code == 404
     monkeypatch.setattr(model, '_submit', submit)
     model.add_adapter_to_model('same', None)
     model.zero_grad()

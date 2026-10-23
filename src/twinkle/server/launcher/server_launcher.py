@@ -181,12 +181,11 @@ class ServerLauncher:
 
     def _stop_controller(self, controller) -> None:
         import ray
-        try:
-            ray.get(controller.shutdown.remote(), timeout=self.config.resources.shutdown_timeout_s)
-        finally:
-            # Killing the owner prevents restart but does not certify its devices
-            # were released. Preserve a failed/unknown shutdown for _run_cleanup.
-            ray.kill(controller, no_restart=True)
+
+        # Keep an unconfirmed owner available for cleanup retry; a timeout alone
+        # does not certify its workers or devices were released.
+        ray.get(controller.shutdown.remote(), timeout=self.config.resources.shutdown_timeout_s)
+        ray.kill(controller, no_restart=True)
 
     def _stop_training_controller(self) -> None:
         if self._training_controller is not None:

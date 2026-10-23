@@ -55,6 +55,10 @@ def test_unresponsive_controller_does_not_block_other_cleanup():
         assert finished.wait(2), 'Controller shutdown exceeded its budget and blocked the next owner'
         assert cleaned == [True]
         assert len(errors) == 1 and isinstance(errors[0].__cause__, ray.exceptions.GetTimeoutError)
+        assert launcher._training_controller is controller
+        ray.get(controller.unblock.remote(), timeout=5)
+        launcher._stop_training_controller()
+        assert launcher._training_controller is None
     finally:
         if not finished.is_set():
             ray.get(controller.unblock.remote(), timeout=5)

@@ -192,10 +192,14 @@ class MultiLoraTransformersModel:
         try:
             self._submit('remove_adapter', model_types.AdapterRequest, None, adapter_name=name, training_id=training_id)
         except TwinkleHTTPError as exc:
-            if exc.status_code != 404:
-                raise
-            # An expired or lost handle is unusable. Forget its local binding so
-            # this label can be recreated; unknown cleanup outcomes still raise.
+            if exc.status_code == 404:
+                self._forget_training(name, training_id)
+            # A missing handle is unusable, but does not certify device release.
+            raise
+        self._forget_training(name, training_id)
+
+    def _forget_training(self, name: str, training_id: str) -> None:
+        """A late response must never erase a newer same-name binding."""
         with self._training_lock:
             if self._training_ids.get(name) == training_id:
                 self._training_ids.pop(name, None)
