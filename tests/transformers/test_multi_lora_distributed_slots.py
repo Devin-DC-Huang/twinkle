@@ -153,3 +153,9 @@ def test_slot_registration_never_unfreezes_base_parameters_with_lora_in_their_na
             assert not any(parameter.requires_grad for parameter in base.values())
             raise RuntimeError('wrapper failed')
     assert {name: parameter.requires_grad for name, parameter in module.named_parameters()} == mask
+    manager.acquire_lora('first', config)
+    wrapper = _wrapper(module, manager, lambda model: model)
+    for disable_lora in (False, True):
+        with wrapper._adapter_context('first', disable_lora=disable_lora):
+            assert not any(parameter.requires_grad for parameter in base.values())
+        assert not any(parameter.requires_grad for parameter in base.values())

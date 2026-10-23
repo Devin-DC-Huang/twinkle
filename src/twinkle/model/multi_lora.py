@@ -145,6 +145,13 @@ class MultiLora:
                         for name, parameter in value.named_parameters():
                             yield prefix + '.' + name, parameter
 
+    def enable_slot_gradients(self):
+        """Keep owned adapter slots visible to reducers without unfreezing the base."""
+        modules = self.module if isinstance(self.module, list) else [self.module]
+        for module in modules:
+            for _, parameter in self._named_slot_parameters(module):
+                parameter.requires_grad_(True)
+
     @contextmanager
     def trainable_slots(self):
         """Expose all slots while wrapping DDP/FSDP, then restore the active mask.
@@ -158,9 +165,7 @@ class MultiLora:
             for name, parameter in self._named_slot_parameters(module)
         } for module in modules]
         try:
-            for module in modules:
-                for _, parameter in self._named_slot_parameters(module):
-                    parameter.requires_grad_(True)
+            self.enable_slot_gradients()
             yield
         finally:
             for module, mask in zip(modules, masks):
