@@ -81,7 +81,8 @@ class RayHelper:
                     name=registry_name,
                     namespace=registry_namespace,
                     lifetime='detached',
-                    num_cpus=0.01 if registry_namespace else 1).remote()
+                    # Preserve Ray's default CPU policy outside managed instances.
+                    num_cpus=0.01 if registry_namespace else None).remote()
             except ValueError:
                 RayHelper._registry = ray.get_actor(registry_name, namespace=registry_namespace)
         assert RayHelper._registry is not None
