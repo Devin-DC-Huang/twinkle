@@ -946,6 +946,12 @@ class Template:
     ) -> PromptEncoding:
         media = MediaBundle.from_sources(sample)
         feature = self.encode(sample, add_generation_prompt=add_generation_prompt)
+        if feature is None:
+            # ``truncation_strategy='delete'`` drops over-long rows dataset-side; a single prompt
+            # (rollout generation) has no row to drop, so say so instead of crashing on None below.
+            raise ValueError(
+                'the prompt exceeds max_length and truncation_strategy=\'delete\' cannot encode a '
+                'single prompt; use a truncation strategy that shortens instead of dropping')
         feature.pop("messages", None)
         feature.pop("tools", None)
         engine_ids = self._engine_input_ids(feature["input_ids"])

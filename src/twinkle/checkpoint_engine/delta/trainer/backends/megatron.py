@@ -1,15 +1,17 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Megatron implementation of the delta trainer backend.
 
-The HF coordinate mapping is DERIVED, not declared: the probe pass overwrites each
-representative mcore parameter (per digit-normalised key pattern) with unique fp64
-position codes -- global rank/pattern/element packed into the mantissa bits, exponent
-set to a subnormal range no real weight can reach -- runs one bridge export, and reads
-back where each code lands in the exported HF tensors. Contiguous segments fitted
-from those observations carry the mapping, so every per-model transform the bridge
-performs (QKV split, gate/up split, TP gather, expert restack, padded-vocab trim) is
-captured from the export's own behaviour: there is no hand-written table that could
-drift from it.
+The HF coordinate mapping is DERIVED, not declared: the probe pass overwrites every
+mcore parameter this rank holds with unique fp64 position codes -- global
+rank/parameter/element packed into the mantissa bits, exponent set to a subnormal
+range no real weight can reach -- runs one bridge export, and reads back where each
+code lands in the exported HF tensors. Contiguous segments fitted from those
+observations carry the mapping, so every per-model transform the bridge performs
+(QKV split, gate/up split, TP gather, expert restack, padded-vocab trim) is captured
+from the export's own behaviour: there is no hand-written table that could drift
+from it. The mapping is per PARAMETER (not per digit-normalised pattern): a
+pattern's parameters share a shape but not an HF target, so one representative's
+segments cannot serve its same-shaped siblings.
 
 Sharding axes: the steady gather runs on the trainer world group with a global
 parameter/slot order, so every axis the trainer side can take -- TP, ETP, EP, PP, VPP,
@@ -22,33 +24,27 @@ survive the PEFT/dequantize paths).
 """
 from __future__ import annotations
 
-import re
-
 import torch
 import torch.distributed as dist
 
 from ..spec import ShardSpec
 from .base import DeltaTrainerBackend, TensorShards, TensorWeights
 
-# fp64 bit layout of one probe code: [exponent 0x001][pattern 8b][rank 9b][element 35b].
+# fp64 bit layout of one probe code: [exponent 0x001][param 11b][rank 9b][element 32b].
 # Everything except the exponent bits lives in the mantissa, so the code stays in the
 # ~1e-308 subnormal band no real weight (smallest bf16 denormal ~1e-38) can enter:
 # a simple range test identifies codes on the export side with zero false positives.
 # The rank field is the GLOBAL rank: PP stages, expert holders and DP replicas are all
-# told apart by it, which is what lets one probe pass serve every sharding axis.
+# told apart by it, which is what lets one probe pass serve every sharding axis. The
+# param field is a PER-RANK ordinal over that rank's own parameters (each rank decodes
+# only the codes its own rank stamped, so the numbering needs no global agreement).
 _PROBE_EXPONENT = 0x001
 _PROBE_BASE = _PROBE_EXPONENT << 52
-_PROBE_RANK_SHIFT = 35
-_PROBE_PATTERN_SHIFT = 44
-_PROBE_PATTERN_BITS = 8
+_PROBE_RANK_SHIFT = 32
+_PROBE_PARAM_SHIFT = 41
+_PROBE_PARAM_BITS = 11
 _PROBE_RANK_BITS = 9
 _PROBE_ELEMENT_LIMIT = 1 << _PROBE_RANK_SHIFT
-
-
-def _pattern_of(name: str) -> str:
-    """Digit-normalised parameter pattern: layer numbers, expert ids and VPP chunk
-    indices all fold to '*', so every same-shaped parameter shares one probe table."""
-    return re.sub(r'\d+', '*', name)
 
 
 def _fit_segments(i: torch.Tensor, j: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -76,16 +72,17 @@ class MegatronDeltaBackend(DeltaTrainerBackend):
     emits the same slot sequence with zero counts.
     """
 
-    #: Probe-fitted mapping, {pattern: {hf_key: (starts, dsts, lens)}} -- tensors stay
+    #: Probe-fitted mapping, {param: {hf_key: (starts, dsts, lens)}} -- tensors stay
     #: on the trainer device; each entry maps a run of this rank's shard elements to a
-    #: flat run of the HF tensor named by hf_key.
+    #: flat run of the HF tensor named by hf_key (the parameter's OWN tensors: the
+    #: codes stamped on it carry its identity, so same-shaped siblings never share).
     _delta_segments: dict = None
     _delta_hf_shapes: dict = None
     #: Global tables aggregated from every rank's probe view (see _derive_delta_segments):
     #: the steady emit order over ALL trainer parameters (PP/EP/DP ranks hold subsets),
     #: the emit dtype each empty stand-in must carry, the global slot key order per
-    #: pattern (an EP pattern's keys are the union over expert holders), the holder
-    #: set per pattern, and which patterns are fully replicated on every holder
+    #: parameter (an EP expert's keys are the union over expert holders), the holder
+    #: set per parameter, and which parameters are fully replicated on every holder
     #: (only the smallest holder rank contributes, so the value ships exactly once).
     _delta_param_order: list = None
     _delta_param_meta: dict = None
@@ -144,17 +141,16 @@ class MegatronDeltaBackend(DeltaTrainerBackend):
                       for ci, chunk in enumerate(models) for n, p in chunk.named_parameters()}
             for name in self._delta_param_order:
                 param = params.get(name)
-                # Replicated patterns (dense params the trainer does not shard: MoE
-                # routers, layernorms) carry identical values on every holder; see
-                # the contributes computation above for how a single shipper is picked.
-                if self._delta_replicated[_pattern_of(name)]:
-                    # Replicated patterns carry identical values on every holder, so
+                # Replicated parameters (dense params the trainer does not shard: MoE
+                # routers, layernorms) carry identical values on every holder.
+                if self._delta_replicated[name]:
+                    # Replicated parameters carry identical values on every holder, so
                     # the smallest holder contributes -- a replicated param may live
                     # on a PP subset (e.g. a MoE router on its stage only) that the
                     # global rank 0 does not even hold.
-                    contributes = global_rank == self._delta_holders[_pattern_of(name)][0]
+                    contributes = global_rank == self._delta_holders[name][0]
                 else:
-                    # Sharded patterns contribute from the dp_rank-0 chain only:
+                    # Sharded parameters contribute from the dp_rank-0 chain only:
                     # DP replicas of a shard are byte-identical.
                     contributes = param is not None and dp_rank == 0
                 if param is not None and contributes:
@@ -192,17 +188,18 @@ class MegatronDeltaBackend(DeltaTrainerBackend):
     def _derive_delta_segments(self) -> None:
         """Probe pass, then aggregate the global tables the steady lockstep needs.
 
-        Probe: overwrite every representative with fp64 codes carrying the GLOBAL
-        rank, run one bridge export, decode this rank's own landings into contiguous
-        segments. The export gathers TP/ETP shards and broadcasts across PP/EP
-        holders, so every rank's export already carries the whole model -- the
-        observations are model-complete without any extra collective.
+        Probe: overwrite EVERY parameter this rank holds with fp64 codes carrying the
+        GLOBAL rank and a per-rank parameter ordinal, run one bridge export, decode
+        this rank's own landings into contiguous segments. The export gathers TP/ETP
+        shards and broadcasts across PP/EP holders, so every rank's export already
+        carries the whole model -- the observations are model-complete without any
+        extra collective.
 
         Aggregation: PP/EP ranks hold disjoint parameter subsets and EP holders map
         into disjoint expert keys, but the steady gather aligns on a count matrix
         that every rank must fill identically. The global parameter order, the emit
-        dtype of each empty stand-in, the per-pattern slot key order and the
-        replicated-pattern verdict are therefore all-gathered from the ranks' own
+        dtype of each empty stand-in, the per-parameter slot key order and the
+        replicated-parameter verdict are therefore all-gathered from the ranks' own
         probe views and merged deterministically -- still an observation of the
         export, not a hand-written second source of truth.
         """
@@ -212,16 +209,13 @@ class MegatronDeltaBackend(DeltaTrainerBackend):
         world_group = dist.group.WORLD
         entries = [(f'chunk{ci}.{n}', p)
                    for ci, chunk in enumerate(models) for n, p in chunk.named_parameters()]
-        representatives: dict[str, tuple[str, torch.Tensor]] = {}
         param_meta: dict[str, str] = {}
         for key, param in entries:
-            representatives.setdefault(_pattern_of(key), (key, param))
             # The steady emit converts floating shards to bf16 (the rollout serving
             # dtype), so non-holders must build their empty stand-ins in that dtype too.
             emit_dtype = torch.bfloat16 if param.is_floating_point() else param.dtype
             param_meta[key] = str(emit_dtype).replace('torch.', '')
-        patterns = sorted(representatives)
-        if not patterns:
+        if not entries:
             self._delta_segments = {}
             self._delta_param_order = []
             self._delta_param_meta = {}
@@ -229,10 +223,10 @@ class MegatronDeltaBackend(DeltaTrainerBackend):
             self._delta_holders = {}
             self._delta_replicated = {}
             return
-        if len(patterns) > (1 << _PROBE_PATTERN_BITS):
+        if len(entries) > (1 << _PROBE_PARAM_BITS):
             raise ValueError(
-                f'megatron delta probe codes address at most {1 << _PROBE_PATTERN_BITS} parameter '
-                f'patterns, got {len(patterns)}')
+                f'megatron delta probe codes address at most {1 << _PROBE_PARAM_BITS} parameters '
+                f'per rank, this rank holds {len(entries)}')
 
         backups: list[tuple[torch.Tensor, torch.Tensor]] = []
         # The export reads parameters across TP/ETP/PP/EP groups (all-reduce src
@@ -241,20 +235,19 @@ class MegatronDeltaBackend(DeltaTrainerBackend):
         # not just this rank's TP group.
         if world > 1:
             dist.barrier(group=world_group)
-        for pattern_id, pattern in enumerate(patterns):
-            _key, param = representatives[pattern]
+        for param_id, (_key, param) in enumerate(entries):
             backups.append((param, param.detach().clone()))
             codes = (torch.arange(param.numel(), dtype=torch.int64, device=param.device)
                      | (global_rank << _PROBE_RANK_SHIFT)
-                     | (pattern_id << _PROBE_PATTERN_SHIFT)
+                     | (param_id << _PROBE_PARAM_SHIFT)
                      | _PROBE_BASE)
             param.data = codes.view(torch.float64).reshape(param.shape)
         if world > 1:
             dist.barrier(group=world_group)
 
-        # {pattern: {hf_key: [i tensor, j tensor]}} -- one element may land in several
+        # {param: {hf_key: [i tensor, j tensor]}} -- one element may land in several
         # HF keys (tied embeddings are exported under both names), so i->key is 1..N.
-        landings: dict[str, dict[str, list]] = {p: {} for p in patterns}
+        landings: dict[str, dict[str, list]] = {key: {} for key, _ in entries}
         hf_shapes: dict[str, tuple] = {}
         try:
             with torch.no_grad():
@@ -268,14 +261,14 @@ class MegatronDeltaBackend(DeltaTrainerBackend):
                         continue
                     j = mask.nonzero().view(-1)
                     codes = flat[j].contiguous().view(torch.int64)
-                    pid = (codes >> _PROBE_PATTERN_SHIFT) & ((1 << _PROBE_PATTERN_BITS) - 1)
+                    pid = (codes >> _PROBE_PARAM_SHIFT) & ((1 << _PROBE_PARAM_BITS) - 1)
                     rank = (codes >> _PROBE_RANK_SHIFT) & ((1 << _PROBE_RANK_BITS) - 1)
                     i = codes & (_PROBE_ELEMENT_LIMIT - 1)
                     mine = rank == global_rank
-                    for pattern_id in pid[mine].unique().tolist():
-                        pattern = patterns[pattern_id]
-                        sel = mine & (pid == pattern_id)
-                        landings[pattern].setdefault(hf_key, []).append((i[sel], j[sel]))
+                    for param_id in pid[mine].unique().tolist():
+                        key = entries[param_id][0]
+                        sel = mine & (pid == param_id)
+                        landings[key].setdefault(hf_key, []).append((i[sel], j[sel]))
         finally:
             for param, backup in backups:
                 param.data = backup
@@ -285,10 +278,9 @@ class MegatronDeltaBackend(DeltaTrainerBackend):
         segments: dict[str, dict] = {}
         covered: dict[str, int] = {}
         slot_keys_local: dict[str, list] = {}
-        for pattern in patterns:
+        for key, _param in entries:
             table = {}
-            covered_any = False
-            for hf_key, pairs in landings[pattern].items():
+            for hf_key, pairs in landings[key].items():
                 i_t = torch.cat([pair[0] for pair in pairs])
                 j_t = torch.cat([pair[1] for pair in pairs])
                 numel = 1
@@ -300,68 +292,62 @@ class MegatronDeltaBackend(DeltaTrainerBackend):
                 order = i_t.argsort()
                 starts, dsts, lens = _fit_segments(i_t[order], j_t[order])
                 table[hf_key] = (starts, dsts, lens)
-                covered_any = True
-            if not covered_any:
-                # Every pattern in this rank's `patterns` is one this rank holds a
-                # representative of, and this rank's export is model-complete (the
-                # bridge gathers/broadcasts across TP/ETP/PP/EP): observing zero
-                # landings means the shard never reached any HF tensor -- a genuine
-                # probe failure, not a sharding-axis artifact (ranks that hold none
-                # of a pattern never list it here in the first place).
+            if not table:
+                # This rank's export is model-complete (the bridge gathers/broadcasts
+                # across TP/ETP/PP/EP): a held parameter observing zero landings means
+                # its shard never reached any HF tensor -- a genuine probe failure,
+                # not a sharding-axis artifact (ranks that hold none of the parameter
+                # never list it here in the first place).
                 raise RuntimeError(
-                    f'megatron delta probe found no export mapping for parameter pattern {pattern!r}; '
+                    f'megatron delta probe found no export mapping for parameter {key!r}; '
                     'the bridge export did not carry this rank\'s shard into any HF tensor')
-            segments[pattern] = table
-            covered[pattern] = int(sum(int(seg[2].sum()) for seg in table.values()))
-            slot_keys_local[pattern] = sorted(table)
+            segments[key] = table
+            covered[key] = int(sum(int(seg[2].sum()) for seg in table.values()))
+            slot_keys_local[key] = sorted(table)
         self._delta_segments = segments
         self._delta_hf_shapes = hf_shapes
 
         # ---- global aggregation over the trainer world ----
+        held = [key for key, _ in entries]
         if world > 1:
             views = [None] * world
             dist.all_gather_object(
                 views,
-                {'params': param_meta, 'slots': slot_keys_local, 'covered': covered,
-                 'patterns': patterns},
+                {'params': param_meta, 'slots': slot_keys_local, 'covered': covered, 'held': held},
                 group=world_group)
         else:
-            views = [{'params': param_meta, 'slots': slot_keys_local, 'covered': covered,
-                      'patterns': patterns}]
+            views = [{'params': param_meta, 'slots': slot_keys_local, 'covered': covered, 'held': held}]
         self._delta_param_order = sorted({name for v in views for name in v['params']})
         self._delta_param_meta = {name: dtype for v in views for name, dtype in v['params'].items()}
-        # The pattern universe is the UNION over ranks (PP/EP/DP ranks hold subsets);
-        # each rank needs every pattern's slot order to fill its own zero-count
-        # slots for parameters it does not hold.
-        all_patterns = sorted({p for v in views for p in v['slots']} | set(patterns))
+        # Each rank needs EVERY parameter's slot order to fill its own zero-count slots
+        # for parameters it does not hold (PP/EP/DP ranks hold subsets).
         self._delta_slot_keys = {
-            pattern: sorted({key for v in views for key in v['slots'].get(pattern, ())})
-            for pattern in all_patterns}
+            name: sorted({key for v in views for key in v['slots'].get(name, ())})
+            for name in self._delta_param_order}
         self._delta_holders = {
-            pattern: [r for r, v in enumerate(views) if pattern in v['patterns']]
-            for pattern in all_patterns}
+            name: [r for r, v in enumerate(views) if name in v['held']]
+            for name in self._delta_param_order}
         self._delta_replicated = {}
-        for pattern in all_patterns:
+        for name in self._delta_param_order:
             total = 0
-            for hf_key in self._delta_slot_keys[pattern]:
+            for hf_key in self._delta_slot_keys[name]:
                 numel = 1
                 for dim in hf_shapes[hf_key]:
                     numel *= dim
                 total += numel
-            # max(covered) == total: some rank maps the WHOLE pattern -> the values
+            # max(covered) == total: some rank maps the WHOLE parameter -> the values
             # are replicated on every holder and only the smallest holder contributes.
             # The strict equality keeps the verdict conservative: a false "sharded"
             # merely duplicates contributions (harmless), a false "replicated"
             # would drop them (corrupting).
-            self._delta_replicated[pattern] = bool(total) and (
-                max(v['covered'].get(pattern, 0) for v in views) == total)
+            self._delta_replicated[name] = bool(total) and (
+                max(v['covered'].get(name, 0) for v in views) == total)
 
     # ------------------------------------------------------------ entry builder
 
     def _hf_delta_entry(self, name, spec, place, lidx, lval):
-        pattern = _pattern_of(name)
-        table = self._delta_segments.get(pattern) or {}
-        slot_keys = self._delta_slot_keys.get(pattern)
+        table = self._delta_segments.get(name) or {}
+        slot_keys = self._delta_slot_keys.get(name)
         if slot_keys is None:
             raise RuntimeError(
                 f'{name}: no probe-derived delta mapping; the probe pass did not cover this parameter')

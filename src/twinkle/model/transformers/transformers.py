@@ -1076,54 +1076,6 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         return merge_micro_batch_outputs(
             batches, plan, task=kwargs.get('task', 'causal_lm'), micro_batch_scales=micro_batch_scales)
 
-    def _build_micro_batch_plan(self, inputs, config, optimizer_config):
-        """Plan the local micro-batches; under data parallelism every rank agrees on the count.
-
-        The token-cost packing is the same kernel ``forward_backward`` uses. Model DP ranks hold
-        different sequence lengths, so uncoordinated plans would disagree on the micro-batch
-        count; the all-gather loop below raises the minimum count until every rank returns the
-        same number, and fails loudly when no common count exists.
-        """
-        processor = optimizer_config.processor
-        assert isinstance(processor, InputProcessor), 'Set InputProcessor correctly before forwarding'
-        optimizer_config._ensure_dp_group()
-        dp_group = optimizer_config._dp_group
-        min_micro_batches = 1
-        while True:
-            try:
-                plan = plan_micro_batches(
-                    inputs, config, padding_free=processor.padding_free,
-                    min_micro_batches=min_micro_batches)
-                planning_error = None
-            except Exception as exc:
-                if dp_group is None:
-                    raise
-                plan = None
-                planning_error = f'{type(exc).__name__}: {exc}'
-            if dp_group is None:
-                return plan
-            local_state = {
-                'micro_batch_count': len(plan) if plan is not None else None,
-                'input_count': len(inputs),
-                'error': planning_error,
-            }
-            states = [None] * dist.get_world_size(dp_group)
-            dist.all_gather_object(states, local_state, group=dp_group)
-            errors = [
-                f'rank {rank}: {state["error"]}'
-                for rank, state in enumerate(states) if state['error'] is not None]
-            if errors:
-                raise RuntimeError('micro-batch planning failed on one or more model DP ranks: '
-                                   + '; '.join(errors))
-            counts = [state['micro_batch_count'] for state in states]
-            if all(count == len(plan) for count in counts):
-                return plan
-            min_micro_batches = max(counts)
-            if any(min_micro_batches > state['input_count'] for state in states):
-                raise ValueError('model DP ranks cannot execute the same number of non-empty '
-                                 'micro-batches; make the input batch divisible by the model '
-                                 'data-parallel size')
-
     def _forward_only_single(self, *, inputs, optimizer_config, **kwargs):
         """Run one evaluation micro-batch (or, without micro-batching, the whole batch)."""
         disable_lora = kwargs.pop('disable_lora', False)
@@ -1443,6 +1395,13 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         optimizer_config.train_status.loss_value = None
 
     def _build_micro_batch_plan(self, inputs, config, optimizer_config):
+        """Plan the local micro-batches; under data parallelism every rank agrees on the count.
+
+        The token-cost packing is the same kernel ``forward_backward`` uses. Model DP ranks hold
+        different sequence lengths, so uncoordinated plans would disagree on the micro-batch
+        count; the all-gather loop below raises the minimum count until every rank returns the
+        same number, and fails loudly when no common count exists.
+        """
         processor = optimizer_config.processor
         assert isinstance(processor, InputProcessor), 'Set a correct `InputProcessor` before forwarding'
         optimizer_config._ensure_dp_group()

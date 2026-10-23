@@ -778,7 +778,7 @@ class VLLMEngine(BaseSamplerEngine):
             lora_path: Resolved filesystem path to the LoRA adapter directory.
 
         Returns:
-            ``LoRARequest`` or ``None`` if loading fails.
+            ``LoRARequest``; loading problems raise (see :meth:`_load_lora`).
         """
         if lora_path in self._lora_request_cache:
             logger.debug(f'Using cached LoRA request for {lora_path}')
@@ -800,14 +800,14 @@ class VLLMEngine(BaseSamplerEngine):
     async def _load_lora(self, lora_path: str):
         from vllm.lora.request import LoRARequest
 
+        # Fail loudly, matching the sglang side: a silent None here means the sampler keeps serving
+        # BASE weights -- an RL policy rollout would train on a different model than it samples.
         if not os.path.exists(lora_path):
-            logger.error(f'LoRA path does not exist: {lora_path}')
-            return None
+            raise FileNotFoundError(f'LoRA path does not exist: {lora_path}')
 
         config_path = os.path.join(lora_path, 'adapter_config.json')
         if not os.path.exists(config_path):
-            logger.error(f'adapter_config.json not found in {lora_path}')
-            return None
+            raise FileNotFoundError(f'adapter_config.json not found in {lora_path}')
 
         lora_int_id = self._generate_lora_id()
         lora_name = str(lora_int_id)
@@ -821,10 +821,9 @@ class VLLMEngine(BaseSamplerEngine):
         logger.info(f'Loading LoRA from {lora_path}')
         try:
             await self.engine.add_lora(lora_request)
-            return lora_request
         except Exception as e:
-            logger.error(f'Failed to load LoRA from {lora_path}: {e}')
-            return None
+            raise RuntimeError(f'Failed to load LoRA from {lora_path}: {e}') from e
+        return lora_request
 
     async def unload_lora_paths(self, adapter_paths: list[str]) -> None:
         """Evict selected LoRA requests without requiring their files to exist."""

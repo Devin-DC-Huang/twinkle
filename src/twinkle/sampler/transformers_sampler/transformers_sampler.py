@@ -147,7 +147,7 @@ class TransformersSampler(Sampler):
     def apply_patch(self, patch_cls: Patch | type[Patch] | str, **kwargs) -> None:
         apply_patch(self, patch_cls, **kwargs)
 
-    @remote_function(dispatch="all", collect="first", lazy_collect=False)
+    @remote_function(dispatch="all", collect="first", lazy_collect=False, exclusive=True, replay=True)
     def set_template(self, template_cls, **kwargs):
         """Set the template that turns messages into token ids.
 

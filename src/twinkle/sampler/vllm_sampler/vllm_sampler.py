@@ -464,7 +464,8 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin, DeltaSamp
                 return_encoded=return_encoded,
                 use_base_model=use_base_model,
                 adapter_paths=adapter_paths,
-                allow_partial_rollout=allow_partial_rollout))
+                allow_partial_rollout=allow_partial_rollout,
+                token_only=token_only))
 
     async def _generate_inputs(
         self,
@@ -715,10 +716,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin, DeltaSamp
             return None
         logger.info(f'Loading LoRA from {adapter_path}')
         local_path = HubOperation.download_model(model_id_or_path=adapter_path)
-        lora_request = await self.engine._get_or_load_lora(local_path)
-        if lora_request is None:
-            logger.warning(f'Failed to pre-load LoRA from {adapter_path}, sampling will proceed without LoRA')
-        return lora_request
+        return await self.engine._get_or_load_lora(local_path)
 
     def _load_lora(self, adapter_path: Optional[str]):
         """Resolve an adapter path to a vLLM ``LoRARequest``, or None for the base model.
