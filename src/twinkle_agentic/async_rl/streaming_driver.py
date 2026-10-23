@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     # rollout domain's vocabulary and the collaborators are twinkle's own classes.
     from .cluster_adapter import ClusterAdapter
     from .score_worker import ScoreWorker
-    from ..rollout import MultiTurnRollout, RolloutSample, SampleHandle
+    from ..rollout import Rollout, RolloutSample, SampleHandle
     from twinkle.model.base import TrainableModel
 
 #: One in-flight trajectory: the sampler handle to poll/collect it by, the policy it was pinned to
@@ -169,7 +169,7 @@ class StreamingDriver:
                  poll: Optional[Callable[[Sequence[SampleHandle]], Sequence[SampleHandle]]] = None,
                  collect: Optional[Callable[[SampleHandle], RolloutSample]] = None,
                  assembly_ready: Optional[Callable[[List[BufferRecord]], Optional[List[BufferRecord]]]] = None,
-                 rollout: Optional[MultiTurnRollout] = None,
+                 rollout: Optional[Rollout] = None,
                  group_pull: Optional[bool] = None,
                  need_rows: Optional[int] = None,
                  version_control: bool = False,

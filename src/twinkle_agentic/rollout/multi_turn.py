@@ -1,10 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import copy
 import re
-import threading
-import uuid
 from collections.abc import Callable
-from concurrent.futures import Future
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal, Optional
 
@@ -17,7 +14,7 @@ from twinkle.template.base import Template
 from twinkle_agentic.protocol.api_sampler import APIGenerationError, APISampler
 from twinkle_agentic.protocol.base import API
 from twinkle_agentic.tools.tool_manager import ToolManager
-from .base import MAX_FOLLOWUPS, STOP_GENERATION_ERROR, STOP_NO_TOOL, Rollout
+from .base import MAX_FOLLOWUPS, STOP_GENERATION_ERROR, STOP_NO_TOOL, Rollout, SampleHandle
 from .ledger import MessageLedger, TurnLedger, last_assistant_text
 from .trace import TraceWriter
 
@@ -110,36 +107,6 @@ class RolloutSample:
     def prompt_index(self) -> str:
         """Back-compat alias for the group id."""
         return self.prompt_id
-
-
-@dataclass(eq=False)
-class SampleHandle:
-    """One in-flight trajectory admitted by :meth:`MultiTurnRollout.admit`.
-
-    Carries the submit-time facts collect/cancel need; identity is ``submission_id``
-    (two handles for one submission are the same trajectory).
-    """
-
-    submission_id: str
-    prompt_idx: Any
-    trajectory_idx: int
-    prompt_extras: dict[str, Any] | None = None
-    require_logprobs: bool = True
-    policy_version: int = 0
-    # The ORIGINAL prompt messages, stamped onto the collected sample (sample.prompt).
-    prompt: list[dict] | None = None
-    # Ref-only remote result (a LazyCollect the driver never resolves early); the local
-    # engine shape leaves it unset and runs the episode on a Future instead.
-    payload: Any = None
-    # The admission pin's adapter path. None marks the in_place strategy, whose collect
-    # stamps a version span; a pinned path (adapter_snapshot) spans nothing.
-    adapter_path: str | None = None
-
-    def __hash__(self) -> int:
-        return hash(self.submission_id)
-
-    def __eq__(self, other: Any) -> bool:
-        return isinstance(other, SampleHandle) and self.submission_id == other.submission_id
 
 
 def _build_sampling_params(num_samples: int, sampling_params: dict | None, force_logprobs: bool) -> SamplingParams:
@@ -759,56 +726,27 @@ class MultiTurnRollout(Rollout):
         ``prompt_idx`` / ``trajectory_idx`` are carried for the collect-side group
         stamping; ``policy_version`` is the admission pin, stamped onto the sample. A
         REMOTE deployment parks the lazy generate on the handle's payload; a local one
-        runs the episode on a daemon-thread Future. This method also runs on a Ray
-        proxy whose ``__init__`` never executed, which is why every state it touches
-        is either on the handle or lazy.
+        runs the episode on a daemon-thread Future.
         """
-        handle = SampleHandle(
-            submission_id=uuid.uuid4().hex,
-            prompt_idx=prompt_idx,
-            trajectory_idx=trajectory_idx,
-            prompt_extras=dict(prompt_extras) if prompt_extras else None,
-            policy_version=policy_version,
-            prompt=list(prompt) if prompt is not None else None,
+        handle = self._new_handle(
+            prompt, trajectory_idx, prompt_idx=prompt_idx, prompt_extras=prompt_extras,
+            adapter_path=adapter_path, policy_version=policy_version)
+        generate_kwargs = dict(
+            num_samples=1,
+            sampling_params=sampling_params,
+            prompt_extras=[prompt_extras] if prompt_extras else None,
+            force_logprobs=True,
             adapter_path=adapter_path,
         )
         if hasattr(self, "_actors"):
             # The remote episode runs on the actor: the generate call itself returns a
             # LazyCollect immediately, so admission never blocks the driver thread.
-            handle.payload = self.generate(
-                [prompt],
-                num_samples=1,
-                sampling_params=sampling_params,
-                prompt_extras=[prompt_extras] if prompt_extras else None,
-                force_logprobs=True,
-                adapter_path=adapter_path,
-            )
+            handle.payload = self.generate([prompt], **generate_kwargs)
             return handle
-        futures: dict[str, Future] = self.__dict__.setdefault("_episode_futures", {})
-        future: Future = Future()
-        futures[handle.submission_id] = future
-
-        def _work() -> None:
-            try:
-                future.set_result(
-                    self.generate(
-                        [prompt],
-                        num_samples=1,
-                        sampling_params=sampling_params,
-                        prompt_extras=[prompt_extras] if prompt_extras else None,
-                        force_logprobs=True,
-                        adapter_path=adapter_path,
-                    )
-                )
-            except Exception as exc:  # surfaced at poll/collect; the thread must not die silently
-                future.set_exception(exc)
-
-        threading.Thread(target=_work, name=f"episode-{handle.submission_id[:8]}", daemon=True).start()
-        return handle
+        return self._admit_local(handle, lambda: self.generate([prompt], **generate_kwargs))
 
     def poll(self, handles: list[SampleHandle]) -> list[SampleHandle]:
         """Non-blocking as-completed query; a failed local episode raises here, fail-loudly."""
-        futures: dict[str, Future] = getattr(self, "_episode_futures", {})
         completed: list[SampleHandle] = []
         for handle in handles:
             if handle.payload is not None:
@@ -817,13 +755,8 @@ class MultiTurnRollout(Rollout):
                 if handle.payload.ready():
                     completed.append(handle)
                 continue
-            future = futures.get(handle.submission_id)
-            if future is None or not future.done():
-                continue
-            error = future.exception()
-            if error is not None:
-                raise RuntimeError(f"streaming episode {handle.submission_id} failed: {error}") from error
-            completed.append(handle)
+            if self._episode_done(handle):
+                completed.append(handle)
         return completed
 
     def collect(self, handle: SampleHandle) -> RolloutSample:
@@ -831,21 +764,12 @@ class MultiTurnRollout(Rollout):
         if handle.payload is not None:
             samples = handle.payload()
         else:
-            future = getattr(self, "_episode_futures", {}).pop(handle.submission_id, None)
-            if future is None:
-                raise RuntimeError(
-                    f"collect called for an unknown or already-collected submission {handle.submission_id}."
-                )
-            samples = future.result()
+            samples = self._pop_episode_future(handle).result()
         if len(samples) != 1:
             raise RuntimeError(
                 f"episode collect expected exactly 1 sample (submission {handle.submission_id}), got {len(samples)}."
             )
-        sample = samples[0]
-        sample.prompt_id = str(handle.prompt_idx)
-        sample.policy_version = handle.policy_version
-        sample.prompt = handle.prompt
-        return sample
+        return self._stamp_admission(samples[0], handle)
 
     def cancel(self, handle: SampleHandle | None) -> None:
         """Drop an admitted-but-uncollected episode: remote drops the ref, local abandons.
@@ -858,7 +782,17 @@ class MultiTurnRollout(Rollout):
         if handle.payload is not None:
             # The in-actor episode finishes on its own; its result is discarded with the ref.
             return
-        getattr(self, "_episode_futures", {}).pop(handle.submission_id, None)
+        self._drop_episode_future(handle.submission_id)
+
+    def stop(self, submission_id: str) -> None:
+        """End an in-flight submission at driver teardown (abort + settle).
+
+        The local episode's future is dropped -- its daemon thread runs to completion
+        discarded, a thread being the one thing Python will not end early. A remote
+        episode's payload ref is dropped by the caller together with the handle, so
+        there is nothing further to end here.
+        """
+        self._drop_episode_future(submission_id)
 
     # `dispatch` has no 'first' mode (only all / slice / slice_dp); the single-worker
     # placement already comes from @remote_class(execute='first'), so 'all' reaches it.
