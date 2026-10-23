@@ -22,6 +22,8 @@ import twinkle
 import twinkle.metric
 import twinkle.patch
 from twinkle import DeviceMesh, Platform, remote_class, remote_function, requires, torch_util
+from twinkle.checkpoint_engine.delta.trainer.backends import MegatronDeltaBackend
+from twinkle.checkpoint_engine.delta.trainer.mixin import DeltaTrainerMixin
 from twinkle.checkpoint_engine.mixin import CheckpointEngineMixin
 from twinkle.checkpoint_engine.weight_keys import add_base_layer_suffix, is_lora_key, normalize_param_name, print_weight_example
 from twinkle.data_format import InputFeature, ModelOutput, Trajectory, is_encoded
@@ -98,7 +100,8 @@ _default_adapter_name = ''
 
 
 @remote_class(execute='all')
-class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
+class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrainerMixin,
+                   MegatronDeltaBackend):
 
     _mcore_async_queue = None
 
