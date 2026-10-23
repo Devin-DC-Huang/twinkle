@@ -17,7 +17,6 @@ from typing import Any, Literal
 
 from .hybrid import SpectralHybridArgs
 from .task_queue import TaskQueueConfig
-from .training import TrainingModes
 
 # Env var keys the launcher sets from the gateway ``server_config`` so that any
 # Ray worker (model / sampler / processor), not just the gateway, applies the
@@ -69,9 +68,7 @@ class ModelArgs(_ArgsBase):
     device_group: dict[str, Any]
     device_mesh: dict[str, Any]
     backend: Literal['mock', 'transformers', 'megatron']
-    device_type: Literal['cuda', 'npu', 'mps', 'cpu'] | None = None
     env_vars: dict[str, str] = Field(default_factory=dict)
-    modes: TrainingModes | None = None
     min_replicas: int | None = Field(default=None, ge=0, strict=True)
     max_replicas: int | None = Field(default=None, gt=0, strict=True)
     idle_timeout_s: float | None = Field(default=None, gt=0, allow_inf_nan=False)
@@ -86,18 +83,8 @@ class ModelArgs(_ArgsBase):
     hybrid: SpectralHybridArgs | None = None
     data_plane_url: str | None = None
 
-    @model_validator(mode='before')
-    @classmethod
-    def _mode_resources(cls, data):
-        if isinstance(data, dict) and data.get('modes') is not None:
-            return {'device_group': {}, 'device_mesh': {}, **data}
-        return data
-
     @model_validator(mode='after')
     def _validate_spectral_backend(self):
-        if self.modes is not None and any(
-                mode.idle_timeout_s is None for mode in (self.modes.lora, self.modes.full) if mode is not None):
-            raise ValueError('modes require a finite positive idle_timeout_s')
         if self.strategy is not None and self.backend != 'transformers':
             raise ValueError('strategy is only supported by the transformers backend')
         if self.hybrid is not None:

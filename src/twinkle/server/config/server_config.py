@@ -87,7 +87,7 @@ class ServerConfig(BaseModel):
 
     @property
     def training_config(self) -> TrainingConfig:
-        """Normalize old and extended model args into one runtime catalog."""
+        """Normalize model application args into the internal runtime catalog."""
         return TrainingConfig(
             **self.training.model_dump(),
             models=[normalize_model_application(app) for app in self.applications if app.import_path == 'model'])

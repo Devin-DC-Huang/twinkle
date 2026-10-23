@@ -54,30 +54,18 @@ def main():
             'args': {
                 'model_id': 'small',
                 'backend': 'mock',
-                'device_type': 'cpu',
-                'modes': {
-                    'lora': {
-                        'num_devices': 1,
-                        'device_mesh': {
-                            'dp_size': 1
-                        },
-                        'max_loras': 2,
-                        'max_replicas': 1
-                    },
-                    'full': {
-                        'num_devices': 1,
-                        'device_mesh': {
-                            'dp_size': 1
-                        }
-                    }
-                }
+                'train_mode': 'lora',
+                'device_group': {'ranks': 1, 'device_type': 'cpu'},
+                'device_mesh': {'dp_size': 1},
+                'max_loras': 2,
+                'max_replicas': 1,
             },
         }, {
             'name': 'other',
             'import_path': 'model',
             'route_prefix': '/api/v1/model/other',
             'args': {
-                'model_id': 'other',
+                'model_id': 'small',
                 'backend': 'mock',
                 'train_mode': 'full',
                 'device_group': {'ranks': 1, 'device_type': 'cpu'},
@@ -129,7 +117,8 @@ def main():
         transport = ClientTransport(ClientContext(base_url=base, api_key='probe-owner', session_id=session))
         first = MultiLoraTransformersModel('small', transport=transport)
         second = MultiLoraTransformersModel('small', transport=transport)
-        first.add_adapter_to_model('same', None)
+        from peft import LoraConfig
+        first.add_adapter_to_model('same', LoraConfig(r=8, target_modules='all-linear'))
         instance = next(
             item for item in ray.get(controller.diagnostics.remote())['instances']
             if first._training_ids['same'] in item['training_ids'])
@@ -142,17 +131,16 @@ def main():
             headers={'Authorization': 'Bearer probe-owner'},
             timeout=10)
         assert bypass.status_code == 400 and 'catalog endpoint' in bypass.text, bypass.text
-        second.add_adapter_to_model('same', None)
+        second.add_adapter_to_model('same', LoraConfig(r=8, target_modules='all-linear'))
         old_id = first._training_ids['same']
         assert old_id != second._training_ids['same']
         assert json.loads(first.get_train_configs().result) == {}
         first.zero_grad()
         first.remove_adapter()
-        first.add_adapter_to_model('same', None)
+        first.add_adapter_to_model('same', LoraConfig(r=8, target_modules='all-linear'))
         assert old_id != first._training_ids['same']
         first.remove_adapter()
         second.remove_adapter()
-        from peft import LoraConfig
         native_lora = MultiLoraTransformersModel('small', transport=transport)
         native_lora.add_adapter_to_model('native-lora', LoraConfig(r=8, target_modules='all-linear'))
         native_lora.zero_grad()
@@ -174,7 +162,7 @@ def main():
             })
         assert shared1.forward_backward([datum], 'cross_entropy').result().metrics
         shared1.optim_step(types.AdamParams(learning_rate=1e-4)).result()
-        exclusive = service.create_full_training_client(base_model='small')
+        exclusive = service.create_full_training_client(base_model='other')
         assert not exclusive.get_info().is_lora
         assert exclusive.forward_backward([datum], 'cross_entropy').result().metrics
         exclusive.optim_step(types.AdamParams(learning_rate=1e-4)).result()
@@ -208,7 +196,8 @@ def main():
         before = ray.available_resources().get('CPU', 0)
         for index in range(10):
             model = MultiLoraTransformersModel('small' if index % 2 == 0 else 'other', transport=transport)
-            model.add_adapter_to_model('cycle', None)
+            model.add_adapter_to_model('cycle', LoraConfig(r=8, target_modules='all-linear')
+                                       if index % 2 == 0 else None)
             model.zero_grad()
             model.remove_adapter()
             print(json.dumps({'phase': 'cycles', 'completed': index + 1}), flush=True)

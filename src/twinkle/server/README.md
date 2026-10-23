@@ -29,6 +29,10 @@ The three runtime modules have different boundaries: `server/runtime.py` initial
 
 Multi-LoRA execution registers every preallocated slot with the distributed reducer. DDP requires `find_unused_parameters=True` and `static_graph=False`; FSDP requires `reshard_after_forward=True` so adapter switches act on sharded parameters instead of retained views. Incompatible overrides fail during model initialization, before weights are loaded.
 
+## Training configuration
+
+The public YAML keeps `applications` with `import_path: model`, `args.train_mode`, `device_group`, and `device_mesh`. Each model application selects one training mode. To expose LoRA and full training for the same weights, use two applications with distinct names and route aliases. `config/training_normalization.py` translates these entries into the internal catalog; internal mode records are not an alternative YAML schema.
+
 ## Sampling ownership and state reconstruction
 
 Stable sampling uses shared access; configuration and full-weight updates use exclusive access. Every participating instance is reserved before an update. Idle sweep checks the same reservations under the state lock. The lock order is configuration then state; startup is never awaited while holding the configuration lock.

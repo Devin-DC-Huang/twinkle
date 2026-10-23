@@ -82,7 +82,7 @@ def test_generated_server_config_matches_launcher_schema(tmp_path, monkeypatch, 
     assert gateway.deployments[0]['name'] == 'GatewayServer'
     assert gateway.args.supported_models == ['Qwen/student'] + [s['model_id'] for s in samplers]
     application = next(app for app in config.applications if app.import_path == 'model')
-    assert application.args.modes is None and application.args.train_mode == 'lora'
+    assert application.args.train_mode == 'lora'
     model = config.training_config.models[0]
     assert model.modes.full is None
     assert model.modes.lora.min_replicas == 0 and model.modes.lora.max_replicas == 1

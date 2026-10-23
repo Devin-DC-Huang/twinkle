@@ -422,7 +422,6 @@ class _ServerTools:
             'args': {
                 'model_id': f'ms://{model_id}',
                 'backend': backend,
-                'device_type': 'cuda',
                 'env_vars': {
                     'TWINKLE_TRUST_REMOTE_CODE': '1'
                 },

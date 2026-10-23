@@ -157,7 +157,7 @@ def validate_idempotent_create(base_url, controller, model_name):
     return True
 
 
-def validate_capacity(base_url, controller, model_name, capacity):
+def validate_capacity(base_url, controller, model_name, full_model_name, capacity):
     """Assert shared LoRA capacity and full-training exclusivity on real devices."""
     from tests.server.integration.on_demand_training.acceptance_support import TrainingHandle, assert_released
     handles = []
@@ -179,13 +179,13 @@ def validate_capacity(base_url, controller, model_name, capacity):
         for handle in reversed(handles):
             handle.close()
     assert_released(controller, ray.get_runtime_context().namespace)
-    exclusive = TrainingHandle(base_url, model_name, 'twinkle', 'exclusive', mode='full')
+    exclusive = TrainingHandle(base_url, full_model_name, 'twinkle', 'exclusive', mode='full')
     try:
         exclusive.step()
         live = [row for row in ray.get(controller.diagnostics.remote())['instances'] if row['state'] != 'STOPPED']
         assert len(live) == 1 and live[0]['mode'] == 'full' and len(live[0]['training_ids']) == 1
         try:
-            overflow = TrainingHandle(base_url, model_name, 'tinker', 'exclusive-overflow', mode='full')
+            overflow = TrainingHandle(base_url, full_model_name, 'tinker', 'exclusive-overflow', mode='full')
         except Exception as exc:
             assert 'replica limit' in str(exc).lower(), exc
         else:
@@ -289,11 +289,12 @@ def main():
     } if args.persistence == 'redis' else {'mode': 'memory'})
     raw['ray_namespace'] = namespace
     raw['http_options'] = {'host': '127.0.0.1', 'port': port}
+    full_applications = []
     for app in raw['applications']:
         params = app['args']
         if app['import_path'] == 'model':
             common = {
-                'num_devices': args.training_devices,
+                'device_group': {'ranks': args.training_devices, 'device_type': 'cuda'},
                 'device_mesh': {'device_type': 'cuda', 'dp_size': args.training_devices // args.training_pp_size,
                                                 'pp_size': args.training_pp_size},
                 'min_replicas': 0, 'max_replicas': 1, 'idle_timeout_s': 3600,
@@ -301,14 +302,22 @@ def main():
                 'queue_config': {**params.get('queue_config', {}), 'execution_timeout': 600},
             }
             app['args'] = {
-                'model_id': args.model, 'backend': args.backend, 'device_type': 'cuda',
-                'modes': {'lora': {**common, 'max_loras': 10, 'max_r': 32}, 'full': common},
+                **common, 'model_id': args.model, 'backend': args.backend, 'train_mode': 'lora',
+                'max_loras': 10, 'max_r': 32,
                 'env_vars': {'TWINKLE_FAIL_FAST': '0', 'TWINKLE_TRUST_REMOTE_CODE': '1'},
             }
             app.pop('deployments', None)
+            full_applications.append({
+                'name': app['name'] + '-full',
+                'route_prefix': app['route_prefix'] + '-full',
+                'import_path': 'model',
+                'args': {**common, 'model_id': args.model, 'backend': args.backend, 'train_mode': 'full',
+                         'env_vars': app['args']['env_vars']},
+            })
         elif app['import_path'] == 'sampler':
             params['model_id'] = args.model
             params['engine_args']['attention_config'] = {'flash_attn_version': 3}
+    raw['applications'].extend(full_applications)
     if args.recovery_only:
         raw['applications'] = [app for app in raw['applications'] if app['import_path'] in ('server', 'model')]
     config = ServerConfig.model_validate(raw)
@@ -320,7 +329,8 @@ def main():
         'TWINKLE_STATE_RAY_NAMESPACE': namespace,
         'TWINKLE_PERSISTENCE_MODE': args.persistence,
         'TWINKLE_DEFAULT_SAVE_DIR': str(run_dir / 'checkpoints'),
-        'TWINKLE_MODEL_ID_ALIASES': json.dumps({'Qwen/Qwen3.5-4B': args.model}),
+        'TWINKLE_MODEL_ID_ALIASES': json.dumps({model.name: model.model_id
+                                              for model in config.training_config.models}),
         'TWINKLE_TRUST_REMOTE_CODE': '1',
         'TWINKLE_FAIL_FAST': '0',
         'TWINKLE_TEST_GPU_E2E': '1',
@@ -425,6 +435,7 @@ def main():
                 base_url, launcher._training_controller, model_name)
             evidence['capacity_checked'] = validate_capacity(
                 base_url, launcher._training_controller, model_name,
+                next(model.name for model in config.training_config.models if model.modes.full is not None),
                 config.training_config.models[0].modes.lora.max_loras)
         if args.stress_iterations or args.soak_seconds:
             from tests.server.integration.on_demand_training.acceptance_support import assert_released

@@ -23,24 +23,25 @@ def model_config():
     }
 
 
-def model_application(model=None):
-    model = dict(model or model_config())
-    name = model.pop('name')
-    return {'name': 'model-' + name, 'route_prefix': '/api/v1/model/' + name,
-            'import_path': 'model', 'args': model}
+def model_application():
+    return {'name': 'model-small', 'route_prefix': '/api/v1/model/Qwen/small',
+            'import_path': 'model', 'args': {
+                'model_id': 'ms://Qwen/small', 'backend': 'transformers',
+                'device_group': {'ranks': 2, 'device_type': 'cuda'},
+                'device_mesh': {'fsdp_size': 2},
+            }}
 
 
 def test_catalog_defaults_and_mode_selection():
-    config = ServerConfig(applications=[model_application()])
-    catalog = TrainingCatalog(config.training_config)
+    config = TrainingConfig(models=[model_config()])
+    catalog = TrainingCatalog(config)
     shared = catalog.get('Qwen/small', 'lora')
     exclusive = catalog.get('Qwen/small', 'full')
     assert shared.capacity == 5
     assert exclusive.capacity == 1
     assert shared.config.min_replicas == exclusive.config.min_replicas == 0
     assert shared.config.idle_timeout_s == 1800
-    assert config.training.allocation_timeout_s == 3
-    assert config.to_yaml_dict()['applications'][0]['args']['model_id'] == 'ms://Qwen/small'
+    assert config.allocation_timeout_s == 3
     with pytest.raises(RequestRejectedError, match='Unknown training model'):
         catalog.get('not-in-catalog', 'lora')
 
@@ -163,11 +164,20 @@ def test_legacy_lifecycle_overrides_and_full_instances():
     assert config.training_config.models[0].modes.lora is None
 
 
-def test_extended_modes_do_not_accept_ambiguous_single_mode_settings():
-    app = model_application()
-    app['args']['train_mode'] = 'full'
-    with pytest.raises(ValidationError, match='cannot be mixed'):
-        ServerConfig(applications=[app])
+def test_separate_model_applications_select_lora_and_full():
+    shared = model_application()
+    exclusive = copy.deepcopy(shared)
+    exclusive.update(name='model-small-full', route_prefix='/api/v1/model/Qwen/small-full')
+    exclusive['args'].update(train_mode='full', min_replicas=0, max_replicas=2, idle_timeout_s=60)
+    config = ServerConfig(applications=[shared, exclusive])
+    catalog = TrainingCatalog(config.training_config)
+    assert catalog.get('Qwen/small', 'lora').capacity == 5
+    full = catalog.get('Qwen/small-full', 'full')
+    assert full.capacity == 1
+    assert (full.config.min_replicas, full.config.max_replicas, full.config.idle_timeout_s) == (0, 2, 60)
+    with pytest.raises(RequestRejectedError, match='does not provide full'):
+        catalog.get('Qwen/small', 'full')
+    assert ServerConfig.model_validate(config.to_yaml_dict()).training_config == config.training_config
 
 
 def test_launcher_keeps_training_and_sampling_capabilities_separate(monkeypatch):
@@ -203,6 +213,18 @@ def legacy_application():
             'env_vars': {'USER_OPTION': 'deployment', 'OTHER_OPTION': 'retained'}, 'pip': ['example==1.0']
         }},
     }]}
+
+
+@pytest.mark.parametrize('extra', [
+    {'modes': None},
+    {'modes': {'lora': {'num_devices': 2, 'device_mesh': {'dp_size': 2}}}},
+    {'device_type': 'cpu'},
+])
+def test_model_yaml_rejects_alternative_resource_and_mode_syntax(extra):
+    app = legacy_application()
+    app['args'].update(extra)
+    with pytest.raises(ValidationError, match='Extra inputs are not permitted'):
+        ServerConfig(applications=[app])
 
 
 def test_legacy_options_reach_cpu_router_without_changing_yaml(monkeypatch):
@@ -294,7 +316,6 @@ def test_l20d_candidate_is_lora_only_and_bounds_total_devices():
     assert (sampler.args.min_replicas, sampler.args.max_replicas, sampler.args.target_ongoing_requests) == (2, 4, 16)
     assert mode.num_devices * mode.max_replicas + sampler.args.device_group['ranks'] * sampler.args.max_replicas == 8
     assert mode.max_loras * mode.max_replicas == 6
-    assert config.applications[-1].args.modes is None
     with pytest.raises(RequestRejectedError, match='does not provide full'):
         TrainingCatalog(config.training_config).get(model.name, 'full')
 
@@ -310,12 +331,14 @@ def test_single_device_megatron_is_rejected_before_allocation(mode, legacy):
         model = model_config()
         model['backend'] = 'megatron'
         model['modes'] = {mode: {'num_devices': 1, 'device_mesh': {'dp_size': 1}}}
-        app = model_application(model)
     with pytest.raises(ValidationError, match='at least 2 devices'):
-        ServerConfig(applications=[app])
+        if legacy:
+            ServerConfig(applications=[app])
+        else:
+            TrainingConfig(models=[model])
 
 
 def test_transformers_still_accepts_single_device():
-    model = model_config()
-    model['modes'] = {'lora': {'num_devices': 1, 'device_mesh': {'dp_size': 1}}}
-    assert ServerConfig(applications=[model_application(model)]).training_config.models[0].modes.lora.num_devices == 1
+    app = model_application()
+    app['args'].update(device_group={'ranks': 1, 'device_type': 'cuda'}, device_mesh={'dp_size': 1})
+    assert ServerConfig(applications=[app]).training_config.models[0].modes.lora.num_devices == 1
