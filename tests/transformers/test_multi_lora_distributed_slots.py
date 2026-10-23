@@ -131,3 +131,25 @@ def test_checkpoint_as_first_operation_preserves_fresh_slot_reset_basis(tmp_path
     manager.acquire_lora('replacement', config)
     for name, value in manager.get_state_dict('replacement').items():
         torch.testing.assert_close(value, initial[name])
+
+
+def test_slot_registration_never_unfreezes_base_parameters_with_lora_in_their_name():
+    from collections import OrderedDict
+    config = LoraConfig(r=2, target_modules=['lora_projection'])
+    manager = MultiLora(max_loras=2, max_r=2)
+    module = manager.patch(torch.nn.Sequential(OrderedDict([
+        ('lora_projection', torch.nn.Linear(4, 4)),
+    ])), target_modules=['lora_projection'], lora_config=config)
+    base = {name: parameter for name, parameter in module.named_parameters() if '.base_layer.' in name}
+    assert base
+    # Respect an explicitly frozen base even when its module name contains lora_.
+    for parameter in base.values():
+        parameter.requires_grad_(False)
+    manager.reset_adapter_status()
+    mask = {name: parameter.requires_grad for name, parameter in module.named_parameters()}
+    with pytest.raises(RuntimeError, match='wrapper failed'):
+        with manager.trainable_slots():
+            assert all(parameter.requires_grad for _, parameter in manager._named_slot_parameters(module))
+            assert not any(parameter.requires_grad for parameter in base.values())
+            raise RuntimeError('wrapper failed')
+    assert {name: parameter.requires_grad for name, parameter in module.named_parameters()} == mask
