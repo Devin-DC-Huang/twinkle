@@ -97,6 +97,22 @@ async def settle_jobs(pool):
 
 
 @pytest.mark.asyncio
+async def test_shutdown_rejects_unconfirmed_release_and_allows_retry():
+    pool, driver, _ = setup()
+    await pool.initialize()
+    driver.fail_close = True
+    try:
+        with pytest.raises(RuntimeError, match='shutdown.*unconfirmed'):
+            await pool.shutdown()
+        assert pool._owned_count() == 2 and not driver.stopped
+        assert all(instance.state == 'QUARANTINED' for instance in pool.instances.values())
+    finally:
+        driver.fail_close = False
+        await pool.shutdown()
+    assert pool._owned_count() == 0 and len(driver.stopped) == 2
+
+
+@pytest.mark.asyncio
 async def test_minimum_expand_and_reclaim_only_idle_extras():
     pool, driver, clock = setup()
     await pool.initialize()

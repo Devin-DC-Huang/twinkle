@@ -96,8 +96,10 @@ class RayRuntime:
         for handle in actors:
             try:
                 await asyncio.wait_for(handle.__ray_ready__.remote(), 5)
-            except ray.exceptions.RayActorError:
+            except ray.exceptions.ActorDiedError:
                 continue
+            except ray.exceptions.RayActorError as exc:
+                raise ResourceReleaseError('Owned worker death could not be confirmed', phase='worker_death') from exc
             raise ResourceReleaseError('Owned worker death could not be confirmed', phase='worker_death')
 
         started, status = time.monotonic(), 'error'

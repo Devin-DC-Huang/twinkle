@@ -63,6 +63,11 @@ class InstanceLifecycle:
                 try:
                     await asyncio.wait_for(stop(), timeout)
                 except Exception as error:
+                    logger.warning(
+                        '%s instance %s shutdown is unconfirmed',
+                        self.label,
+                        identity,
+                        exc_info=(type(error), error, error.__traceback__))
                     await quarantined(error)
                 else:
                     # Only the feature can retire its users/quota and commit STOPPED.
@@ -92,6 +97,12 @@ class InstanceLifecycle:
     @staticmethod
     def owned_count(instances):
         return sum(instance.state != 'STOPPED' for instance in instances)
+
+    def require_released(self, instances):
+        """A shutdown ACK must certify release before its owner can be removed."""
+        owned = self.owned_count(instances)
+        if owned:
+            raise RuntimeError(f'{self.label} shutdown is unconfirmed: {owned} instances remain owned')
 
     @classmethod
     def headroom(cls, instances, maximum):

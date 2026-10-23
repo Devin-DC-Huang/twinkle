@@ -229,6 +229,56 @@ async def test_max_lifetime_stops_new_work_while_admitted_work_finishes():
 
 
 @pytest.mark.asyncio
+async def test_shutdown_rejects_unconfirmed_release_and_allows_retry():
+    from tests.server.state.fake_backend import FakeBackend
+
+    controller, state, runtime, _ = await setup(backend=FakeBackend())
+    await create(controller, state, 'shutdown-ack')
+    runtime.fail_shutdown = True
+    try:
+        with pytest.raises(RuntimeError, match='shutdown.*unconfirmed'):
+            await controller.shutdown()
+        assert runtime.allocations
+        assert all(instance.state == 'QUARANTINED' for instance in controller.instances.values())
+    finally:
+        runtime.fail_shutdown = False
+        await controller.shutdown()
+    assert not runtime.allocations
+    assert all(instance.state == 'STOPPED' for instance in controller.instances.values())
+
+
+@pytest.mark.asyncio
+async def test_shutdown_attempts_healthy_peer_after_an_instance_metadata_failure():
+    from tests.server.state.fake_backend import FakeBackend
+
+    controller, state, runtime, _ = await setup(backend=FakeBackend())
+    first = await create(controller, state, 'shutdown-first')
+    peer = await create(controller, state, 'shutdown-peer', mode='full')
+    first_instance = controller.instances[controller.trainings[first].instance_id]
+    peer_instance = controller.instances[controller.trainings[peer].instance_id]
+    save = controller.store.save_instance
+
+    async def unavailable(record):
+        if record.instance_id == first_instance.instance_id and record.state == 'DRAINING':
+            raise RuntimeError('Instance metadata unavailable')
+        await save(record)
+
+    controller.store.save_instance = unavailable
+    try:
+        with pytest.raises(RuntimeError, match='Instance metadata unavailable'):
+            await controller.shutdown()
+        assert peer_instance.state == 'STOPPED'
+        assert peer_instance.instance_id not in runtime.allocations
+        assert first_instance.instance_id in runtime.allocations
+        with pytest.raises(ResourceNotFoundError):
+            await controller.route(first, 'owner')
+    finally:
+        controller.store.save_instance = save
+        await controller.shutdown()
+    assert not runtime.allocations
+
+
+@pytest.mark.asyncio
 async def test_lazy_queries_allocate_nothing():
     controller, state, runtime, _ = await setup()
     assert runtime.starts == 0

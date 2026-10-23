@@ -790,8 +790,17 @@ class TrainingController:
 
     async def shutdown(self) -> None:
         self._ready = False
-        for instance in list(self.instances.values()):
-            await self.fail_instance(
+        outcomes = await asyncio.gather(
+            *(self.fail_instance(
                 instance.instance_id,
                 FutureFailureRecord(
                     reason_code='orphaned_replica', message='Training service is shutting down', attribution='server'))
+              for instance in list(self.instances.values())),
+            return_exceptions=True)
+        await self.wait_for_jobs()
+        errors = [outcome for outcome in outcomes if isinstance(outcome, BaseException)]
+        for error in errors:
+            logger.error('Training instance shutdown failed', exc_info=(type(error), error, error.__traceback__))
+        if errors:
+            raise errors[0]
+        self.lifecycle.require_released(self.instances.values())

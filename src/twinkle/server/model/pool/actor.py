@@ -171,5 +171,4 @@ class TrainingControllerActor:
             task.cancel()
         await asyncio.gather(*self._monitors, return_exceptions=True)
         await self.core.shutdown()
-        await self.core.wait_for_jobs()
         await self.driver.runtime.wait_for_cleanup()

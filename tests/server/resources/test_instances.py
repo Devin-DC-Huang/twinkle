@@ -25,8 +25,10 @@ async def test_spawn_logs_exception_with_traceback(caplog, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_concurrent_close_shares_one_stop_and_retries_quarantine():
+async def test_concurrent_close_shares_one_stop_and_retries_quarantine(caplog, monkeypatch):
     import asyncio
+    target = logging.getLogger('twinkle.server.resources.instances')
+    monkeypatch.setattr(target, 'handlers', [*target.handlers, caplog.handler])
     lifecycle = InstanceLifecycle('test')
     entered, resume = asyncio.Event(), asyncio.Event()
     calls, events = [], []
@@ -51,6 +53,9 @@ async def test_concurrent_close_shares_one_stop_and_retries_quarantine():
     resume.set()
     await asyncio.gather(first, second)
     assert calls == ['stop'] and events == ['death unconfirmed']
+    records = [record for record in caplog.records if record.getMessage() == 'test instance one shutdown is unconfirmed']
+    assert len(records) == 1 and records[0].exc_info[1].args == ('death unconfirmed',)
+    assert records[0].exc_info[2] is not None
     await lifecycle.close('one', stop, 1, stopped, quarantined)
     assert calls == ['stop', 'stop'] and events[-1] == 'stopped'
     await lifecycle.join()
@@ -199,7 +204,9 @@ async def test_orphan_inventory_cannot_block_recovery_deadlines(monkeypatch, kin
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('outcome', ['unconfirmed_worker', 'removed', 'removal_failed'])
+@pytest.mark.parametrize('outcome', [
+    'unconfirmed_worker', 'unavailable_worker', 'dead_worker', 'removed', 'removal_failed'
+])
 async def test_worker_death_precedes_group_release_and_removal_timing(monkeypatch, outcome):
     from types import SimpleNamespace
     from unittest.mock import AsyncMock, Mock
@@ -209,10 +216,15 @@ async def test_worker_death_precedes_group_release_and_removal_timing(monkeypatc
     from twinkle.server.resources.runtime import RayRuntime
 
     async def ready():
+        if outcome == 'unavailable_worker':
+            raise ray.exceptions.ActorUnavailableError('Control-plane connection lost', None)
+        if outcome == 'dead_worker':
+            raise ray.exceptions.ActorDiedError()
         return None  # Worker can still answer: death has not been confirmed.
 
     handle = SimpleNamespace(__ray_ready__=SimpleNamespace(remote=ready))
-    rows = [{'namespace': 'test', 'name': 'owned-worker'}] if outcome == 'unconfirmed_worker' else []
+    rows = ([{'namespace': 'test', 'name': 'owned-worker'}]
+            if outcome in ('unconfirmed_worker', 'unavailable_worker', 'dead_worker') else [])
     monkeypatch.setattr(ray.util, 'list_named_actors', lambda **kwargs: rows)
     monkeypatch.setattr(ray, 'get_actor', lambda *args, **kwargs: handle)
     monkeypatch.setattr(ray, 'kill', lambda *args, **kwargs: None)
@@ -221,7 +233,7 @@ async def test_worker_death_precedes_group_release_and_removal_timing(monkeypatc
     runtime.pool.remove = AsyncMock(side_effect=RuntimeError('PG removal failed')
                                     if outcome == 'removal_failed' else None)
     observe = Mock()
-    if outcome == 'unconfirmed_worker':
+    if outcome in ('unconfirmed_worker', 'unavailable_worker'):
         with pytest.raises(ResourceReleaseError) as failure:
             await runtime.shutdown('owned', 'app', observe_removal=observe)
         assert failure.value.phase == 'worker_death'

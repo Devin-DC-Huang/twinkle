@@ -363,3 +363,4 @@ class SamplerController:
         await asyncio.gather(*(self._close(instance) for instance in list(self.instances.values())))
         self._guard.close()
         await self.lifecycle.join()
+        self.lifecycle.require_released(self.instances.values())
