@@ -89,6 +89,11 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin, DeltaSamp
     When gpus_per_worker > 1 is set in DeviceGroup, tensor parallelism is used.
     """
 
+    # Declared so a rollout hands this sampler its RolloutState instead of a bare encoded feature:
+    # a multimodal row's pixel tensors can only be carried by the state (_encode_single rejects a media
+    # feature without one), and _generate_inputs already reads state.feature / engine_input_ids / media.
+    accepts_rollout_state = True
+
     def __init__(self, model_id: str, engine_args: Dict[str, Any] = None, device_mesh: DeviceMesh = None, **kwargs):
         """Initialize vLLMSampler.
 

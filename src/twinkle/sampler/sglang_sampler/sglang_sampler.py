@@ -64,6 +64,12 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin):
         default ``sync_weights(merge_and_sync=True)``, which sends merged base weights.
     """
 
+    # Declared so a rollout hands this sampler its RolloutState instead of a bare encoded feature:
+    # a multimodal row's image tensors can only be carried by the state (the media guard rejects a
+    # media feature without one), and _generate_inputs already reads state.feature / engine_input_ids /
+    # media. Mirrors :class:`vLLMSampler` / :class:`TransformersSampler`.
+    accepts_rollout_state = True
+
     def __init__(self, model_id: str, engine_args: Dict[str, Any] = None, device_mesh: DeviceMesh = None, **kwargs):
         """Initialize SGLangSampler.
 

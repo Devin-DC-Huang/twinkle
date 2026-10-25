@@ -251,12 +251,14 @@ class StreamingDriver:
                                 f'-- inject it explicitly or pass a rollout to default-bind it')
         # ``consume`` is optional: providing it selects the blocking regime (run() trains in-process, the
         # PPO/RFT/distill path); omitting it selects the iterator regime (run() is bridged to __next__ and
-        # the recipe trains, see __iter__). ``score`` is the iterator regime's per-sample scoring seam --
-        # optional and algorithm-agnostic.
-        for name, fn in (('consume', consume), ('score', score)):
-            if fn is not None and not callable(fn):
-                raise TypeError(f'StreamingDriver optional seam {name!r} must be callable or None, '
-                                f'got {type(fn).__name__}')
+        # the recipe trains, see __iter__). ``score`` is the iterator regime's scoring seam -- optional and
+        # algorithm-agnostic -- but it is NOT validated here: it was already checked above against its TWO
+        # legal shapes (a local callable, or a score worker carrying ``score_group``). Re-checking ``score``
+        # for plain callability would wrongly reject the score-worker shape this driver explicitly supports
+        # (``self._score_worker``), which is what the disaggregated GRPO/PPO assemblies inject.
+        if consume is not None and not callable(consume):
+            raise TypeError(f'StreamingDriver optional seam \'consume\' must be callable or None, '
+                            f'got {type(consume).__name__}')
         if max_group_regenerations < 0:
             raise ValueError(f'max_group_regenerations must be non-negative, got {max_group_regenerations}')
         # The control plane is OPTIONAL: version_control=True is the RL regime; False is the infer regime

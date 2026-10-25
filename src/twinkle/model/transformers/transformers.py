@@ -1271,7 +1271,8 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         generation_target = self.model if hasattr(self.model, 'generate') else unwrapped_model
         engine = TransformersEngine(self.tokenizer_id, model=generation_target, tokenizer=template.tokenizer)
 
-        encoded, failures = generation.encode_all(template, inputs_list, logprobs_only=logprobs_only, strict=strict)
+        encoded, states, failures = generation.encode_all(
+            template, inputs_list, logprobs_only=logprobs_only, strict=strict)
         results: List[Optional[SampleResponse]] = [None] * len(inputs_list)
         for index, response in failures.items():
             results[index] = response
@@ -1290,11 +1291,11 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         with lora_ctx:
             for chunk in generation.chunks(pending, _GENERATION_MAX_BATCH_SIZE):
                 for index, response in zip(
-                        chunk, generation.run_chunk(chunk, encoded, params, template, call_batch, strict=strict)):
+                        chunk, generation.run_chunk(chunk, encoded, states, call_batch, strict=strict)):
                     results[index] = response
 
         if not logprobs_only:
-            generation.attach_features(template, results, encoded)
+            generation.attach_features(template, results, encoded, states)
         return [
             r if r is not None else generation.error_response(encoded.get(i, {})) for i, r in enumerate(results)
         ]

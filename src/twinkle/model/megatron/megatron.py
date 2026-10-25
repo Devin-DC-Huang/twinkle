@@ -813,11 +813,13 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
         logps = []
         channel_loss = {}
         count = 0
+        n_loss_entries = 0
         if losses:
             for loss_dict in losses:
                 if isinstance(loss_dict, dict):
                     if 'loss' in loss_dict:
                         loss += loss_dict['loss']
+                        n_loss_entries += 1
                     if 'logits' in loss_dict:
                         logits.append(loss_dict['logits'])
                     if 'logps' in loss_dict:
@@ -831,6 +833,14 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
                             channel_loss[channel] = stats
                 elif isinstance(loss_dict, torch.Tensor):
                     raise ValueError('Expected loss dict, got tensor')
+        if n_loss_entries > 1:
+            # Backend equivalence: the transformers backend reports ONE mean loss for the whole batch, so
+            # a run split into several microbatches must average the per-microbatch losses, not SUM them
+            # (a sum scales the reported loss with num_microbatches -- e.g. DPO at an identity adapter
+            # reports 2*ln2 instead of ln2 with two microbatches -- while the gradient is unaffected:
+            # mcore already normalizes the backward tensor in place). Tokens/logps stay lists (they carry
+            # per-row payloads), only the scalar telemetry is averaged.
+            loss = loss / n_loss_entries
 
         # Report the LOCAL token-sum and its denominator (transformers contract): LossMetric's
         # sum branch divides exactly once and its dp_group gather does the DP reduction, so no

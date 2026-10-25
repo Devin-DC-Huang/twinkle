@@ -260,6 +260,11 @@ class InputProcessor:
         assert logits is not None, (
             "outputs['logits'] missing; ensure TransformersValuePatch is applied for task='seq_cls'/'reranker'."
         )
+        if logits.dim() == 2:
+            # A pre-pooled head (XLM-R-style ``*ForSequenceClassification`` pools the last valid
+            # token INSIDE forward, before the score head) already answered one score per sequence;
+            # the patch captured ``[n_seqs, num_labels]`` and there is nothing left to reduce.
+            return inputs, outputs
         pooled, _ = self._pool_last_valid_token(logits, inputs, sp_strategy=sp_strategy)
         outputs = copy(outputs)
         outputs["logits"] = pooled.contiguous()

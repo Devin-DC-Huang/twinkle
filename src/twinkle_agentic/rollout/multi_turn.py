@@ -1,4 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import contextlib
 import copy
 import re
 from collections.abc import Callable
@@ -589,8 +590,28 @@ class MultiTurnRollout(Rollout):
         if params is None:
             params = SamplingParams()
         # Fall back to the construction-time tool_manager, as __call__/_resolve_call does, so a caller
-        # that wired tools at build time need not re-pass them per stream.
+        # that wired tools at build time need not re-pass them per stream. A tools_factory sandbox
+        # carries no shared manager (it was rejected at construction); the single streamed episode
+        # leases one env for the whole conversation turn and builds its manager from it, exactly as
+        # _run_one does per training episode.
         tool_manager = tool_manager if tool_manager is not None else self.tool_manager
+        lease = contextlib.ExitStack()
+        try:
+            if tool_manager is None and self._per_episode_tools:
+                env = lease.enter_context(self.env_pool.lease())
+                tool_manager = self._tool_manager_for(env, self.tool_plugins)
+            yield from self._stream_episode(trajectory, params, adapter_path, tool_manager)
+        finally:
+            lease.close()
+
+    def _stream_episode(
+        self,
+        trajectory: Trajectory,
+        params: SamplingParams,
+        adapter_path: str | None,
+        tool_manager: ToolManager | None,
+    ):
+        """The streaming loop proper; the lease above is held for all of it."""
         # Message-level accounting, but template-aware so a reply's tool-call markup still parses. The
         # feature stays a {'messages','tools'} dict with no input_ids, so sample_stream re-encodes the
         # whole trajectory each turn and the tool schema reaches the prompt tokens.
