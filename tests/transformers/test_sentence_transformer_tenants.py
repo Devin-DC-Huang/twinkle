@@ -61,6 +61,9 @@ def test_st_pipeline_tenants_checkpoint_and_reuse(tmp_path, monkeypatch):
     group_a, group_b = model.optimizer_group['a'], model.optimizer_group['b']
     template_a, template_b = group_a.template, group_b.template
     assert template_a is not template_b
+    model.set_template('Template', max_length=17, adapter_name='b')
+    assert group_a.template is template_a and group_b.template is not template_b
+    template_b = group_b.template
     a0, b0, b_vectors = state('a'), state('b'), vectors('b')
     reference = st.SentenceTransformer(str(original), device='cpu').eval()
     features = {'input_ids': torch.tensor([row['input_ids'] for row in batch]),

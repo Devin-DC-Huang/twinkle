@@ -15,7 +15,7 @@ from peft import LoraConfig
 from safetensors.torch import load_file
 from transformers import AutoTokenizer
 
-from cookbook.client.swift_model.sentence_transformer_client import MODEL, configure, encoded_batch, step, vectors
+from cookbook.client.swift_model.sentence_transformer_client import MODEL, TEXTS, configure, encoded_batch, step, vectors
 
 
 def reference(args):
@@ -34,7 +34,9 @@ def reference(args):
         model.set_processor('InputProcessor', padding_side='right', adapter_name=name)
         model.set_loss('InfonceLoss', temperature=0.1, adapter_name=name)
         model.set_optimizer('AdamW', lr=lr, adapter_name=name)
-    model.load(args.initial, adapter_name='a')
+    # Restore the initial checkpoint's RNG and optimizer as well as weights.
+    # This aligns dropout for a numerical update comparison across processes/devices.
+    model.resume_from_checkpoint(args.initial, adapter_name='a')
     before = model.forward_only(inputs=copy.deepcopy(batch), adapter_name='a')['embeddings'].detach().cpu().numpy()
     for _ in range(2):
         model.forward_backward(inputs=copy.deepcopy(batch), adapter_name='a', task='embedding')
@@ -44,9 +46,7 @@ def reference(args):
                        consumed_train_samples=2 * len(batch))
     native = SentenceTransformer(args.model, device='cuda').eval()
     with torch.inference_mode():
-        raw = native.encode([row for row in __import__(
-            'cookbook.client.swift_model.sentence_transformer_client', fromlist=['TEXTS']).TEXTS],
-                            convert_to_numpy=True, show_progress_bar=False)
+        raw = native.encode(TEXTS, convert_to_numpy=True, show_progress_bar=False)
     Path(args.run_dir, 'reference.json').write_text(json.dumps({
         'before': before.tolist(), 'after': after.tolist(), 'raw': raw.tolist(), 'checkpoint': saved}))
     del native, model
