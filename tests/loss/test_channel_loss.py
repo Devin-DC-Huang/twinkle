@@ -151,6 +151,7 @@ def test_transformers_forward_keeps_loss_metadata_out_of_model_call():
     model._gdn_padding_free_enabled = False
     model.sp_strategy = None
     model.hf_config = None
+    model.strategy = SimpleNamespace(unwrap_model=lambda module: module)
     status = SimpleNamespace(inputs=None, outputs=None, forward_kwargs=None, loss_value=0)
     group = SimpleNamespace(
         processor=PassthroughProcessor(),
