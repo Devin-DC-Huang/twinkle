@@ -1,7 +1,6 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 import math
 import os
-from typing import Dict, List
 
 from twinkle import DeviceGroup, Platform
 from twinkle.utils import get_logger
@@ -11,7 +10,7 @@ logger = get_logger()
 
 def _gpu_placement_group_cpus(node_cpu: int, nproc_per_node: int) -> int:
     """Return the logical CPUs reserved by one GPU placement group."""
-    cpus_per_proc = int(os.environ.get('TWINKLE_GPU_PG_CPUS_PER_PROC', 4))
+    cpus_per_proc = int(os.environ.get("TWINKLE_GPU_PG_CPUS_PER_PROC", 4))
     cpus_per_proc = max(cpus_per_proc, 1)
     required_cpus = max(nproc_per_node * cpus_per_proc, 1)
     node_cap = max(node_cpu // 4, 1)
@@ -19,8 +18,44 @@ def _gpu_placement_group_cpus(node_cpu: int, nproc_per_node: int) -> int:
 
 
 class ResourceManager:
+    @classmethod
+    def from_allocation(cls, group: DeviceGroup, placement_group, devices: list[str]):
+        """Use an allocation owned by a lifecycle controller, without reserving again.
 
-    def __init__(self, nproc_per_node: int, ncpu_proc_per_node: int, groups: List[DeviceGroup]):
+        Ranks are local to this allocation; devices are the actual Ray-selected IDs.
+        The controller owns removal, so this view's destroy method is a no-op.
+        """
+        import ray
+
+        manager = cls.__new__(cls)
+        width = group.gpus_per_worker
+        if len(devices) % width:
+            raise ValueError("Allocation device count must be divisible by gpus_per_worker")
+        chunks = [devices[index : index + width] for index in range(0, len(devices), width)]
+        ranks = list(range(len(chunks)))
+        group.ranks = ranks
+        manager.group_configs = [group]
+        manager.placement_groups = [placement_group]
+        manager.cpu_placement_groups = []
+        manager._external_allocation = True
+        manager.device_groups = {
+            group.name: [
+                {
+                    "gpu_rank": chunk,
+                    "placement_group": placement_group,
+                    "ray_address": str(ray.get_runtime_context().gcs_address),
+                }
+                for chunk in chunks
+            ]
+        }
+        if (group.device_type or "").upper() == "CPU":
+            manager.device_groups[group.name] = [
+                {"placement_group": placement_group, "ray_address": str(ray.get_runtime_context().gcs_address)}
+                for _ in devices
+            ]
+        return manager
+
+    def __init__(self, nproc_per_node: int, ncpu_proc_per_node: int, groups: list[DeviceGroup]):
         # CPU placement group default strategy:
         # - Old approach: use node_cpu//4 as CPU bundle per node, even if only 1~2 CPU processes are needed,
         #   this creates a huge PG (e.g., 640 CPU node requests 160 CPU PG).
@@ -28,41 +63,43 @@ class ResourceManager:
         #   such large CPU PGs may stay pending forever, causing Serve replica's __init__ to hang.
         # - New strategy: request based on "actual CPU processes needed on node * CPUs per process",
         #   with node_cpu//4 as the upper bound.
-        cpu_pg_cpus_per_proc = int(os.environ.get('TWINKLE_CPU_PG_CPUS_PER_PROC', 1))
+        cpu_pg_cpus_per_proc = int(os.environ.get("TWINKLE_CPU_PG_CPUS_PER_PROC", 1))
         cpu_pg_cpus_per_proc = max(cpu_pg_cpus_per_proc, 1)
 
         import ray
         from ray.util.placement_group import PlacementGroup
+
         all_ranks = []
         shared_groups = []
         last_rank = -1
         cpu_proc_count = 0
         group_names = [group.name for group in groups]
         if len(group_names) != len(set(group_names)):
-            raise ValueError(f'DeviceGroup names must be unique, got {group_names}.')
-        device_types = {group.device_type.upper() for group in groups} - {'CPU'}
+            raise ValueError(f"DeviceGroup names must be unique, got {group_names}.")
+        device_types = {group.device_type.upper() for group in groups} - {"CPU"}
         assert len(device_types) <= 1
 
         if not device_types:
             # Pure cpu task
-            device_type = 'CPU'
+            device_type = "CPU"
         else:
             device_type = next(iter(device_types))
             device_type = Platform.get_platform(device_type).__name__
 
         for group in groups:
             ranks = group.ranks
-            if (group.device_type or '').upper() == 'CPU':
+            if (group.device_type or "").upper() == "CPU":
                 if group.shared:
                     raise ValueError(f"CPU DeviceGroup '{group.name}' cannot be shared.")
-                assert isinstance(ranks, int), 'CPU group only supports integer ranks'
+                assert isinstance(ranks, int), "CPU group only supports integer ranks"
                 cpu_proc_count += ranks
                 continue
 
             if isinstance(ranks, int):
                 if group.shared:
                     raise ValueError(
-                        f"Shared DeviceGroup '{group.name}' requires explicit physical ranks; got ranks={ranks}.")
+                        f"Shared DeviceGroup '{group.name}' requires explicit physical ranks; got ranks={ranks}."
+                    )
                 ranks = list(range(last_rank + 1, last_rank + 1 + ranks))
             ranks = list(ranks)
             if not ranks:
@@ -75,15 +112,16 @@ class ResourceManager:
             last_rank = max(last_rank, max(ranks))
 
         if len(set(all_ranks)) != len(all_ranks):
-            raise ValueError('Non-shared DeviceGroup ranks must not overlap.')
+            raise ValueError("Non-shared DeviceGroup ranks must not overlap.")
         allocated_ranks = set(all_ranks)
         for group in shared_groups:
             missing = sorted(set(group.ranks) - allocated_ranks)
             if missing:
                 raise ValueError(
                     f"Shared DeviceGroup '{group.name}' references unallocated physical ranks {missing}; "
-                    'shared ranks must be a subset of non-shared DeviceGroup ranks.')
-        if device_type != 'CPU':
+                    "shared ranks must be a subset of non-shared DeviceGroup ranks."
+                )
+        if device_type != "CPU":
             # Calculate required nodes based on actual node indices spanned by all_ranks
             if all_ranks:
                 node_indices = [rank // nproc_per_node for rank in all_ranks]
@@ -99,28 +137,29 @@ class ResourceManager:
         self.nodes = []
         self.cpu_nodes = []
         for node in ray.nodes():
-            if not node.get('Alive', True):
+            if not node.get("Alive", True):
                 continue
-            resource = node['Resources']
-            if device_type != 'CPU':
+            resource = node["Resources"]
+            if device_type != "CPU":
                 node_device_num = int(resource.get(device_type, 0))
                 if node_device_num >= nproc_per_node:
                     self.nodes.append(node)
             else:
-                if int(resource.get('CPU', 0)) // 4 >= ncpu_proc_per_node:
+                if int(resource.get("CPU", 0)) // 4 >= ncpu_proc_per_node:
                     self.nodes.append(node)
             # Independent CPU node pool: any alive node with enough CPU
-            node_cpu = int(resource.get('CPU', 0))
+            node_cpu = int(resource.get("CPU", 0))
             if node_cpu // 4 >= ncpu_proc_per_node:
                 self.cpu_nodes.append(node)
 
-        assert self.nnodes <= len(
-            self.nodes), f'Not enough resources, required nodes: {self.nnodes}, available: {len(self.nodes)}'
+        assert self.nnodes <= len(self.nodes), (
+            f"Not enough resources, required nodes: {self.nnodes}, available: {len(self.nodes)}"
+        )
 
         bundles = []
         cpu_bundles = []
 
-        if device_type != 'CPU':
+        if device_type != "CPU":
             for i in range(self.nnodes):
                 # TODO not accurate, because placement_group cannot distribute to node same ordered with self.nodes
                 node_idx = self.min_node_idx + i
@@ -128,22 +167,25 @@ class ResourceManager:
                     node = self.nodes[node_idx]
                 except IndexError:
                     node = self.nodes[0]
-                node_cpu = int(node['Resources']['CPU'])
-                bundles.append({
-                    device_type: nproc_per_node,
-                    'CPU': _gpu_placement_group_cpus(node_cpu, nproc_per_node),
-                })
+                node_cpu = int(node["Resources"]["CPU"])
+                bundles.append(
+                    {
+                        device_type: nproc_per_node,
+                        "CPU": _gpu_placement_group_cpus(node_cpu, nproc_per_node),
+                    }
+                )
 
         # CPU placement groups: only create when there are actual CPU processes to allocate.
         if cpu_proc_count > 0:
             cpu_nnodes = math.ceil(cpu_proc_count / ncpu_proc_per_node)
-            assert cpu_nnodes <= len(
-                self.cpu_nodes), (f'Not enough nodes for CPU processes, required nodes: {cpu_nnodes}, '
-                                  f'available CPU nodes: {len(self.cpu_nodes)}, ensure your ray cluster '
-                                  f'has enough nodes with sufficient CPU resources.')
+            assert cpu_nnodes <= len(self.cpu_nodes), (
+                f"Not enough nodes for CPU processes, required nodes: {cpu_nnodes}, "
+                f"available CPU nodes: {len(self.cpu_nodes)}, ensure your ray cluster "
+                f"has enough nodes with sufficient CPU resources."
+            )
             for i in range(cpu_nnodes):
                 node = self.cpu_nodes[i]
-                node_cpu = int(node['Resources']['CPU'])
+                node_cpu = int(node["Resources"]["CPU"])
                 # How many CPU processes will actually be placed on this node
                 # (last node may have fewer than ncpu_proc_per_node)
                 procs_on_node = min(
@@ -154,7 +196,7 @@ class ResourceManager:
                 # but don't request 160 CPU for just 1~2 processes.
                 node_cap = max(node_cpu // 4, 1)
                 need = max(procs_on_node * cpu_pg_cpus_per_proc, 1)
-                cpu_bundles.append({'CPU': min(node_cap, need)})
+                cpu_bundles.append({"CPU": min(node_cap, need)})
 
         self.cpu_node_map = {}
         for i in range(cpu_proc_count):
@@ -172,9 +214,12 @@ class ResourceManager:
 
         self.node_ranks = []
         if self.placement_groups:
-            self.node_ranks = ray.get([
-                ray.remote(Platform.get_node_rank).options(placement_group=pg).remote() for pg in self.placement_groups
-            ])
+            self.node_ranks = ray.get(
+                [
+                    ray.remote(Platform.get_node_rank).options(placement_group=pg).remote()
+                    for pg in self.placement_groups
+                ]
+            )
         if self.node_ranks.count(0) > 1:
             self.node_ranks = list(range(len(self.placement_groups)))
 
@@ -187,48 +232,48 @@ class ResourceManager:
         if self.placement_groups:
             visible_device_futures = []
             for pg in self.placement_groups:
-                probe_options = {'placement_group': pg}
-                if device_type == 'GPU':
+                probe_options = {"placement_group": pg}
+                if device_type == "GPU":
                     # Ask Ray for the GPUs owned by this placement group.  A
                     # no-GPU probe with NOSET_* only sees the node-global
                     # CUDA_VISIBLE_DEVICES list, so independently initialized
                     # Model and Sampler groups both select its first entry.
                     # The probe is short-lived and releases the bundle before
                     # component workers are created.
-                    probe_options['num_gpus'] = nproc_per_node
+                    probe_options["num_gpus"] = nproc_per_node
                 else:
-                    probe_options['resources'] = {device_type: nproc_per_node}
+                    probe_options["resources"] = {device_type: nproc_per_node}
                 visible_device_futures.append(get_visible_devices.options(**probe_options).remote())
             self.visible_devices = ray.get(visible_device_futures)
 
         visible_devices = []
         for visible_device in self.visible_devices:
             if visible_device:
-                visible_device = [int(device) for device in visible_device.split(',')]
+                visible_device = [int(device) for device in visible_device.split(",")]
             else:
                 visible_device = list(range(nproc_per_node))
             visible_devices.append(visible_device)
         self.visible_devices = visible_devices
 
-        self.node2pg: Dict[int, PlacementGroup] = {}
+        self.node2pg: dict[int, PlacementGroup] = {}
         # Map actual node indices to placement groups
         # For GPU/NPU groups, node indices start from self.min_node_idx
-        if device_type != 'CPU':
+        if device_type != "CPU":
             for i, placement_group in enumerate(self.placement_groups):
                 actual_node_idx = self.min_node_idx + i
                 self.node2pg[actual_node_idx] = placement_group
         else:
             # For CPU-only or when using default node_ranks
-            for node_rank, placement_group in zip(self.node_ranks, self.placement_groups):
+            for node_rank, placement_group in zip(self.node_ranks, self.placement_groups, strict=False):
                 self.node2pg[node_rank] = placement_group
 
         self.device_groups = {}
         ray_address = str(ray.get_runtime_context().gcs_address)
         global_cpu_proc_idx = 0
         for group in groups:
-            if (group.device_type or '').upper() != 'CPU':
+            if (group.device_type or "").upper() != "CPU":
                 ranks = group.ranks
-                gpus_per_worker = getattr(group, 'gpus_per_worker', 1)
+                gpus_per_worker = getattr(group, "gpus_per_worker", 1)
                 local_device_groups = []
                 # Use original ranks for GPU mapping so each DeviceGroup maps to
                 # the correct physical devices.  E.g. ranks=[2,3] with
@@ -237,13 +282,15 @@ class ResourceManager:
 
                 if gpus_per_worker > 1:
                     if len(normalized_ranks) % gpus_per_worker != 0:
-                        raise ValueError(f"DeviceGroup '{group.name}': number of ranks ({len(normalized_ranks)}) "
-                                         f'must be divisible by gpus_per_worker ({gpus_per_worker})')
+                        raise ValueError(
+                            f"DeviceGroup '{group.name}': number of ranks ({len(normalized_ranks)}) "
+                            f"must be divisible by gpus_per_worker ({gpus_per_worker})"
+                        )
 
                     num_workers = len(normalized_ranks) // gpus_per_worker
                     for worker_idx in range(num_workers):
                         start_idx = worker_idx * gpus_per_worker
-                        worker_ranks = normalized_ranks[start_idx:start_idx + gpus_per_worker]
+                        worker_ranks = normalized_ranks[start_idx : start_idx + gpus_per_worker]
 
                         # All GPUs for a worker should be on the same node
                         gpu_ranks_local = []
@@ -255,21 +302,26 @@ class ResourceManager:
                             gpu_ranks_local.append(gpu_ranks)
 
                         if len(set(node_ranks)) > 1:
-                            raise ValueError(f"DeviceGroup '{group.name}': GPUs {worker_ranks} span multiple nodes. "
-                                             f"Each worker's GPUs must be on the same node.")
+                            raise ValueError(
+                                f"DeviceGroup '{group.name}': GPUs {worker_ranks} span multiple nodes. "
+                                f"Each worker's GPUs must be on the same node."
+                            )
 
                         node_rank = node_ranks[0]
                         local_device_groups.append(
                             dict(
                                 gpu_rank=gpu_ranks_local,
                                 placement_group=self.node2pg[node_rank],
-                                ray_address=ray_address))
+                                ray_address=ray_address,
+                            )
+                        )
                 else:
                     for alloc_rank in normalized_ranks:
                         node_rank = alloc_rank // nproc_per_node
                         gpu_rank = self.visible_devices[node_rank - self.min_node_idx][alloc_rank % nproc_per_node]
                         local_device_groups.append(
-                            dict(gpu_rank=[gpu_rank], placement_group=self.node2pg[node_rank], ray_address=ray_address))
+                            dict(gpu_rank=[gpu_rank], placement_group=self.node2pg[node_rank], ray_address=ray_address)
+                        )
 
                 self.device_groups[group.name] = local_device_groups
 
@@ -278,48 +330,54 @@ class ResourceManager:
                     # Create virtual ranks for workers (not GPUs)
                     group.ranks = list(range(len(local_device_groups)))
             else:
-                assert getattr(group, 'gpus_per_worker', 1) == 1
+                assert getattr(group, "gpus_per_worker", 1) == 1
                 ranks = group.ranks
                 local_device_groups = []
                 for _ in range(ranks):
                     local_device_groups.append(
                         dict(
                             placement_group=self.cpu_placement_groups[self.cpu_node_map[global_cpu_proc_idx][0]],
-                            ray_address=ray_address))
+                            ray_address=ray_address,
+                        )
+                    )
                     global_cpu_proc_idx += 1
                 self.device_groups[group.name] = local_device_groups
 
         self.group_configs = groups
         logger.info(f"nodes: {[n['NodeID'][:8] for n in self.nodes]}")
-        logger.info(f'node_ranks: {self.node_ranks}')
-        logger.info(f'node2pg keys: {list(self.node2pg.keys())}')
+        logger.info(f"node_ranks: {self.node_ranks}")
+        logger.info(f"node2pg keys: {list(self.node2pg.keys())}")
 
     @staticmethod
     def noset_env():
         return {
-            'RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES': '1',
-            'RAY_EXPERIMENTAL_NOSET_ROCR_VISIBLE_DEVICES': '1',
-            'RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES': '1',
-            'RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES': '1',
-            'RAY_EXPERIMENTAL_NOSET_HABANA_VISIBLE_MODULES': '1',
-            'RAY_EXPERIMENTAL_NOSET_NEURON_RT_VISIBLE_CORES': '1',
-            'RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS': '1',
-            'RAY_EXPERIMENTAL_NOSET_ONEAPI_DEVICE_SELECTOR': '1',
+            "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
+            "RAY_EXPERIMENTAL_NOSET_ROCR_VISIBLE_DEVICES": "1",
+            "RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES": "1",
+            "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES": "1",
+            "RAY_EXPERIMENTAL_NOSET_HABANA_VISIBLE_MODULES": "1",
+            "RAY_EXPERIMENTAL_NOSET_NEURON_RT_VISIBLE_CORES": "1",
+            "RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS": "1",
+            "RAY_EXPERIMENTAL_NOSET_ONEAPI_DEVICE_SELECTOR": "1",
         }
 
     def get_config(self, group: str):
         for config in self.group_configs:
             if config.name == group:
                 return config
-        assert False, f'No group {group} found in group list: {[group.name for group in self.group_configs]}'
+        raise AssertionError(f"No group {group} found in group list: {[group.name for group in self.group_configs]}")
 
     def get_group(self, group: str):
-        assert group in self.device_groups, (f'No group {group} found in group '
-                                             f'list: {[group.name for group in self.group_configs]}')
+        assert group in self.device_groups, (
+            f"No group {group} found in group list: {[group.name for group in self.group_configs]}"
+        )
         return self.device_groups[group]
 
     def destroy_placement_group(self):
+        if getattr(self, "_external_allocation", False):
+            return
         import ray
+
         for pg in self.placement_groups:
             ray.util.remove_placement_group(pg)
         for pg in self.cpu_placement_groups:

@@ -1,25 +1,29 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Run checkpoint loading and generation as one owned sampling job."""
-from __future__ import annotations
 
+from __future__ import annotations
 import glob
 import os
+
 from safetensors import SafetensorError
 
 from twinkle.exceptions import FullWeightLoadError
-from twinkle.server.task_queue.types import BACKEND_TIMEOUT_EXCEPTIONS, UserTaskError
+from twinkle.server.exceptions import RequestRejectedError
+from twinkle.server.task_queue.backend_gate import BACKEND_TIMEOUT_EXCEPTIONS
 
 
 def is_full_checkpoint(resolved_uri: str | None) -> bool:
     if not resolved_uri:
         return False
-    if os.path.isfile(os.path.join(resolved_uri, 'adapter_config.json')):
+    if os.path.isfile(os.path.join(resolved_uri, "adapter_config.json")):
         return False
     if os.path.isabs(resolved_uri) and not os.path.isdir(resolved_uri):
-        raise UserTaskError(f'Checkpoint directory does not exist: {resolved_uri}')
-    if os.path.isdir(resolved_uri) and not (os.path.isfile(os.path.join(resolved_uri, 'model.safetensors.index.json'))
-                                            or glob.glob(os.path.join(resolved_uri, '*.safetensors'))):
-        raise UserTaskError(f'No .safetensors weights found under {resolved_uri}')
+        raise RequestRejectedError(f"Checkpoint directory does not exist: {resolved_uri}")
+    if os.path.isdir(resolved_uri) and not (
+        os.path.isfile(os.path.join(resolved_uri, "model.safetensors.index.json"))
+        or glob.glob(os.path.join(resolved_uri, "*.safetensors"))
+    ):
+        raise RequestRejectedError(f"No .safetensors weights found under {resolved_uri}")
     return True
 
 
@@ -29,7 +33,8 @@ async def resolve_sampler_weights(service, resolved_uri: str | None, *, full_che
         full_checkpoint = is_full_checkpoint(resolved_uri)
         if full_checkpoint:
             return await service.sampling_guard.run(
-                lambda: resolve_sampler_weights(service, resolved_uri, full_checkpoint=True), exclusive=True)
+                lambda: resolve_sampler_weights(service, resolved_uri, full_checkpoint=True), exclusive=True
+            )
     if not full_checkpoint:
         return resolved_uri or None
     try:
@@ -38,7 +43,7 @@ async def resolve_sampler_weights(service, resolved_uri: str | None, *, full_che
         service.sampling_guard.invalidate_weights(error)
         raise
     except (ValueError, OSError, KeyError, SafetensorError) as error:
-        raise UserTaskError(str(error)) from error
+        raise RequestRejectedError(str(error)) from error
     return None
 
 

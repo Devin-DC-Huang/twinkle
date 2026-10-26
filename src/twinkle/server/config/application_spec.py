@@ -9,14 +9,15 @@ the matching ``*Args`` schema in a model validator.
 The schemas use ``extra='forbid'`` so unknown args (typos, copy-paste from
 other deployments) fail at load time instead of being silently dropped.
 """
-from __future__ import annotations
 
-import math
+from __future__ import annotations
 import os
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from typing import Any, Literal
 
-from twinkle.server.task_queue.config import TaskQueueConfig
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from .task_queue import TaskQueueConfig
+from .training import ModelArgs
 
 # Env var keys the launcher sets from the gateway ``server_config`` so that any
 # Ray worker (model / sampler / processor), not just the gateway, applies the
@@ -24,10 +25,10 @@ from twinkle.server.task_queue.config import TaskQueueConfig
 # defaults. Only the four *policy* fields are propagated; ``actor_name`` is a
 # per-process cache key, not a cross-worker policy, so it is excluded.
 SERVER_STATE_ENV_KEYS: tuple[str, ...] = (
-    'TWINKLE_SERVER_STATE_EXPIRATION_TIMEOUT',
-    'TWINKLE_SERVER_STATE_CLEANUP_INTERVAL',
-    'TWINKLE_SERVER_STATE_PER_TOKEN_MODEL_LIMIT',
-    'TWINKLE_SERVER_STATE_METRICS_UPDATE_INTERVAL',
+    "TWINKLE_SERVER_STATE_EXPIRATION_TIMEOUT",
+    "TWINKLE_SERVER_STATE_CLEANUP_INTERVAL",
+    "TWINKLE_SERVER_STATE_PER_TOKEN_MODEL_LIMIT",
+    "TWINKLE_SERVER_STATE_METRICS_UPDATE_INTERVAL",
 )
 
 # ---------- shared helpers ------------------------------------------------- #
@@ -36,7 +37,7 @@ SERVER_STATE_ENV_KEYS: tuple[str, ...] = (
 class _ArgsBase(BaseModel):
     """Base class for every per-deployment args schema (extra='forbid')."""
 
-    model_config = ConfigDict(extra='forbid')
+    model_config = ConfigDict(extra="forbid")
 
 
 class HttpOptions(BaseModel):
@@ -49,84 +50,21 @@ class HttpOptions(BaseModel):
     listener on plain HTTP.
     """
 
-    model_config = ConfigDict(extra='forbid')
+    model_config = ConfigDict(extra="forbid")
 
-    host: str = 'localhost'
+    host: str = "localhost"
     port: int = 8000
     ssl_keyfile: str | None = None
     ssl_certfile: str | None = None
 
-    @model_validator(mode='after')
-    def _ssl_pair_set_together(self) -> 'HttpOptions':
+    @model_validator(mode="after")
+    def _ssl_pair_set_together(self) -> HttpOptions:
         if (self.ssl_keyfile is None) != (self.ssl_certfile is None):
-            raise ValueError('ssl_keyfile and ssl_certfile must be set together to serve HTTPS')
+            raise ValueError("ssl_keyfile and ssl_certfile must be set together to serve HTTPS")
         return self
 
 
 # ---------- per-deployment args schemas ------------------------------------ #
-
-
-class SpectralHybridArgs(_ArgsBase):
-    """Strict server-owned Spectral Hybrid allocation and optimizer defaults."""
-
-    allocation_path: str = Field(min_length=1)
-    default_lr_lora: float = Field(default=2.5e-5, gt=0)
-    default_lr_fft: float = Field(default=1.0e-6, gt=0)
-
-    @field_validator('default_lr_lora', 'default_lr_fft')
-    @classmethod
-    def _finite_learning_rate(cls, value: float) -> float:
-        if not math.isfinite(value):
-            raise ValueError('learning rate must be finite')
-        return value
-
-
-class ModelArgs(_ArgsBase):
-    """Args for the ``model`` deployment.
-
-    The ``backend`` field selects the model implementation (transformers /
-    megatron / mock) — see ``model/app.py`` for the dispatch site that picks
-    the runtime class based on this value.
-    """
-
-    model_id: str
-    nproc_per_node: int = 1
-    device_group: dict[str, Any]
-    device_mesh: dict[str, Any]
-    backend: Literal['mock', 'transformers', 'megatron']
-    train_mode: Literal['lora', 'hybrid', 'full'] = 'lora'
-    strategy: Literal['accelerate', 'native_fsdp'] | None = None
-    adapter_config: dict[str, Any] | None = None
-    queue_config: TaskQueueConfig = Field(default_factory=TaskQueueConfig)
-    max_loras: int = 5
-    max_r: int = Field(default=32, gt=0)
-    max_length: int | None = None
-    target_modules: str | list[str] = 'all-linear'
-    hybrid: SpectralHybridArgs | None = None
-    data_plane_url: str | None = None
-    model_loader: str | None = None
-    #: ``module:attr`` import spec naming the model class to serve, e.g.
-    #: ``swift.dev.model.multi_lora_sentence_transformer_model:MultiLoraSentenceTransformerModel``.
-    #: twinkle resolves it inside the replica and wraps the class in its own tinker/twinkle compat
-    #: layer, so a family whose runtime object is not a plain AutoModel (a sentence-transformers
-    #: pipeline, say) can be served by the same deployment. Only meaningful for a LoRA-mode
-    #: transformers deployment; every other combination is rejected below instead of being ignored.
-    model_cls: str | None = None
-
-    @model_validator(mode='after')
-    def _validate_spectral_backend(self):
-        if self.strategy is not None and self.backend != 'transformers':
-            raise ValueError('strategy is only supported by the transformers backend')
-        if self.hybrid is not None:
-            if self.backend != 'transformers':
-                raise ValueError('hybrid is only supported by the transformers backend')
-            if self.train_mode == 'full':
-                raise ValueError('hybrid is not supported with train_mode="full"')
-        if self.model_cls is not None:
-            if self.backend != 'transformers' or self.train_mode != 'lora' or self.hybrid is not None:
-                raise ValueError('model_cls is only supported by a transformers backend in train_mode="lora" '
-                                 'without hybrid')
-        return self
 
 
 class SamplerArgs(_ArgsBase):
@@ -145,11 +83,33 @@ class SamplerArgs(_ArgsBase):
     nproc_per_node: int = 1
     device_group: dict[str, Any]
     device_mesh: dict[str, Any]
-    sampler_type: Literal['mock', 'vllm', 'vllm_async', 'sglang', 'sglang_async', 'torch']
+    sampler_type: Literal["mock", "vllm", "vllm_async", "sglang", "sglang_async", "torch"]
     engine_args: dict[str, Any] | None = None
     queue_config: TaskQueueConfig = Field(default_factory=TaskQueueConfig)
     data_plane_url: str | None = None
     template: dict[str, Any] | None = None
+    min_replicas: int = Field(default=1, ge=0, strict=True)
+    max_replicas: int = Field(default=1, gt=0, strict=True)
+    idle_timeout_s: float = Field(default=600, gt=0, allow_inf_nan=False)
+    target_ongoing_requests: int = Field(default=16, gt=0, strict=True)
+
+    @model_validator(mode="after")
+    def _validate_pool(self):
+        if self.min_replicas > self.max_replicas:
+            raise ValueError("sampler min_replicas must not exceed max_replicas")
+        ranks = self.device_group.get("ranks", self.nproc_per_node)
+        width = self.device_group.get("gpus_per_worker", 1)
+        if type(ranks) is not int or ranks <= 0 or type(width) is not int or width <= 0 or ranks % width:
+            raise ValueError("sampler device_group requires a positive device count divisible by gpus_per_worker")
+        if self.sampler_type != "mock":
+            from twinkle.utils.device_mesh import DeviceMesh
+
+            if DeviceMesh.from_sizes(**self.device_mesh).world_size != ranks:
+                raise ValueError("sampler device_mesh world_size must equal its device count")
+            tp = (self.engine_args or {}).get("tensor_parallel_size", width)
+            if tp != width:
+                raise ValueError("sampler tensor_parallel_size must equal gpus_per_worker")
+        return self
 
 
 class ServerStateArgs(_ArgsBase):
@@ -179,13 +139,13 @@ class ServerStateArgs(_ArgsBase):
         """
         env: dict[str, str] = {}
         if self.expiration_timeout is not None:
-            env['TWINKLE_SERVER_STATE_EXPIRATION_TIMEOUT'] = str(self.expiration_timeout)
+            env["TWINKLE_SERVER_STATE_EXPIRATION_TIMEOUT"] = str(self.expiration_timeout)
         if self.cleanup_interval is not None:
-            env['TWINKLE_SERVER_STATE_CLEANUP_INTERVAL'] = str(self.cleanup_interval)
+            env["TWINKLE_SERVER_STATE_CLEANUP_INTERVAL"] = str(self.cleanup_interval)
         if self.per_token_model_limit is not None:
-            env['TWINKLE_SERVER_STATE_PER_TOKEN_MODEL_LIMIT'] = str(self.per_token_model_limit)
+            env["TWINKLE_SERVER_STATE_PER_TOKEN_MODEL_LIMIT"] = str(self.per_token_model_limit)
         if self.metrics_update_interval is not None:
-            env['TWINKLE_SERVER_STATE_METRICS_UPDATE_INTERVAL'] = str(self.metrics_update_interval)
+            env["TWINKLE_SERVER_STATE_METRICS_UPDATE_INTERVAL"] = str(self.metrics_update_interval)
         return env
 
     @classmethod
@@ -197,10 +157,10 @@ class ServerStateArgs(_ArgsBase):
         configured to a default value". Only policy fields are populated;
         ``actor_name`` stays ``None``.
         """
-        exp = os.environ.get('TWINKLE_SERVER_STATE_EXPIRATION_TIMEOUT')
-        clean = os.environ.get('TWINKLE_SERVER_STATE_CLEANUP_INTERVAL')
-        limit = os.environ.get('TWINKLE_SERVER_STATE_PER_TOKEN_MODEL_LIMIT')
-        interval = os.environ.get('TWINKLE_SERVER_STATE_METRICS_UPDATE_INTERVAL')
+        exp = os.environ.get("TWINKLE_SERVER_STATE_EXPIRATION_TIMEOUT")
+        clean = os.environ.get("TWINKLE_SERVER_STATE_CLEANUP_INTERVAL")
+        limit = os.environ.get("TWINKLE_SERVER_STATE_PER_TOKEN_MODEL_LIMIT")
+        interval = os.environ.get("TWINKLE_SERVER_STATE_METRICS_UPDATE_INTERVAL")
         if exp is None and clean is None and limit is None and interval is None:
             return None
         return cls(
@@ -227,7 +187,7 @@ class ServerArgs(_ArgsBase):
     http_options: HttpOptions | None = None
     route_prefix: str | None = None
     api_key: str | None = None
-    owned_by: str = 'twinkle'
+    owned_by: str = "twinkle"
 
 
 class ProcessorArgs(_ArgsBase):
@@ -251,11 +211,11 @@ class DataPlaneArgs(_ArgsBase):
 
 
 _ARGS_SCHEMA: dict[str, type[_ArgsBase]] = {
-    'server': ServerArgs,
-    'model': ModelArgs,
-    'sampler': SamplerArgs,
-    'processor': ProcessorArgs,
-    'data_plane': DataPlaneArgs,
+    "server": ServerArgs,
+    "model": ModelArgs,
+    "sampler": SamplerArgs,
+    "processor": ProcessorArgs,
+    "data_plane": DataPlaneArgs,
 }
 
 # ---------- ApplicationSpec ------------------------------------------------ #
@@ -273,19 +233,19 @@ class ApplicationSpec(BaseModel):
     falling back to a different schema's default.
     """
 
-    model_config = ConfigDict(extra='forbid')
+    model_config = ConfigDict(extra="forbid")
 
     name: str
-    route_prefix: str = '/'
-    import_path: Literal['server', 'model', 'sampler', 'processor', 'data_plane']
+    route_prefix: str = "/"
+    import_path: Literal["server", "model", "sampler", "processor", "data_plane"]
     # ``args`` is always populated by the ``mode='before'`` validator below
     # (which validates the raw block against the schema selected by
     # ``import_path`` and defaults a missing block to ``{}``), so the field is
     # required here — the validator runs first and fills it.
     args: ServerArgs | ModelArgs | SamplerArgs | ProcessorArgs | DataPlaneArgs
-    deployments: list[dict[str, Any]] = Field(default_factory=list)
+    deployments: list[dict[str, Any]] = Field(default_factory=list, max_length=1)
 
-    @model_validator(mode='before')
+    @model_validator(mode="before")
     @classmethod
     def _coerce_args_to_schema(cls, data: Any) -> Any:
         """Validate the raw ``args`` block against the schema for ``import_path``.
@@ -296,36 +256,16 @@ class ApplicationSpec(BaseModel):
         """
         if not isinstance(data, dict):
             return data
-        import_path = data.get('import_path')
+        import_path = data.get("import_path")
         if import_path not in _ARGS_SCHEMA:
             # Let Pydantic's Literal validator handle bad import_path values.
             return data
         schema = _ARGS_SCHEMA[import_path]
-        raw_args = data.get('args')
+        raw_args = data.get("args")
         if isinstance(raw_args, schema):
             return data
         if raw_args is None:
             raw_args = {}
         # ``schema.model_validate`` rejects a non-dict itself with a clean
         # error, so no separate non-dict guard is needed here.
-        return {**data, 'args': schema.model_validate(raw_args)}
-
-    @model_validator(mode='after')
-    def _validate_full_mode_single_replica(self) -> ApplicationSpec:
-        """``train_mode: full`` requires exactly one replica.
-
-        The exclusive-tenant lock lives in per-replica memory
-        (``ModelManagement._resource_records``), so more than one replica would
-        silently allow one full-parameter tenant per replica, each rewriting
-        its own copy of the base weights. Reject that at config-load time.
-        """
-        if not (isinstance(self.args, ModelArgs) and self.args.train_mode == 'full'):
-            return self
-        for dep in self.deployments:
-            num_replicas = dep.get('num_replicas')
-            max_replicas = (dep.get('autoscaling_config') or {}).get('max_replicas')
-            if (num_replicas or 1) > 1 or (max_replicas or 1) > 1:
-                raise ValueError(f"Application '{self.name}': train_mode='full' is an exclusive single-tenant "
-                                 'mode and requires a single replica; set num_replicas/autoscaling_config.'
-                                 'max_replicas to 1.')
-        return self
+        return {**data, "args": schema.model_validate(raw_args)}

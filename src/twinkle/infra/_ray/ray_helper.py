@@ -1,13 +1,14 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
-from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Type, TypeVar, Union
+from collections.abc import Callable
+from typing import Any, Literal, Optional, TypeVar, Union
 
 from twinkle import DeviceGroup, Platform, find_free_port, find_node_ip, requires
 from twinkle.utils.loader import run_worker_setup_hook
 from .. import _torch_setup
 from .resource_manager import ResourceManager
 
-T = TypeVar('T')
+T = TypeVar("T")
 
 
 class LazyCollect:
@@ -34,6 +35,7 @@ class LazyCollect:
     def _get_result(self):
         """Internal method to lazily collect and cache results"""
         import ray
+
         if self._result is None:
             result = []
             for future in self._futures:
@@ -79,6 +81,7 @@ class LazyCollect:
         exception is raised later, at the real :meth:`__call__` collect.
         """
         import ray
+
         refs = [future for future in self._futures if isinstance(future, ray.ObjectRef)]
         if not refs:
             return True
@@ -112,37 +115,36 @@ class LazyCollect:
 
 
 class RayHelper:
-
-    resource_manager: Optional[ResourceManager] = None
+    resource_manager: ResourceManager | None = None
 
     _registry = None
 
-    _remote_components: Dict[str, Any] = {}
+    _remote_components: dict[str, Any] = {}
 
     @staticmethod
-    def _get_ray_custom_resources(device_groups: List[DeviceGroup]) -> Dict[str, float]:
+    def _get_ray_custom_resources(device_groups: list[DeviceGroup]) -> dict[str, float]:
         """Return custom accelerator resources needed for local Ray startup.
 
         Ray discovers CUDA GPUs itself.  Other accelerators, such as Ascend
         NPUs, need to be registered as Ray custom resources so that placement
         groups can request them.
         """
-        device_types = {group.device_type.upper() for group in device_groups} - {'CPU'}
+        device_types = {group.device_type.upper() for group in device_groups} - {"CPU"}
 
         # ResourceManager supports one accelerator type per run.  Only NPU
         # currently needs an explicit Ray custom-resource registration.
-        if device_types != {'NPU'}:
+        if device_types != {"NPU"}:
             return {}
 
         try:
             import torch
 
-            npu = getattr(torch, 'npu', None)
+            npu = getattr(torch, "npu", None)
             npu_count = npu.device_count() if npu is not None and npu.is_available() else 0
         except (ImportError, AttributeError, RuntimeError):
             return {}
 
-        return {'NPU': float(npu_count)} if npu_count > 0 else {}
+        return {"NPU": float(npu_count)} if npu_count > 0 else {}
 
     @staticmethod
     def init_registry():
@@ -161,7 +163,7 @@ class RayHelper:
             def add_config(self, key: str, value: Any):
                 self.config[key] = value
 
-            def add_or_get(self, key: str, value: Any) -> Tuple[bool, Any]:
+            def add_or_get(self, key: str, value: Any) -> tuple[bool, Any]:
                 """Add or get config, because ray is single threaded."""
                 if key in self.config:
                     return self.config[key]
@@ -174,17 +176,25 @@ class RayHelper:
             def clear(self):
                 self.config.clear()
 
+        registry_name = os.environ.get("TWINKLE_RAY_REGISTRY_NAME", "config_registry")
+        registry_namespace = os.environ.get("TWINKLE_RAY_NAMESPACE")
         try:
-            RayHelper._registry = ray.get_actor('config_registry')
+            RayHelper._registry = ray.get_actor(registry_name, namespace=registry_namespace)
         except ValueError:
             try:
-                RayHelper._registry = WorkerRegistry.options(name='config_registry', lifetime='detached').remote()
+                RayHelper._registry = WorkerRegistry.options(
+                    name=registry_name,
+                    namespace=registry_namespace,
+                    lifetime="detached",
+                    # Preserve Ray's default CPU policy outside managed instances.
+                    num_cpus=0.01 if registry_namespace else None,
+                ).remote()
             except ValueError:
-                RayHelper._registry = ray.get_actor('config_registry')
+                RayHelper._registry = ray.get_actor(registry_name, namespace=registry_namespace)
         assert RayHelper._registry is not None
 
     @staticmethod
-    def initialize(nproc_per_node: int, ncpu_proc_per_node: int, device_groups: List[DeviceGroup]):
+    def initialize(nproc_per_node: int, ncpu_proc_per_node: int, device_groups: list[DeviceGroup]):
         """Initialize RayHelper.
 
         Args:
@@ -195,13 +205,14 @@ class RayHelper:
         Returns:
             None
         """
-        requires('ray')
+        requires("ray")
         import ray
+
         RayHelper.device_groups = device_groups
         if not RayHelper.ray_inited():
             # Connecting to an existing cluster (e.g. RAY_ADDRESS set for multi-node): custom
             # resources are declared at ``ray start`` time, and Ray rejects ``resources`` on connect.
-            connecting = bool(os.environ.get('RAY_ADDRESS'))
+            connecting = bool(os.environ.get("RAY_ADDRESS"))
             resources = None if connecting else RayHelper._get_ray_custom_resources(device_groups)
             ray.init(ignore_reinit_error=True, resources=resources or None)
 
@@ -219,6 +230,7 @@ class RayHelper:
 
         if RayHelper._registry is not None:
             import ray
+
             try:
                 ray.get(RayHelper._registry.clear.remote())
                 ray.kill(RayHelper._registry)
@@ -240,11 +252,17 @@ class RayHelper:
     def is_worker():
         """Check if this process is the worker"""
         import ray
+
         return RayHelper.ray_inited() and ray._private.worker.global_worker.mode == ray._private.worker.WORKER_MODE
 
     @staticmethod
-    def execute_all_sync(method_name: str, workers_and_args: List[Tuple[Any, List[Any], Dict[str, Any]]], *,
-                         on_submit: Optional[Callable] = None, timeout=None):
+    def execute_all_sync(
+        method_name: str,
+        workers_and_args: list[tuple[Any, list[Any], dict[str, Any]]],
+        *,
+        on_submit: Callable | None = None,
+        timeout=None,
+    ):
         """Execute method and return results.
 
         ``timeout`` is passed to ``ray.get(list, timeout=)``, whose semantics are
@@ -254,11 +272,16 @@ class RayHelper:
         are strictly tighter.
         """
         import ray
+
         return ray.get(RayHelper.execute_all_async(method_name, workers_and_args, on_submit=on_submit), timeout=timeout)
 
     @staticmethod
-    def execute_all_async(method_name: str, workers_and_args: List[Tuple[Any, List[Any], Dict[str, Any]]], *,
-                          on_submit: Optional[Callable] = None):
+    def execute_all_async(
+        method_name: str,
+        workers_and_args: list[tuple[Any, list[Any], dict[str, Any]]],
+        *,
+        on_submit: Callable | None = None,
+    ):
         """Execute method and return futures."""
         output = []
         for worker_and_args in workers_and_args:
@@ -274,16 +297,19 @@ class RayHelper:
     @staticmethod
     def add_or_get_config(key: str, value: Any):
         import ray
+
         return ray.get(RayHelper._registry.add_or_get.remote(key, value))
 
     @staticmethod
     def add_config(key: str, value: Any):
         import ray
+
         ray.get(RayHelper._registry.add_config.remote(key, value))
 
     @staticmethod
     def get_config(key: str):
         import ray
+
         return ray.get(RayHelper._registry.get_config.remote(key))
 
     @staticmethod
@@ -291,6 +317,7 @@ class RayHelper:
         """Avoid create remote component twice."""
         if component not in RayHelper._remote_components:
             import ray
+
             RayHelper._remote_components[component] = ray.remote(component)
         return RayHelper._remote_components[component]
 
@@ -306,11 +333,7 @@ class RayHelper:
         return ip, port
 
     @staticmethod
-    def do_get_and_collect_func(collect_func: Callable,
-                                method: Union[str, Callable],
-                                futures,
-                                device_mesh,
-                                timeout=None):
+    def do_get_and_collect_func(collect_func: Callable, method: str | Callable, futures, device_mesh, timeout=None):
         """Return the Future-protocol handle over one dispatched call's refs."""
         return LazyCollect(futures, method, collect_func, device_mesh, timeout=timeout)
 
@@ -319,14 +342,14 @@ class RayHelper:
         """Collect `LazyCollect` in each arg."""
         new_args = []
         for arg in args:
-            if isinstance(arg, Callable) and getattr(arg, '_is_lazy_collect', False):
+            if isinstance(arg, Callable) and getattr(arg, "_is_lazy_collect", False):
                 arg = arg()
             new_args.append(arg)
 
         new_kwargs = {}
         for key in list(kwargs.keys()):
             value = kwargs[key]
-            if isinstance(value, Callable) and getattr(value, '_is_lazy_collect', False):
+            if isinstance(value, Callable) and getattr(value, "_is_lazy_collect", False):
                 value = value()
             new_kwargs[key] = value
         return new_args, new_kwargs
@@ -334,24 +357,26 @@ class RayHelper:
     @staticmethod
     def has_ref(args, kwargs) -> bool:
         for arg in args:
-            if isinstance(arg, Callable) and getattr(arg, '_is_lazy_collect', False):
+            if isinstance(arg, Callable) and getattr(arg, "_is_lazy_collect", False):
                 return True
         for key in list(kwargs.keys()):
             value = kwargs[key]
-            if isinstance(value, Callable) and getattr(value, '_is_lazy_collect', False):
+            if isinstance(value, Callable) and getattr(value, "_is_lazy_collect", False):
                 return True
         return False
 
     @staticmethod
-    def create_workers(worker_cls: Type[T],
-                       group: str,
-                       execute: Literal['all', 'peer', 'first'],
-                       *args,
-                       instance_id,
-                       extra_torch_kwargs: Optional[Dict[str, Any]] = None,
-                       max_concurrency: Optional[int] = None,
-                       worker_slots: Optional[List[int]] = None,
-                       **kwargs) -> List[T]:
+    def create_workers(
+        worker_cls: type[T],
+        group: str,
+        execute: Literal["all", "peer", "first"],
+        *args,
+        instance_id,
+        extra_torch_kwargs: dict[str, Any] | None = None,
+        max_concurrency: int | None = None,
+        worker_slots: list[int] | None = None,
+        **kwargs,
+    ) -> list[T]:
         # TODO when will remote create remote?
         # Should it peer create peer? or peer create all?
         # Whether the input data of each remote is independent, or they are a part of the whole device mesh?
@@ -369,14 +394,16 @@ class RayHelper:
         assert len(placement_groups) == len(ranks)
         if worker_slots is not None:
             slots = tuple(worker_slots)
-            if any(type(slot) is not int or not 0 <= slot < len(ranks) for slot in slots) or len(set(slots)) != len(slots):
-                raise ValueError(f'worker_slots must be unique indices in [0, {len(ranks)}), got {slots!r}.')
+            if any(type(slot) is not int or not 0 <= slot < len(ranks) for slot in slots) or len(set(slots)) != len(
+                slots
+            ):
+                raise ValueError(f"worker_slots must be unique indices in [0, {len(ranks)}), got {slots!r}.")
             if not slots:
                 return []
             placement_groups = [placement_groups[slot] for slot in slots]
             ranks = [ranks[slot] for slot in slots]
-        key = f'{group}-{worker_cls.__class__.__name__}-{instance_id}'
-        if execute == 'peer':
+        key = f"{group}-{worker_cls.__class__.__name__}-{instance_id}"
+        if execute == "peer":
             # Create the peer worker
             # 0 1 2 3
             # | | | |
@@ -384,46 +411,42 @@ class RayHelper:
             _slice = Platform.get_peer_index(len(ranks))
             placement_groups = placement_groups[_slice]
             ranks = ranks[_slice]
-            ip, port = RayHelper.get_master_id_port(placement_groups[0]['placement_group'])
-            ip = RayHelper.add_or_get_config(key + '-ip', ip)
-            port = RayHelper.add_or_get_config(key + '-port', port)
-        elif execute == 'first':
+            ip, port = RayHelper.get_master_id_port(placement_groups[0]["placement_group"])
+            ip = RayHelper.add_or_get_config(key + "-ip", ip)
+            port = RayHelper.add_or_get_config(key + "-port", port)
+        elif execute == "first":
             placement_groups = placement_groups[:1]
             ranks = ranks[:1]
-            ip, port = RayHelper.get_master_id_port(placement_groups[0]['placement_group'])
+            ip, port = RayHelper.get_master_id_port(placement_groups[0]["placement_group"])
         else:
-            ip, port = RayHelper.get_master_id_port(placement_groups[0]['placement_group'])
+            ip, port = RayHelper.get_master_id_port(placement_groups[0]["placement_group"])
 
-        device_type_upper = (device_config.device_type or '').upper()
-        if device_type_upper != 'CPU':
+        device_type_upper = (device_config.device_type or "").upper()
+        if device_type_upper != "CPU":
             world_size = len(ranks)
             device_type = Platform.get_platform(device_type_upper).__name__
-            for pg_idx, (deploy_pg, gpu) in enumerate(zip(placement_groups, ranks)):
-                deploy_pg: Dict
+            for pg_idx, (deploy_pg, _gpu) in enumerate(zip(placement_groups, ranks, strict=False)):
+                deploy_pg: dict
                 cluster_name = group
-                worker_name = key + '-' + str(pg_idx)
+                worker_name = key + "-" + str(pg_idx)
                 env_vars = os.environ.copy()
-                env_vars.update({
-                    'WORLD_SIZE':
-                    str(world_size),
-                    'RANK':
-                    str(pg_idx),
-                    'LOCAL_RANK':
-                    str(0),
-                    'CLUSTER_NAME':
-                    cluster_name,
-                    'WORKER_NAME':
-                    worker_name,
-                    Platform.get_platform(device_type_upper).visible_device_env():
-                    ','.join([str(r) for r in deploy_pg['gpu_rank']]),
-                    'TWINKLE_MODE':
-                    'ray',
-                    _torch_setup.EXTRA_TORCH_KWARGS_ENV:
-                    _torch_setup.to_env_value(extra_torch_kwargs),
-                })
+                env_vars.update(
+                    {
+                        "WORLD_SIZE": str(world_size),
+                        "RANK": str(pg_idx),
+                        "LOCAL_RANK": str(0),
+                        "CLUSTER_NAME": cluster_name,
+                        "WORKER_NAME": worker_name,
+                        Platform.get_platform(device_type_upper).visible_device_env(): ",".join(
+                            [str(r) for r in deploy_pg["gpu_rank"]]
+                        ),
+                        "TWINKLE_MODE": "ray",
+                        _torch_setup.EXTRA_TORCH_KWARGS_ENV: _torch_setup.to_env_value(extra_torch_kwargs),
+                    }
+                )
 
-                env_vars['MASTER_ADDR'] = ip
-                env_vars['MASTER_PORT'] = str(port)
+                env_vars["MASTER_ADDR"] = ip
+                env_vars["MASTER_PORT"] = str(port)
 
                 # Prevent Ray from overriding CUDA_VISIBLE_DEVICES set in runtime_env
                 # This is critical for multi-GPU workers (gpus_per_worker > 1)
@@ -432,21 +455,22 @@ class RayHelper:
                 if max_concurrency is not None:
                     # Read back in the worker to size the thread pool that runs
                     # blocking continuous-work methods off the actor's event loop.
-                    env_vars['TWINKLE_ACTOR_MAX_CONCURRENCY'] = str(max_concurrency)
+                    env_vars["TWINKLE_ACTOR_MAX_CONCURRENCY"] = str(max_concurrency)
 
                 # Ray serialises runtime_env to JSON; a callable setup hook is rejected by Ray 2.58
                 # ("Object of type function is not JSON serializable"). Pass the import path instead.
                 runtime_env = RuntimeEnv(
-                    env_vars=env_vars,
-                    worker_process_setup_hook='twinkle.utils.loader.run_worker_setup_hook')
+                    env_vars=env_vars, worker_process_setup_hook="twinkle.utils.loader.run_worker_setup_hook"
+                )
 
                 worker_options = {
-                    'scheduling_strategy':
-                    PlacementGroupSchedulingStrategy(placement_group=deploy_pg['placement_group']),
-                    'name': worker_name,
-                    'namespace': 'default',
-                    'runtime_env': runtime_env,
-                    'num_cpus': 0.01,
+                    "scheduling_strategy": PlacementGroupSchedulingStrategy(
+                        placement_group=deploy_pg["placement_group"]
+                    ),
+                    "name": worker_name,
+                    "namespace": os.environ.get("TWINKLE_RAY_NAMESPACE", "default"),
+                    "runtime_env": runtime_env,
+                    "num_cpus": 0.01,
                 }
 
                 # The placement group already reserves a GPU worker's full
@@ -460,14 +484,16 @@ class RayHelper:
                 # the worker in ``set_visible_accelerator_ids`` before its
                 # constructor runs.  The CPU claim and placement-group strategy
                 # are sufficient to place the actor in the GPU-owning bundle.
-                if device_type != 'GPU':
+                if device_type != "GPU":
                     # Use a custom resource key for non-GPU accelerators
                     # (for example, NPU).
-                    worker_options['resources'] = {device_type: 0.01}
+                    worker_options["resources"] = {device_type: 0.01}
 
                 if max_concurrency is not None:
-                    worker_options['max_concurrency'] = max_concurrency
+                    worker_options["max_concurrency"] = max_concurrency
 
+                if os.environ.get("TWINKLE_RAY_NAMESPACE"):
+                    worker_options.update(max_restarts=0, max_task_retries=0)
                 try:
                     worker = worker_cls.options(**worker_options).remote(*args, **kwargs)
                 except BaseException:
@@ -480,44 +506,49 @@ class RayHelper:
             workers = []
             # For CPU case, don't set visible device environment variables
             _visible_device_env = {}
-            for rank, (deploy_pg, index) in enumerate(zip(placement_groups, list(range(world_size)))):
-                deploy_pg: Dict
+            for rank, (deploy_pg, _index) in enumerate(zip(placement_groups, list(range(world_size)), strict=False)):
+                deploy_pg: dict
                 cluster_name = group
-                worker_name = key + '-' + str(rank)
+                worker_name = key + "-" + str(rank)
                 env_vars = os.environ.copy()
-                env_vars.update({
-                    'WORLD_SIZE': str(world_size),
-                    'RANK': str(rank),
-                    'LOCAL_RANK': str(0),
-                    'CLUSTER_NAME': cluster_name,
-                    'WORKER_NAME': worker_name,
-                    'TWINKLE_MODE': 'ray',
-                    _torch_setup.EXTRA_TORCH_KWARGS_ENV: _torch_setup.to_env_value(extra_torch_kwargs),
-                    **_visible_device_env
-                })
+                env_vars.update(
+                    {
+                        "WORLD_SIZE": str(world_size),
+                        "RANK": str(rank),
+                        "LOCAL_RANK": str(0),
+                        "CLUSTER_NAME": cluster_name,
+                        "WORKER_NAME": worker_name,
+                        "TWINKLE_MODE": "ray",
+                        _torch_setup.EXTRA_TORCH_KWARGS_ENV: _torch_setup.to_env_value(extra_torch_kwargs),
+                        **_visible_device_env,
+                    }
+                )
                 if max_concurrency is not None:
                     # Read back in the worker to size the thread pool that runs
                     # blocking continuous-work methods off the actor's event loop.
-                    env_vars['TWINKLE_ACTOR_MAX_CONCURRENCY'] = str(max_concurrency)
+                    env_vars["TWINKLE_ACTOR_MAX_CONCURRENCY"] = str(max_concurrency)
 
                 # Ray serialises runtime_env to JSON; a callable setup hook is rejected by Ray 2.58
                 # ("Object of type function is not JSON serializable"). Pass the import path instead.
                 runtime_env = RuntimeEnv(
-                    env_vars=env_vars,
-                    worker_process_setup_hook='twinkle.utils.loader.run_worker_setup_hook')
+                    env_vars=env_vars, worker_process_setup_hook="twinkle.utils.loader.run_worker_setup_hook"
+                )
 
                 worker_options = {
-                    'scheduling_strategy':
-                    PlacementGroupSchedulingStrategy(placement_group=deploy_pg['placement_group']),
-                    'name': worker_name,
-                    'namespace': 'default',
-                    'runtime_env': runtime_env,
-                    'num_cpus': 0.01,
+                    "scheduling_strategy": PlacementGroupSchedulingStrategy(
+                        placement_group=deploy_pg["placement_group"]
+                    ),
+                    "name": worker_name,
+                    "namespace": os.environ.get("TWINKLE_RAY_NAMESPACE", "default"),
+                    "runtime_env": runtime_env,
+                    "num_cpus": 0.01,
                 }
 
                 if max_concurrency is not None:
-                    worker_options['max_concurrency'] = max_concurrency
+                    worker_options["max_concurrency"] = max_concurrency
 
+                if os.environ.get("TWINKLE_RAY_NAMESPACE"):
+                    worker_options.update(max_restarts=0, max_task_retries=0)
                 try:
                     worker = worker_cls.options(**worker_options).remote(*args, **kwargs)
                 except BaseException:

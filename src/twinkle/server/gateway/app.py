@@ -5,18 +5,19 @@ Unified Gateway Server.
 A single Ray Serve deployment that serves both Tinker (/tinker/*) and
 Twinkle (/twinkle/*) management and proxy endpoints.
 """
-from __future__ import annotations
 
+from __future__ import annotations
 import asyncio
-from fastapi import FastAPI, HTTPException
 from typing import Any
+
+from fastapi import FastAPI, HTTPException
 
 import twinkle.protocol.types as types
 from twinkle.server.deployment import LazyCleanupMixin, bind_deployment, build_deployment_app
+from twinkle.server.lifecycle.proxy import ServiceProxy
 from twinkle.server.state import get_server_state
 from twinkle.utils.logger import get_logger
 from .openai_handlers import _register_api_key_gate, _register_openai_routes
-from .proxy import ServiceProxy
 from .tinker_handlers import _register_gateway_tinker_routes
 from .twinkle_handlers import _register_gateway_twinkle_routes
 
@@ -26,26 +27,30 @@ logger = get_logger()
 class GatewayServer(LazyCleanupMixin):
     """Unified gateway server handling both Tinker and Twinkle API clients."""
 
-    def __init__(self,
-                 supported_models: list | None = None,
-                 server_config: Any = None,
-                 http_options: dict[str, Any] | None = None,
-                 **kwargs) -> None:
+    def __init__(
+        self,
+        supported_models: list | None = None,
+        server_config: Any = None,
+        http_options: dict[str, Any] | None = None,
+        **kwargs,
+    ) -> None:
         # ``server_config`` may be a typed ServerStateArgs (from the launcher), a
         # raw dict (direct callers), or None. Normalize to the keyword args
         # ``get_server_state`` expects, dropping unset (None) values so they fall
         # back to ServerState's own defaults.
         state_kwargs = self._normalize_server_state_args(server_config)
         self.state = get_server_state(**state_kwargs)
-        self.route_prefix = kwargs.get('route_prefix', '/api/v1')
+        self.route_prefix = kwargs.get("route_prefix", "/api/v1")
         self.http_options = http_options or {}
         self.proxy = ServiceProxy(http_options=http_options, route_prefix=self.route_prefix)
         self.supported_models = self._normalize_models(supported_models)
+        self.training_models = self._normalize_models(kwargs.get("training_models", supported_models))
+        self._training_model_names = frozenset(m.model_name for m in self.training_models)
         self._supported_model_names = frozenset(m.model_name for m in self.supported_models)
         # OpenAI-compat surface knobs: ``api_key`` gates every inference route with a Bearer check
         # (None = unauthenticated), ``owned_by`` is the ``owned_by`` field of ``/models`` entries.
-        self.api_key = kwargs.get('api_key')
-        self.owned_by = kwargs.get('owned_by') or 'twinkle'
+        self.api_key = kwargs.get("api_key")
+        self.owned_by = kwargs.get("owned_by") or "twinkle"
         self._modelscope_config_lock = asyncio.Lock()
         self._state_cleanup_started = False
         # Per-instance, not module-level: a process-global set never got cleared
@@ -71,7 +76,7 @@ class GatewayServer(LazyCleanupMixin):
         """
         if server_config is None:
             return {}
-        if hasattr(server_config, 'model_dump'):
+        if hasattr(server_config, "model_dump"):
             data = server_config.model_dump()
         elif isinstance(server_config, dict):
             data = dict(server_config)
@@ -93,24 +98,27 @@ class GatewayServer(LazyCleanupMixin):
         return normalized
 
     def _validate_base_model(self, base_model: str) -> None:
-        if base_model not in self._supported_model_names:
+        if base_model not in self._training_model_names:
             raise HTTPException(
                 status_code=400,
                 detail=f"Base model '{base_model}' is not supported. "
-                f"Supported models: {', '.join(sorted(self._supported_model_names))}")
+                f"Supported models: {', '.join(sorted(self._training_model_names))}",
+            )
 
     async def _get_base_model(self, model_id: str) -> str:
         metadata = await self.state.get_model_metadata(model_id)
-        if metadata and metadata.get('base_model'):
-            return metadata['base_model']
-        raise HTTPException(status_code=404, detail=f'Model {model_id} not found')
+        if metadata and metadata.get("base_model"):
+            return metadata["base_model"]
+        raise HTTPException(status_code=404, detail=f"Model {model_id} not found")
 
 
-def build_gateway_app(deploy_options: dict[str, Any],
-                      supported_models: list | None = None,
-                      server_config: Any = None,
-                      http_options: dict[str, Any] | None = None,
-                      **kwargs):
+def build_gateway_app(
+    deploy_options: dict[str, Any],
+    supported_models: list | None = None,
+    server_config: Any = None,
+    http_options: dict[str, Any] | None = None,
+    **kwargs,
+):
     """Build and configure the unified gateway server application.
 
     Serves Tinker endpoints at /* and Twinkle endpoints at /twinkle/*.
@@ -142,7 +150,7 @@ def build_gateway_app(deploy_options: dict[str, Any],
         await servable.proxy.close()
 
     app = build_deployment_app(
-        'Gateway',
+        "Gateway",
         register_routes,
         on_shutdown=_on_shutdown,
         attach_cleanup_middleware=True,
@@ -152,7 +160,7 @@ def build_gateway_app(deploy_options: dict[str, Any],
         app,
         GatewayServer,
         deploy_options,
-        deployment_name='GatewayServer',
+        deployment_name="GatewayServer",
         bind_kwargs=dict(
             supported_models=supported_models,
             server_config=server_config,

@@ -4,11 +4,12 @@ Twinkle-native gateway handlers.
 
 All endpoints are prefixed /twinkle/* and registered via _register_gateway_twinkle_routes(app, self_fn).
 """
-from __future__ import annotations
 
+from __future__ import annotations
 from collections.abc import Callable
-from fastapi import Depends, FastAPI, Request
 from typing import TYPE_CHECKING
+
+from fastapi import Depends, FastAPI, Request
 
 if TYPE_CHECKING:
     from .app import GatewayServer
@@ -20,9 +21,8 @@ from twinkle.server.lifecycle.envelope import envelope_from_record
 from twinkle.server.lifecycle.poll_config import long_poll_window
 from twinkle.server.middleware.auth import get_token_from_request
 from twinkle.utils.logger import get_logger
-from .use_cases import delete_checkpoint
+from .use_cases import delete_checkpoint, get_weights_info, list_checkpoints, list_training_runs, poll_future
 from .use_cases import get_training_run as get_training_run_use_case
-from .use_cases import get_weights_info, list_checkpoints, list_training_runs, poll_future
 
 logger = get_logger()
 
@@ -30,22 +30,22 @@ logger = get_logger()
 def _register_gateway_twinkle_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) -> None:
     """Register all /twinkle/* routes on the given FastAPI app."""
 
-    @app.get('/twinkle/capacity_info', response_model=types.CapacityInfoResponse)
+    @app.get("/twinkle/capacity_info", response_model=types.CapacityInfoResponse)
     async def get_capacity_info(
-            request: Request,
-            self: GatewayServer = Depends(self_fn),
+        request: Request,
+        self: GatewayServer = Depends(self_fn),
     ) -> types.CapacityInfoResponse:
         info = await self.state.get_capacity_info()
         return types.CapacityInfoResponse(**info)
 
-    @app.get('/twinkle/healthz', response_model=types.HealthResponse)
+    @app.get("/twinkle/healthz", response_model=types.HealthResponse)
     async def healthz(request: Request) -> types.HealthResponse:
-        return types.HealthResponse(status='ok')
+        return types.HealthResponse(status="ok")
 
-    @app.get('/twinkle/healthz/deep')
+    @app.get("/twinkle/healthz/deep")
     async def healthz_deep(
-            request: Request,
-            self: GatewayServer = Depends(self_fn),
+        request: Request,
+        self: GatewayServer = Depends(self_fn),
     ) -> dict:
         """Deep health check: verifies model actors are alive, not just the gateway.
 
@@ -57,36 +57,40 @@ def _register_gateway_twinkle_routes(app: FastAPI, self_fn: Callable[[], Gateway
         results = {}
         all_healthy = True
 
-        for model in self.supported_models:
+        for model in self.training_models:
             model_name = model.model_name
             try:
-                resp = await self.proxy.proxy_request(request, 'healthz', model_name, 'model')
-                healthy = (resp.status_code == 200)
+                resp = await self.proxy.proxy_request(request, "healthz", model_name, "model")
+                healthy = resp.status_code == 200
+                if healthy:
+                    import json
+
+                    healthy = json.loads(resp.body).get("healthy", True)
                 if not healthy:
                     all_healthy = False
                 results[model_name] = {
-                    'healthy': healthy,
-                    'status_code': resp.status_code,
+                    "healthy": healthy,
+                    "status_code": resp.status_code,
                 }
             except Exception as e:
                 all_healthy = False
                 results[model_name] = {
-                    'healthy': False,
-                    'detail': str(e),
+                    "healthy": False,
+                    "detail": str(e),
                 }
 
-        body = {'healthy': all_healthy, 'models': results}
+        body = {"healthy": all_healthy, "models": results}
         if not all_healthy:
             return JSONResponse(status_code=503, content=body)
         return body
 
-    @app.get('/twinkle/get_server_capabilities', response_model=types.GetServerCapabilitiesResponse)
+    @app.get("/twinkle/get_server_capabilities", response_model=types.GetServerCapabilitiesResponse)
     async def get_server_capabilities(
-            request: Request,
-            self: GatewayServer = Depends(self_fn),
+        request: Request,
+        self: GatewayServer = Depends(self_fn),
     ) -> types.GetServerCapabilitiesResponse:
         return types.GetServerCapabilitiesResponse(
-            supported_models=self.supported_models,
+            supported_models=self.training_models,
             protocol_version=1,
             features=types.ClientFeatures(
                 task_envelope=True,
@@ -98,31 +102,31 @@ def _register_gateway_twinkle_routes(app: FastAPI, self_fn: Callable[[], Gateway
             limits=types.ProtocolLimits(long_poll_timeout_seconds=long_poll_window()),
         )
 
-    @app.post('/twinkle/create_session', response_model=types.CreateSessionResponse)
+    @app.post("/twinkle/create_session", response_model=types.CreateSessionResponse)
     async def create_session(
-            request: Request,
-            body: types.CreateSessionRequest,
-            self: GatewayServer = Depends(self_fn),
+        request: Request,
+        body: types.CreateSessionRequest,
+        self: GatewayServer = Depends(self_fn),
     ) -> types.CreateSessionResponse:
         session_id = await self.state.create_session(body.model_dump())
         return types.CreateSessionResponse(session_id=session_id)
 
-    @app.post('/twinkle/session_heartbeat', response_model=types.SessionHeartbeatResponse)
+    @app.post("/twinkle/session_heartbeat", response_model=types.SessionHeartbeatResponse)
     async def session_heartbeat(
-            request: Request,
-            body: types.SessionHeartbeatRequest,
-            self: GatewayServer = Depends(self_fn),
+        request: Request,
+        body: types.SessionHeartbeatRequest,
+        self: GatewayServer = Depends(self_fn),
     ) -> types.SessionHeartbeatResponse:
         alive = await self.state.touch_session(body.session_id)
         if not alive:
-            raise ResourceNotFoundError('Unknown session')
+            raise ResourceNotFoundError("Unknown session")
         return types.SessionHeartbeatResponse()
 
-    @app.post('/twinkle/retrieve_future', response_model=types.TaskEnvelope)
+    @app.post("/twinkle/retrieve_future", response_model=types.TaskEnvelope)
     async def retrieve_future(
-            request: Request,
-            body: types.RetrieveFutureRequest,
-            self: GatewayServer = Depends(self_fn),
+        request: Request,
+        body: types.RetrieveFutureRequest,
+        self: GatewayServer = Depends(self_fn),
     ) -> types.TaskEnvelope:
         """Long-poll a twinkle-native task to a terminal state.
 
@@ -139,16 +143,17 @@ def _register_gateway_twinkle_routes(app: FastAPI, self_fn: Callable[[], Gateway
         finish. See ``poll_config`` for the numbers.
         """
         request_id = body.request_id
+        await self.state.assert_future_owner(request_id, get_token_from_request(request))
         outcome = await poll_future(self.state, request_id)
         if outcome.record is None:
-            raise ResourceNotFoundError(f'request_id {request_id} not found or expired')
+            raise ResourceNotFoundError(f"request_id {request_id} not found or expired")
         return envelope_from_record(request_id, outcome.record)
 
-    @app.post('/twinkle/cancel', response_model=types.CancelResponse)
+    @app.post("/twinkle/cancel", response_model=types.CancelResponse)
     async def cancel_future(
-            request: Request,
-            body: types.CancelRequest,
-            self: GatewayServer = Depends(self_fn),
+        request: Request,
+        body: types.CancelRequest,
+        self: GatewayServer = Depends(self_fn),
     ) -> types.CancelResponse:
         """Best-effort cancel of a not-yet-started task.
 
@@ -156,85 +161,88 @@ def _register_gateway_twinkle_routes(app: FastAPI, self_fn: Callable[[], Gateway
         running or already-terminal task is reported but never interrupted, so cancel
         can never corrupt in-flight GPU/optimizer state.
         """
+        await self.state.assert_future_owner(body.request_id, get_token_from_request(request))
         result = await self.state.cancel_future(body.request_id)
         return types.CancelResponse(**result)
 
-    @app.get('/twinkle/training_runs', response_model=types.TrainingRunsResponse)
+    @app.get("/twinkle/training_runs", response_model=types.TrainingRunsResponse)
     async def get_training_runs(request: Request, limit: int = 20, offset: int = 0) -> types.TrainingRunsResponse:
         token = get_token_from_request(request)
-        return list_training_runs(token, 'twinkle', limit=limit, offset=offset)
+        return list_training_runs(token, "twinkle", limit=limit, offset=offset)
 
-    @app.get('/twinkle/training_runs/{run_id}', response_model=types.TrainingRun)
+    @app.get("/twinkle/training_runs/{run_id}", response_model=types.TrainingRun)
     async def get_training_run(request: Request, run_id: str) -> types.TrainingRun:
         token = get_token_from_request(request)
-        run = get_training_run_use_case(token, 'twinkle', run_id, check_permission=True)
+        run = get_training_run_use_case(token, "twinkle", run_id, check_permission=True)
         if not run:
-            raise ResourceNotFoundError(f'Training run {run_id} not found or access denied')
+            raise ResourceNotFoundError(f"Training run {run_id} not found or access denied")
         return run
 
-    @app.get('/twinkle/training_runs/{run_id}/checkpoints', response_model=types.CheckpointsListResponse)
+    @app.get("/twinkle/training_runs/{run_id}/checkpoints", response_model=types.CheckpointsListResponse)
     async def get_run_checkpoints(request: Request, run_id: str) -> types.CheckpointsListResponse:
         token = get_token_from_request(request)
-        response = list_checkpoints(token, 'twinkle', run_id)
+        response = list_checkpoints(token, "twinkle", run_id)
         if response is None:
-            raise ResourceNotFoundError(f'Training run {run_id} not found or access denied')
+            raise ResourceNotFoundError(f"Training run {run_id} not found or access denied")
         return response
 
     @app.delete(
-        '/twinkle/training_runs/{run_id}/checkpoints/{checkpoint_id:path}',
-        response_model=types.DeleteCheckpointResponse)
-    async def delete_run_checkpoint(request: Request, run_id: str,
-                                    checkpoint_id: str) -> types.DeleteCheckpointResponse:
+        "/twinkle/training_runs/{run_id}/checkpoints/{checkpoint_id:path}",
+        response_model=types.DeleteCheckpointResponse,
+    )
+    async def delete_run_checkpoint(
+        request: Request, run_id: str, checkpoint_id: str
+    ) -> types.DeleteCheckpointResponse:
         token = get_token_from_request(request)
 
         if not validate_user_path(token, checkpoint_id):
-            raise RequestRejectedError('Invalid checkpoint path: path traversal not allowed')
+            raise RequestRejectedError("Invalid checkpoint path: path traversal not allowed")
 
-        success = delete_checkpoint(token, 'twinkle', run_id, checkpoint_id)
+        success = delete_checkpoint(token, "twinkle", run_id, checkpoint_id)
         if not success:
-            raise ResourceNotFoundError(f'Checkpoint {checkpoint_id} not found or access denied')
+            raise ResourceNotFoundError(f"Checkpoint {checkpoint_id} not found or access denied")
 
-        return types.DeleteCheckpointResponse(success=True, message=f'Checkpoint {checkpoint_id} deleted successfully')
+        return types.DeleteCheckpointResponse(success=True, message=f"Checkpoint {checkpoint_id} deleted successfully")
 
-    @app.post('/twinkle/weights_info', response_model=types.WeightsInfoResponse)
+    @app.post("/twinkle/weights_info", response_model=types.WeightsInfoResponse)
     async def weights_info(request: Request, body: types.WeightsInfoRequest) -> types.WeightsInfoResponse:
         token = get_token_from_request(request)
-        response = get_weights_info(token, 'twinkle', body.twinkle_path)
+        response = get_weights_info(token, "twinkle", body.twinkle_path)
         if response is None:
-            raise ResourceNotFoundError(f'Weights at {body.twinkle_path} not found or access denied')
+            raise ResourceNotFoundError(f"Weights at {body.twinkle_path} not found or access denied")
         return response
 
-    @app.get('/twinkle/checkpoint_path/{run_id}/{checkpoint_id:path}', response_model=types.CheckpointPathResponse)
+    @app.get("/twinkle/checkpoint_path/{run_id}/{checkpoint_id:path}", response_model=types.CheckpointPathResponse)
     async def get_checkpoint_path(request: Request, run_id: str, checkpoint_id: str) -> types.CheckpointPathResponse:
         token = get_token_from_request(request)
 
         if not validate_user_path(token, checkpoint_id):
-            raise RequestRejectedError('Invalid checkpoint path: path traversal not allowed')
+            raise RequestRejectedError("Invalid checkpoint path: path traversal not allowed")
 
-        training_run_manager = create_training_run_manager(token, client_type='twinkle')
-        checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
+        training_run_manager = create_training_run_manager(token, client_type="twinkle")
+        checkpoint_manager = create_checkpoint_manager(token, client_type="twinkle")
 
         run = training_run_manager.get(run_id)
         if not run:
-            raise ResourceNotFoundError(f'Training run {run_id} not found or access denied')
+            raise ResourceNotFoundError(f"Training run {run_id} not found or access denied")
 
         checkpoint = checkpoint_manager.get(run_id, checkpoint_id)
         if not checkpoint:
-            raise ResourceNotFoundError(f'Checkpoint {checkpoint_id} not found')
+            raise ResourceNotFoundError(f"Checkpoint {checkpoint_id} not found")
 
         ckpt_dir = checkpoint_manager.get_ckpt_dir(run_id, checkpoint_id)
         return types.CheckpointPathResponse(path=str(ckpt_dir), twinkle_path=checkpoint.twinkle_path)
 
-    @app.get('/twinkle/status')
+    @app.get("/twinkle/status")
     async def status(
-            request: Request,
-            self: GatewayServer = Depends(self_fn),
+        request: Request,
+        self: GatewayServer = Depends(self_fn),
     ) -> dict:
         cleanup_stats = await self.state.get_cleanup_stats()
         return {
-            'resources': cleanup_stats['resource_counts'],
-            'cleanup': {
-                'running': cleanup_stats['cleanup_running'],
-                'expiration_timeout': cleanup_stats['expiration_timeout'],
+            "resources": cleanup_stats["resource_counts"],
+            "cleanup": {
+                "running": cleanup_stats["cleanup_running"],
+                "expiration_timeout": cleanup_stats["expiration_timeout"],
             },
         }

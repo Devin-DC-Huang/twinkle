@@ -6,23 +6,25 @@ registration closing over ``self_fn`` via ``Depends``, not a mixin: there is no
 inheritance relationship with the deployment class. Provides POST /tinker/asample using
 schedule_concurrent_task() returning UntypedAPIFuture.
 """
-from __future__ import annotations
 
+from __future__ import annotations
 import os
 import traceback
 from collections.abc import Callable
+from typing import TYPE_CHECKING
+
 from fastapi import Depends, FastAPI, Request
 from tinker import types
-from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .app import SamplerManagement
 
 from twinkle.data_format import SamplingParams
 from twinkle.server.checkpoint import create_checkpoint_manager
+from twinkle.server.exceptions import RequestRejectedError
 from twinkle.server.sampler.weights import sample_with_weights
-from twinkle.server.task_queue.types import UserTaskError
 from twinkle.utils.logger import get_logger
+from .runtime import request_execution_scope
 
 logger = get_logger()
 
@@ -50,9 +52,10 @@ def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerM
     It is wired in via Depends so it is resolved lazily at request time.
     """
 
-    @app.post('/tinker/asample')
-    async def asample(request: Request, body: types.SampleRequest,
-                      self: SamplerManagement = Depends(self_fn)) -> types.UntypedAPIFuture:
+    @app.post("/tinker/asample")
+    async def asample(
+        request: Request, body: types.SampleRequest, self: SamplerManagement = Depends(self_fn)
+    ) -> types.UntypedAPIFuture:
         """Execute text generation (inference) for Tinker clients.
 
         Args:
@@ -67,33 +70,35 @@ def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerM
         async def _do_sample():
             try:
                 # Extract prompt token IDs from ModelInput
-                prompt_inputs = {'input_ids': body.prompt.to_ints()}
+                prompt_inputs = {"input_ids": body.prompt.to_ints()}
 
                 # Get model_path from body or sampling session
                 model_path = body.model_path
                 if not model_path and body.sampling_session_id:
                     session = await self.state.get_sampling_session(body.sampling_session_id)
                     if session:
-                        model_path = session.get('model_path')
+                        model_path = session.get("model_path")
 
                 # Parse and resolve adapter URI from model_path
                 adapter_uri = None
                 if model_path:
-                    checkpoint_manager = create_checkpoint_manager(token, client_type='tinker')
+                    checkpoint_manager = create_checkpoint_manager(token, client_type="tinker")
                     adapter_name, adapter_uri = checkpoint_manager.parse_adapter_uri(model_path)
 
                 # Base-model sampling is valid when no model_path was provided.
                 if adapter_uri and not os.path.exists(adapter_uri):
-                    raise UserTaskError(f'Adapter URI {model_path} does not exist. Please check the model_path.')
+                    raise RequestRejectedError(f"Adapter URI {model_path} does not exist. Please check the model_path.")
 
                 # Convert tinker SamplingParams to twinkle SamplingParams if needed
                 sampling_params = None
                 if body.sampling_params:
                     sampling_params = SamplingParams(
                         max_tokens=body.sampling_params.max_tokens
-                        if body.sampling_params.max_tokens is not None else 256,
+                        if body.sampling_params.max_tokens is not None
+                        else 256,
                         temperature=body.sampling_params.temperature
-                        if body.sampling_params.temperature is not None else 1.0,
+                        if body.sampling_params.temperature is not None
+                        else 1.0,
                         top_p=body.sampling_params.top_p,
                         top_k=body.sampling_params.top_k,
                         stop=body.sampling_params.stop,
@@ -129,14 +134,16 @@ def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerM
                                 logprobs = flattened
                             else:
                                 raise RuntimeError(
-                                    f'Sampler returned {len(flattened)} logprobs for {len(seq.tokens)} generated '
-                                    'tokens; refusing to return a misaligned Tinker SampledSequence.')
+                                    f"Sampler returned {len(flattened)} logprobs for {len(seq.tokens)} generated "
+                                    "tokens; refusing to return a misaligned Tinker SampledSequence."
+                                )
                         tinker_sequences.append(
                             _sampled_sequence(
                                 stop_reason=seq.stop_reason,
                                 tokens=list(seq.tokens),
                                 logprobs=logprobs,
-                            ))
+                            )
+                        )
                 return _sample_response(
                     sequences=tinker_sequences,
                     prompt_logprobs=responses[0].prompt_logprobs,
@@ -152,5 +159,6 @@ def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerM
             _do_sample,
             token=token,
             input_tokens=input_tokens,
-            task_type='sample',
+            task_type="sample",
+            execution_scope=request_execution_scope(request),
         )
