@@ -64,7 +64,7 @@ def make_lora(model, target):
     return str(target)
 
 
-async def exercise(model, directory, namespace, evidence):
+async def exercise(model, directory, namespace, evidence, *, extended=True):
     import numpy as np
     import ray
     from ray import serve
@@ -219,6 +219,15 @@ async def exercise(model, directory, namespace, evidence):
             driver.wait_operation = original_wait
         evidence['control_sweep_safe'] = True
 
+        if not extended:
+            await asyncio.sleep(2.1)
+            await pool.sweep()
+            await settled()
+            evidence['sizes'].append(len(pool._ready_instances()))
+            assert evidence['sizes'] == [minimum, devices_count, minimum]
+            evidence['scaling_complete'] = True
+            return
+
         old = checkpoint_alias(model, directory / 'checkpoint-A')
         new = checkpoint_alias(model, directory / 'checkpoint-B')
         await sample(full=old)
@@ -337,12 +346,14 @@ async def exercise(model, directory, namespace, evidence):
         assert not any(row['namespace'] == namespace and 'sampler_' in row['name']
                        for row in list_named_actors(all_namespaces=True))
         evidence['confirmed_release'] = True
+        if not extended and evidence.get('scaling_complete'):
+            evidence['passed'] = True
         save()
     evidence['passed'] = True
     save()
 
 
-def test_real_pool_lifecycle():
+def _run_real_pool(*, extended):
     import ray
     import twinkle
     from ray import serve
@@ -360,7 +371,15 @@ def test_real_pool_lifecycle():
              _temp_dir='/tmp/twp-' + namespace[-8:], include_dashboard=False, dashboard_port=0)
     try:
         serve.start(http_options={'host': '127.0.0.1', 'port': 0})
-        asyncio.run(exercise(model, directory, namespace, evidence))
+        asyncio.run(exercise(model, directory, namespace, evidence, extended=extended))
     finally:
         serve.shutdown()
         ray.shutdown()
+
+
+def test_real_pool_scaling():
+    _run_real_pool(extended=False)
+
+
+def test_real_pool_lifecycle():
+    _run_real_pool(extended=True)

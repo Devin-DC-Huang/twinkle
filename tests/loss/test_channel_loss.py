@@ -158,6 +158,7 @@ def test_transformers_forward_keeps_loss_metadata_out_of_model_call():
         train_status=status,
         accumulate_metrics=lambda _: None,
     )
+    group.get_loss = lambda _key=None: group.loss_instance
     model.optimizer_group = {'': group}
 
     TransformersModel.forward.__wrapped__(model, inputs={
