@@ -18,8 +18,11 @@ def test_st_http_training_isolation_and_resume(tmp_path):
     directory.mkdir(parents=True, exist_ok=True)
     command = [sys.executable, '-u', str(Path(__file__).with_name('validation.py')),
                '--model', model, '--run-dir', str(directory)]
+    root = Path(__file__).resolve().parents[4]
+    env = {**os.environ, 'PYTHONPATH': os.pathsep.join(filter(None, (
+        str(root / 'src'), str(root), os.environ.get('PYTHONPATH'))))}
     with (directory / 'server-and-client.log').open('w') as output:
-        result = subprocess.run(command, stdout=output, stderr=subprocess.STDOUT, timeout=1800)
+        result = subprocess.run(command, stdout=output, stderr=subprocess.STDOUT, env=env, timeout=1800)
     assert result.returncode == 0, (directory / 'server-and-client.log').read_text()[-6000:]
     evidence = json.loads((directory / 'results.json').read_text())
     assert evidence['passed'] and evidence['slot_reuse']
