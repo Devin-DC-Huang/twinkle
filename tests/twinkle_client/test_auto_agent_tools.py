@@ -82,8 +82,11 @@ def test_generated_server_config_matches_launcher_schema(tmp_path, monkeypatch, 
     assert gateway.deployments[0]['name'] == 'GatewayServer'
     assert gateway.args.supported_models == ['Qwen/student'] + [s['model_id'] for s in samplers]
     application = next(app for app in config.applications if app.import_path == 'model')
+    assert application.name == 'models-student'
     assert application.args.train_mode == 'lora'
+    assert application.args.adapter_config.adapter_timeout == 600
     model = config.training_config.models[0]
+    assert model.env_vars['TWINKLE_TRUST_REMOTE_CODE'] == '1'
     assert model.mode == 'lora'
     assert model.config.min_replicas == 0 and model.config.max_replicas == 1
     assert model.config.num_devices == 2 and model.config.idle_timeout_s == 600
