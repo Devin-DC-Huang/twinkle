@@ -31,7 +31,7 @@ ST 首版在服务配置中显式使用 `gradient_checkpointing: false`；这是
 
 ## 运行示例
 
-先在服务端安装 `requirements-st.txt`，启动：
+在已就绪的 Twinkle 设备环境中，用 `--no-deps` 安装 `requirements-st.txt` 的固定 Swift/ST 版本，缺失的 ST 常规依赖单独补齐，然后启动：
 
 ```bash
 python -m twinkle.server launch --config cookbook/client/swift_model/sentence_transformer_config.yaml
@@ -45,3 +45,21 @@ python cookbook/client/swift_model/sentence_transformer_client.py --base-url htt
 先完成 on-demand 普通模型的设备验收，再运行 ST 链路：冷启动 → 创建两个 adapter → 设置 embedding processor、loss 和 optimizer → 训练与读取向量 → 保存 adapter → 释放并重建 handle → 恢复 optimizer 和进度 → 继续训练 → 释放并复用槽位。
 对照同一原始 ST 模型、模块配置和精度，比较池化、投影、归一化后的向量及参数更新；同时检查租户间 optimizer、进度、模板与权重不串用。
 首版限定 LoRA，不扩展全参、SP 或 padding-free。
+
+## 验收状态（2026-10-26）
+
+普通模型的 PPU on-demand 训练已验证冷启动、共享容量、Full 独占、去重、故障恢复、Redis 重启和资源释放；恢复后继续训练的 logprob 最大误差为 0。
+本地 ST 回归覆盖 Pooling、Dense、Normalize 流水线与租户 optimizer、进度、模板和槽位隔离。all-MiniLM-L6-v2 的 CPU 裸库训练、adapter 恢复和继续训练也已通过。
+
+**真实 ST HTTP / PPU 验收尚未完成。** PPU 主机 SSH 持续超时，当前不能将其标为通过。
+采样池完整设备用例已验证 `1→2` 和执行中的请求保留，但在后续 Full checkpoint IPC 热更新中超时，尚未走到缩容；该 IPC 问题单独记录，不纳入本次修复。独立的 `test_real_pool_scaling` 保留 `1→2→1` 与确认释放的完整断言，待设备恢复后执行。
+
+独立设备验收入口（需要两张已确认空闲的卡；CS 使用物理卡 0，裸库对照进程使用物理卡 1）：
+
+```bash
+TWINKLE_TEST_ST_CS=1 TWINKLE_TEST_ST_MODEL=/absolute/ST/model/cache \
+CUDA_VISIBLE_DEVICES=0 python -m pytest --noconftest \
+  tests/server/integration/st_cs/test_http_e2e.py -q
+```
+
+采样扩缩容入口使用 `TWINKLE_TEST_REAL_POOL=1`、`TWINKLE_TEST_POOL_DEVICES=2`、`TWINKLE_TEST_MODEL_PATH` 和 `TWINKLE_TEST_ARTIFACT_DIR`，选择 `tests/server/integration/sampler/test_real_pool_e2e.py::test_real_pool_scaling`。原有 `test_real_pool_lifecycle` 继续保留 Full 热更新、LoRA 驱逐及故障恢复等扩展断言。
