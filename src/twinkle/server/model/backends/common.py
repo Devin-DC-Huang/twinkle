@@ -6,7 +6,7 @@ Shared helpers and base classes for backend model implementations.
 import re
 from collections.abc import Mapping
 from numbers import Number
-from typing import Any, List
+from typing import Any
 
 import numpy as np
 import torch
