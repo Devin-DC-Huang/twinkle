@@ -44,6 +44,8 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         max_length: int = 8192,
         target_modules: list[str] | str = "all-linear",
         model_loader: ModelLoaderProtocol | None = None,
+        gradient_checkpointing: bool = True,
+        gradient_checkpointing_kwargs: dict[str, Any] | None = None,
         acc_strategy: str = "token",
         model_arch: dict[str, Any] | None = None,
         **kwargs,
@@ -126,7 +128,10 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         # Initialize expert parallel attributes (required by set_optimizer in TransformersModel)
         self.optimizer_group: dict[str, OptimizerGroup] = {}
         self.multi_adapter = MultiLora(max_loras=max_loras, max_r=max_r, max_length=max_length)
-        self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        if gradient_checkpointing:
+            self.model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False, **(gradient_checkpointing_kwargs or {})}
+            )
         self.model = self.multi_adapter.patch(self.model, target_modules=target_modules, lora_config=self.lora_config)
         # PEFT creates LoRA parameters in FP32 even when the base model uses a
         # lower-precision dtype. Align the preallocated slots before FSDP2

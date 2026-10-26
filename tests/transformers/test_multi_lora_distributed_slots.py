@@ -14,6 +14,21 @@ from twinkle.model.multi_lora import MultiLora
 from twinkle.model.transformers.multi_lora_transformers import MultiLoraTransformersModel
 
 
+@pytest.mark.parametrize('enabled', [False, True])
+def test_gradient_checkpointing_option_reaches_the_backbone(enabled, monkeypatch):
+    from transformers import AutoModel, BertConfig
+    from twinkle import DeviceMesh, Platform, initialize
+    monkeypatch.setenv('ACCELERATE_USE_CPU', 'true')
+    monkeypatch.setattr(Platform, 'get_local_device', lambda *args, **kwargs: 'cpu')
+    initialize(mode='local')
+    model = MultiLoraTransformersModel(
+        model_cls=AutoModel, config=BertConfig(vocab_size=16, hidden_size=8, num_hidden_layers=1,
+                                              num_attention_heads=2, intermediate_size=16),
+        device_mesh=DeviceMesh.from_sizes(device_type='cpu', dp_size=1), mixed_precision='no',
+        max_loras=1, max_r=2, target_modules=['query', 'value'], gradient_checkpointing=enabled)
+    assert model.model.base_model.model.is_gradient_checkpointing is enabled
+
+
 def _wrapper(module, manager, wrap_model):
     wrapper = object.__new__(MultiLoraTransformersModel)
     torch.nn.Module.__init__(wrapper)

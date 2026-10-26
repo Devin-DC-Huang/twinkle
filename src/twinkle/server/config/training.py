@@ -56,6 +56,8 @@ class TrainingArguments(BaseModel):
     max_length: int | None = Field(default=None, gt=0, strict=True)
     model_cls: str | None = None
     model_loader: str | None = None
+    gradient_checkpointing: bool | None = Field(default=None, strict=True)
+    mixed_precision: Literal["no", "fp8", "fp16", "bf16"] | None = None
 
     @model_validator(mode="after")
     def _validate_replicas(self):
@@ -94,6 +96,10 @@ class ModelArgs(TrainingArguments, LoraArguments):
     def _validate_spectral_backend(self):
         if self.strategy is not None and self.backend != "transformers":
             raise ValueError("strategy is only supported by the transformers backend")
+        if self.backend != "transformers" and (
+            self.gradient_checkpointing is not None or self.mixed_precision is not None
+        ):
+            raise ValueError("gradient_checkpointing and mixed_precision require the transformers backend")
         if self.hybrid is not None:
             if self.backend != "transformers":
                 raise ValueError("hybrid is only supported by the transformers backend")
@@ -187,6 +193,10 @@ class TrainingModelConfig(BaseModel):
             raise ValueError("device_mesh.device_type must match device_type")
         if self.config.strategy is not None and self.backend != "transformers":
             raise ValueError("strategy requires the transformers backend")
+        if self.backend != "transformers" and (
+            self.config.gradient_checkpointing is not None or self.config.mixed_precision is not None
+        ):
+            raise ValueError("gradient_checkpointing and mixed_precision require the transformers backend")
         if isinstance(self.config, LoraTrainingConfig) and self.config.hybrid and self.backend != "transformers":
             raise ValueError("hybrid requires the transformers backend")
         if self.config.model_cls is not None:

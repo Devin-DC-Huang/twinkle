@@ -41,7 +41,8 @@ async def test_custom_model_specs_survive_catalog_roundtrip_and_worker_construct
 
     app = model_application()
     # These modules deliberately do not exist on the gateway. Resolution belongs to workers.
-    app['args'].update(model_cls='worker_only.encoder:Model', model_loader='worker_only.loader:load')
+    app['args'].update(model_cls='worker_only.encoder:Model', model_loader='worker_only.loader:load',
+                       gradient_checkpointing=False, mixed_precision='no')
     catalog = ServerConfig(applications=[app]).training_config
     spec = TrainingModelConfig.model_validate_json(catalog.models[0].model_dump_json())
     captured = Mock(return_value=object())
@@ -57,6 +58,8 @@ async def test_custom_model_specs_survive_catalog_roundtrip_and_worker_construct
                                       base_model=spec.name, mode='lora', startup_deadline=0), spec)
     assert captured.call_args.kwargs['model_cls'] == app['args']['model_cls']
     assert captured.call_args.kwargs['model_loader'] == app['args']['model_loader']
+    assert captured.call_args.kwargs['gradient_checkpointing'] is False
+    assert captured.call_args.kwargs['mixed_precision'] == 'no'
     driver.runtime.deploy.assert_awaited_once()
 
 
@@ -72,6 +75,15 @@ def test_custom_model_class_rejects_incompatible_training_modes(mutation):
         app['args']['backend'] = 'megatron'
     with pytest.raises(ValidationError, match='model_cls'):
         ServerConfig(applications=[app])
+
+
+def test_st_example_is_a_cold_on_demand_custom_model():
+    config = ServerConfig.from_yaml('cookbook/client/swift_model/sentence_transformer_config.yaml')
+    model = config.training_config.models[0]
+    assert model.config.model_cls.endswith(':MultiLoraSentenceTransformerModel')
+    assert model.config.gradient_checkpointing is False
+    assert model.config.mixed_precision == 'no'
+    assert (model.config.min_replicas, model.config.max_replicas, model.capacity) == (0, 1, 2)
 
 
 def test_catalog_defaults_and_mode_selection():
