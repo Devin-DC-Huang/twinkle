@@ -1,5 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Real vLLM pool acceptance. Run only on four dedicated devices with the PPU SDK loaded."""
+"""Real vLLM pool acceptance. Run only on two or four dedicated devices with the PPU SDK loaded."""
 import asyncio
 import json
 import math
@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 pytestmark = pytest.mark.skipif(os.environ.get('TWINKLE_TEST_REAL_POOL') != '1',
-                                reason='Requires four dedicated devices and a real cached model')
+                                reason='Requires two or four dedicated devices and a real cached model')
 
 
 @pytest.fixture(scope='session', autouse=True)
@@ -76,25 +76,30 @@ async def exercise(model, directory, namespace, evidence):
     from twinkle.server.sampler.pool.driver import SamplerDriver
     from twinkle.server.state import get_server_state
 
+    devices_count = int(os.environ.get('TWINKLE_TEST_POOL_DEVICES', '4'))
+    assert devices_count in (2, 4)
+    minimum = devices_count // 2
     args = SamplerArgs(model_id=str(model), sampler_type='vllm',
                        device_group={'name': 'sampler', 'ranks': 1, 'device_type': 'cuda'},
                        device_mesh={'device_type': 'cuda', 'dp_size': 1},
                        engine_args={'max_model_len': 2048, 'gpu_memory_utilization': .4, 'enable_lora': True,
                                     'enforce_eager': True, 'logprobs_mode': 'processed_logprobs',
                                     'attention_config': {'flash_attn_version': 3}},
-                       min_replicas=2, max_replicas=4, target_ongoing_requests=1, idle_timeout_s=2,
-                       queue_config={'execution_timeout': 600, 'queue_timeout': 600})
+                       min_replicas=minimum, max_replicas=devices_count, target_ongoing_requests=1, idle_timeout_s=2,
+                       queue_config={'execution_timeout': 600, 'queue_timeout': 600, 'inline_fast_path_timeout': 0.01})
     budgets = {'allocation_timeout_s': 60, 'startup_timeout_s': 900,
                'shutdown_timeout_s': 180, 'sweep_interval_s': 1}
     driver = SamplerDriver(args, namespace, 'real-pool', {}, budgets)
-    pool = SamplerController(args, driver, budgets)
+    clock_offset = [0]
+    pool = SamplerController(args, driver, budgets, clock=lambda: time.monotonic() + clock_offset[0])
     pools = [pool]
     state = get_server_state()
     tokenizer = AutoTokenizer.from_pretrained(str(model), local_files_only=True)
-    ids = tokenizer.apply_chat_template([{'role': 'user', 'content': 'Count the integers from one to one hundred.'}],
+    ids = tokenizer.apply_chat_template([{'role': 'user', 'content': 'Count the integers from one to one hundred thousand.'}],
                                        tokenize=True, add_generation_prompt=True, enable_thinking=False,
                                        return_dict=False)
     calls = []
+    futures = []
     invoke = driver.invoke
 
     async def observed(instance, ticket, body, queue=None):
@@ -112,6 +117,7 @@ async def exercise(model, directory, namespace, evidence):
         assert reply['status'] == 200, reply
         result = json.loads(reply['body'])
         request_id = result['request_id']
+        futures.append(request_id)
         deadline = time.monotonic() + 600
         while result['status'] not in ('completed', 'failed', 'cancelled'):
             assert time.monotonic() < deadline, result
@@ -154,13 +160,13 @@ async def exercise(model, directory, namespace, evidence):
 
         await verify_worker_origins()
         save()
-        await asyncio.gather(*(sample(max_tokens=256) for _ in range(8)))
+        await asyncio.gather(*(sample(max_tokens=256) for _ in range(2 * devices_count)))
         await settled()
-        assert len(pool._ready_instances()) == 4
+        assert len(pool._ready_instances()) == devices_count
         devices = [device for instance in pool._ready_instances() for device in instance.devices]
-        assert len(devices) == len(set(devices)) == 4
+        assert len(devices) == len(set(devices)) == devices_count
         calls.clear()
-        samples = await asyncio.gather(*(sample(max_tokens=128) for _ in range(8)))
+        samples = await asyncio.gather(*(sample(max_tokens=128) for _ in range(2 * devices_count)))
         await settled()
         await verify_worker_origins()
         evidence['sample_result'] = samples[0]
@@ -168,8 +174,28 @@ async def exercise(model, directory, namespace, evidence):
         for instance in pool._ready_instances():
             assert not (await driver.health(instance))['unhealthy']
         evidence.update(device_ids=devices, request_placements=list(calls))
-        evidence['sizes'].append(4)
+        evidence['sizes'].append(devices_count)
         save()
+
+        # Observe real running compute before moving the idle clock past its deadline.
+        futures.clear()
+        active = [asyncio.create_task(sample(max_tokens=1024)) for _ in range(devices_count)]
+        try:
+            deadline = time.monotonic() + 30
+            while True:
+                records = [await state.get_future(identity) for identity in futures]
+                if (len(records) == devices_count and all(row['status'] == 'running' for row in records)
+                        and all(instance.requests for instance in pool._ready_instances())):
+                    break
+                assert time.monotonic() < deadline and not any(task.done() for task in active), records
+                await asyncio.sleep(.01)
+            clock_offset[0] += 10
+            await pool.sweep()
+            assert len(pool._ready_instances()) == devices_count
+            evidence['active_compute_sweep_safe'] = True
+        finally:
+            await asyncio.gather(*active)
+            await settled()
 
         # Pause the ACK after a real backend update, then sweep across the idle window.
         entered, resume = asyncio.Event(), asyncio.Event()
@@ -186,7 +212,7 @@ async def exercise(model, directory, namespace, evidence):
             await asyncio.wait_for(entered.wait(), 120)
             await asyncio.sleep(2.1)
             await pool.sweep()
-            assert len(pool._ready_instances()) == 4
+            assert len(pool._ready_instances()) == devices_count
         finally:
             resume.set()
             await update
@@ -211,7 +237,7 @@ async def exercise(model, directory, namespace, evidence):
             await asyncio.wait_for(entered.wait(), 180)
             await asyncio.sleep(2.1)
             await pool.sweep()
-            assert len(pool._ready_instances()) == 4
+            assert len(pool._ready_instances()) == devices_count
         finally:
             resume.set()
             await update
@@ -223,11 +249,11 @@ async def exercise(model, directory, namespace, evidence):
         await pool.sweep()
         await settled()
         evidence['sizes'].append(len(pool._ready_instances()))
-        assert evidence['sizes'] == [2, 4, 2]
+        assert evidence['sizes'] == [minimum, devices_count, minimum]
         save()
-        await asyncio.gather(*(sample(max_tokens=128) for _ in range(8)))
+        await asyncio.gather(*(sample(max_tokens=128) for _ in range(2 * devices_count)))
         await settled()
-        assert len(pool._ready_instances()) == 4
+        assert len(pool._ready_instances()) == devices_count
         evidence['superseded_checkpoint_rebuild'] = True
 
         lora = make_lora(model, directory / 'lora')
@@ -329,7 +355,8 @@ def test_real_pool_lifecycle():
                       TWINKLE_DEFAULT_SAVE_DIR=str(directory / 'checkpoints'))
     evidence = {'namespace': namespace, 'model': str(model), 'import': twinkle.__file__,
                 'sha': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()}
-    ray.init(address='local', namespace=namespace, num_cpus=24, num_gpus=4,
+    ray.init(address='local', namespace=namespace, num_cpus=24,
+             num_gpus=int(os.environ.get('TWINKLE_TEST_POOL_DEVICES', '4')),
              _temp_dir='/tmp/twp-' + namespace[-8:], include_dashboard=False, dashboard_port=0)
     try:
         serve.start(http_options={'host': '127.0.0.1', 'port': 0})
