@@ -793,9 +793,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
                 # Log the rank-attributed failure, then re-raise: swallowing it would let this DP
                 # rank skip the PP collectives while the others wait, and a degraded value would
                 # mask the failure.
-                logger.warning(
-                    "[forward_step] data processing error on rank: %s: %s", type(e).__name__, e
-                )
+                logger.warning("[forward_step] data processing error on rank: %s: %s", type(e).__name__, e)
                 raise
             return output_tensor, partial(
                 post_loss_function,
