@@ -1504,6 +1504,15 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         (exclusive) model, so the next tenant starts from clean pretrained
         weights instead of the previous tenant's trained weights.
         """
+        if kwargs.get('reset_training_state', False):
+            for optimizer_group in self.optimizer_group.values():
+                self.unregister_mm_forward_hook(optimizer_group)
+            self.optimizer_group = {_default_adapter_name: self._construct_default_optimizer_group()}
+            self.optimizer_group[_default_adapter_name].adapter_name = _default_adapter_name
+            self.active_group = _default_adapter_name
+            if self._model_wrapped:
+                self.register_mm_forward_hook(self.optimizer_group[_default_adapter_name])
+
         if not self.model_id:
             logger.warning('reload_initial_weights skipped: model_id is not set (blank model).')
             return

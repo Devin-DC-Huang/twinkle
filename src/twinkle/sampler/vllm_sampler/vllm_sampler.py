@@ -143,17 +143,24 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
             except Exception as exc:
                 q.put(exc)
             finally:
-                q.put(_SENTINEL)
+                try:
+                    await async_gen_coro.aclose()
+                finally:
+                    q.put(_SENTINEL)
 
-        asyncio.run_coroutine_threadsafe(_drain(), self._async_loop)
-
-        while True:
-            item = q.get()
-            if item is _SENTINEL:
-                break
-            if isinstance(item, Exception):
-                raise item
-            yield item
+        generation = asyncio.run_coroutine_threadsafe(_drain(), self._async_loop)
+        try:
+            while True:
+                item = q.get()
+                if item is _SENTINEL:
+                    break
+                if isinstance(item, Exception):
+                    raise item
+                yield item
+        finally:
+            # Queue termination or closing the Python iterator is not evidence
+            # that the engine-loop task has exited. Join before releasing weights.
+            generation.result()
 
     async def _create_engine_async(self, engine_cls, model_id, engine_kwargs):
         """Create engine in async context to ensure output_handler starts correctly."""
