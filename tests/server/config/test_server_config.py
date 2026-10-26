@@ -106,7 +106,7 @@ def test_nested_field_constraint_violation_named(bad_max_input_tokens: int) -> N
     assert any('max_input_tokens' in err['loc'] for err in errors)
 
 
-def test_torch_sampler_is_rejected_during_config_validation() -> None:
+def test_unknown_sampler_is_rejected_during_config_validation() -> None:
     with pytest.raises(ValidationError):
         ApplicationSpec.model_validate({
             'name': 'sampler',
@@ -115,15 +115,23 @@ def test_torch_sampler_is_rejected_during_config_validation() -> None:
                 'model_id': 'm',
                 'device_group': {},
                 'device_mesh': {},
-                'sampler_type': 'torch',
+                'sampler_type': 'unknown_sampler',
             },
         })
 
 
 def test_sampler_docstring_values_match_selector() -> None:
     doc = build_sampler_app.__doc__ or ''
-    line = next(line for line in doc.splitlines() if 'sampler_type:' in line)
+    line = doc[doc.index('sampler_type:'):].split('Validated up front')[0]
     assert set(re.findall(r'``(\w+)``', line)) == set(SAMPLER_SELECTOR.builders)
+
+
+@pytest.mark.parametrize('sampler_type', ['torch', 'sglang_async'])
+def test_dev_sampler_extensions_remain_available(sampler_type):
+    app = ApplicationSpec.model_validate({
+        'name': 'sampler', 'import_path': 'sampler', 'args': {
+            'model_id': 'm', 'device_group': {}, 'device_mesh': {}, 'sampler_type': sampler_type}})
+    assert app.args.sampler_type == sampler_type
 
 
 # ---------- round-trip fidelity ----------------------------------------- #

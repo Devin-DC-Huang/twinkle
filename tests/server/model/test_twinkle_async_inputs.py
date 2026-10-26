@@ -259,6 +259,12 @@ async def test_checkpoint_consumers_keep_backend_path_and_options(monkeypatch, t
         service.model.resume_from_checkpoint.return_value = {'step': 7}
     else:
         body = types.UploadToHubRequest(checkpoint_dir=path, hub_model_id='org/output', hub_token='hub-token')
+        if not local:
+            # A hub model ID is accepted by load/resume; upload requires an owned local checkpoint.
+            with pytest.raises(ValueError, match='Path escapes the permitted directory'):
+                await endpoint(request, body, service)
+            service.model.upload_to_hub.assert_not_called()
+            return
     response = await endpoint(request, body, service)
 
     if operation == 'load':

@@ -10,9 +10,10 @@ from twinkle.model.transformers.transformers import TransformersModel
 
 
 def test_forward_kwargs_do_not_duplicate_metric_control_parameters():
-    metric = Mock()
+    metric = Mock(_twinkle_loss_key=None)
     kwargs = {'gradient_accumulation_steps': 2, 'lr': 99, 'step': 99, 'grad_norm': 99, 'loss_reduction': 'sum'}
-    status = TrainStatus(inputs=[{}], outputs={'loss': 1.0}, metrics=[metric], forward_kwargs=kwargs)
+    status = TrainStatus(inputs=[{}], outputs={'loss': 1.0}, metrics=[metric], forward_kwargs=kwargs,
+                         loss_reduction='sum')
     group = BaseOptimizerGroup(train_status=status, cur_step=3, gradient_accumulation_steps=2)
     group.accumulate_metrics(True)
     metric.accumulate.assert_called_once_with(

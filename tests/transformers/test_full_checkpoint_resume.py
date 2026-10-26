@@ -30,7 +30,9 @@ def test_full_resume_restores_weights_and_optional_training_state(tmp_path, weig
                                                    cur_step=0, gradient_accumulation_steps=1)}
     result = wrapper.resume_from_checkpoint(str(tmp_path), resume_only_model=weights_only)
     assert model(torch.ones(1, 1)).item() == 2
-    assert result['cur_step'] == 3
+    # dev's weights-only contract starts fresh progress as well as fresh optimizer state.
+    assert result['cur_step'] == (0 if weights_only else 3)
+    assert result['consumed_train_samples'] == (0 if weights_only else 12)
     if weights_only:
         assert not optimizer.state
         assert wrapper.optimizer_group[''].cur_step == 0
