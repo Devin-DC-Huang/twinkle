@@ -1,295 +1,436 @@
-# GRPO-family variant losses (plan T10a-04..T10a-11, T10a-14, T10a-15):
-# GPG / DRO / GeoMean / KLCov / ClipCov / DPPO-TV / DPPO-KL / REAL / compute_sdar_loss / MOPDLoss.
+# Copyright (c) ModelScope Contributors. All rights reserved.
+"""Tests for the GRPO-family variants that reshape the surrogate beyond PPO clipping.
+
+Covers GPG, DRO, DPPO-TV, DPPO-KL, GeoMean and REAL, plus numeric assertions for the
+variants that previously had only a finite-loss smoke test (GSPO, SAPO, CISPO, DR-GRPO).
+"""
 import math
 
 import pytest
 import torch
 
-from twinkle.loss import (ClipCovLoss, DPPOKLLoss, DPPOTVLoss, DROLoss, GPGLoss, GeoMeanLoss, KLCovLoss,
-                          MOPDLoss, OPSDLoss, REALLoss)
-from twinkle.loss.sdar import compute_sdar_loss
+from twinkle.loss import (
+    CISPOLoss,
+    DPPOKLLoss,
+    DPPOTVLoss,
+    DROLoss,
+    DRGRPOLoss,
+    GeoMeanLoss,
+    GPGLoss,
+    GRPOLoss,
+    GSPOLoss,
+    REALLoss,
+    SAPOLoss,
+    torch_loss_mapping,
+)
 
 
-def _rl_batch(batch_size=2, seq_len=4, gap=0.0, adv=1.0):
-    """A fully-valid [B, T] batch with per-token-constant logps and old_logps.
-
-    ``gap`` sets old_logps = logps - gap (a constant per-token log-ratio of ``gap``),
-    ``adv`` sets a constant per-token advantage. All masks are ones so every loss family
-    shares the same aggregation denominators.
-    """
-    labels = torch.ones(batch_size, seq_len, dtype=torch.long)
-    logps = torch.full((batch_size, seq_len), 0.3)
-    old_logps = logps - gap
-    advantages = torch.full((batch_size, seq_len), adv)
-    return {'labels': labels}, {'logps': logps}, old_logps, advantages
+def _k3_kl(logps, ref_logps, loss_mask):
+    """k3 reference-KL term used by every variant's optional ``beta`` penalty."""
+    delta = ref_logps - logps
+    return torch.exp(delta) - delta - 1
 
 
-def _loss(fn, batch, ref_logps=None, **extra):
-    inputs, outputs, old_logps, advantages = batch
-    return fn(inputs, outputs, old_logps=old_logps, ref_logps=ref_logps, advantages=advantages,
-              **extra)['loss'].item()
+def _seq_mean(per_token_loss, loss_mask):
+    """The GRPOLoss default aggregation: token-mean per sequence, then batch mean."""
+    return ((per_token_loss * loss_mask).sum(-1) / loss_mask.sum(-1).clamp(min=1.0)).mean()
 
 
 class TestGPGLoss:
-    """T10a-04 (GPG half): pure REINFORCE -- the ratio is ignored."""
 
-    def test_equals_neg_mean_logps_times_adv(self):
-        # per_token = -logps * adv; with the default token-mean aggregation this is exact.
-        fn = GPGLoss()
-        loss = _loss(fn, _rl_batch(adv=1.0))
-        assert loss == pytest.approx(-0.3, abs=1e-6)
-        # Doubling the advantage doubles the loss (the ratio never enters).
-        loss2 = _loss(fn, _rl_batch(adv=2.0))
-        assert loss2 == pytest.approx(2 * loss, abs=1e-6)
+    def test_matches_reinforce_formula(self):
+        labels = torch.tensor([[1, 1, -100], [1, 1, -100]])
+        logps = torch.tensor([[-0.5, -0.5, 0.0], [-1.0, -1.0, 0.0]])
+        advantages = torch.tensor([[2.0], [3.0]])
 
-    def test_ratio_ignored(self):
-        # A nonzero old_logps gap must NOT change GPG's loss (no importance ratio).
-        a = _loss(GPGLoss(), _rl_batch(gap=0.0))
-        b = _loss(GPGLoss(), _rl_batch(gap=1.0))
-        assert a == pytest.approx(b, abs=1e-9)
+        result = GPGLoss()({'labels': labels}, {'logps': logps}, advantages=advantages)
+
+        # Row 0: -(-0.5) * 2 = 1.0 per token. Row 1: -(-1.0) * 3 = 3.0 per token.
+        assert result['loss'].item() == pytest.approx(2.0)
+
+    def test_ignores_the_importance_ratio(self):
+        labels = torch.tensor([[1, 1]])
+        logps = torch.tensor([[-0.5, -0.5]])
+        advantages = torch.tensor([[1.0]])
+
+        loss_fn = GPGLoss()
+        on_policy = loss_fn({'labels': labels}, {'logps': logps}, old_logps=logps, advantages=advantages)
+        off_policy = loss_fn({'labels': labels}, {'logps': logps}, old_logps=logps - 1.0, advantages=advantages)
+
+        torch.testing.assert_close(off_policy['loss'], on_policy['loss'])
+        assert on_policy['loss'].item() == pytest.approx(0.5)
+
+    def test_differs_from_clipped_grpo_on_the_same_batch(self):
+        labels = torch.tensor([[1, 1]])
+        logps = torch.tensor([[-0.5, -0.5]])
+        old_logps = torch.tensor([[-1.5, -1.5]])  # ratio = e > 1 + epsilon
+        advantages = torch.tensor([[1.0]])
+
+        gpg = GPGLoss()({'labels': labels}, {'logps': logps}, old_logps=old_logps, advantages=advantages)
+        grpo = GRPOLoss()({'labels': labels}, {'logps': logps}, old_logps=old_logps, advantages=advantages)
+
+        # GRPO clips the ratio at 1.2 -> -1.2 per token; GPG stays at -logp * adv = 0.5.
+        assert grpo['loss'].item() == pytest.approx(-1.2)
+        assert gpg['loss'].item() == pytest.approx(0.5)
+
+    def test_zero_advantage_gives_zero(self):
+        labels = torch.tensor([[1, 1]])
+        logps = torch.tensor([[-0.5, -0.5]])
+        result = GPGLoss()({'labels': labels}, {'logps': logps}, advantages=torch.zeros(1, 1))
+        assert result['loss'].item() == pytest.approx(0.0)
+
+    def test_registered_in_mapping(self):
+        assert torch_loss_mapping.get('gpg') is GPGLoss
 
 
 class TestDROLoss:
-    """T10a-04 (DRO half): quadratic log-ratio penalty on top of REINFORCE."""
 
-    def test_penalty_gap_hand_computed(self):
-        # DRO - GPG on the same batch = mean(0.5 * dro_beta * gap^2) over valid tokens.
-        gap, dro_beta = 0.4, 0.1
-        batch = _rl_batch(gap=gap)
-        dro = _loss(DROLoss(dro_beta=dro_beta), batch)
-        gpg = _loss(GPGLoss(), batch)
-        expected_penalty = 0.5 * dro_beta * gap * gap
-        assert dro - gpg == pytest.approx(expected_penalty, abs=1e-6)
+    def test_matches_quadratic_log_ratio_formula(self):
+        labels = torch.tensor([[1, 1, -100]])
+        logps = torch.tensor([[-0.6, -0.4, 0.0]])
+        old_logps = torch.tensor([[-0.4, -0.2, 0.0]])  # log ratio = -0.2
+        advantages = torch.tensor([[1.0]])
 
-    def test_zero_gap_equals_gpg(self):
-        batch = _rl_batch(gap=0.0)
-        assert _loss(DROLoss(dro_beta=0.5), batch) == pytest.approx(_loss(GPGLoss(), batch), abs=1e-9)
+        result = DROLoss(dro_beta=0.5)(
+            {'labels': labels}, {'logps': logps}, old_logps=old_logps, advantages=advantages)
 
-    def test_invalid_beta_raises(self):
+        # per_token = -(logp * adv - 0.5 * beta * log_ratio^2)
+        expected_per_token = -((-0.6) * 1.0 - 0.5 * 0.5 * 0.04)
+        expected_per_token_next = -((-0.4) * 1.0 - 0.5 * 0.5 * 0.04)
+        assert result['loss'].item() == pytest.approx((expected_per_token + expected_per_token_next) / 2)
+
+    def test_quadratic_penalty_is_symmetric_in_the_log_ratio(self):
+        loss_fn = DROLoss(dro_beta=0.2)
+        labels = torch.tensor([[1]])
+        logps = torch.tensor([[-0.5]])
+        advantages = torch.zeros(1, 1)
+
+        up = loss_fn({'labels': labels}, {'logps': logps}, old_logps=logps - 0.3, advantages=advantages)
+        down = loss_fn({'labels': labels}, {'logps': logps}, old_logps=logps + 0.3, advantages=advantages)
+
+        torch.testing.assert_close(up['loss'], down['loss'])
+        assert up['loss'].item() == pytest.approx(0.5 * 0.2 * 0.09)
+
+    def test_penalty_uses_the_unclamped_log_ratio(self):
+        """The base GRPO path clamps the log ratio at ±5; DRO's penalty must not."""
+        labels = torch.tensor([[1]])
+        logps = torch.tensor([[-0.5]])
+        old_logps = torch.tensor([[9.5]])  # log ratio = -10, beyond the base ±5 clamp
+        result = DROLoss(dro_beta=0.1)(
+            {'labels': labels}, {'logps': logps}, old_logps=old_logps, advantages=torch.zeros(1, 1))
+
+        # 0.5 * 0.1 * 100 = 5.0 (a ±5-clamped ratio would give 1.25).
+        assert result['loss'].item() == pytest.approx(5.0)
+
+    def test_rejects_non_positive_beta(self):
         with pytest.raises(ValueError, match='dro_beta'):
             DROLoss(dro_beta=0.0)
 
-    def test_kl_penalty_adds(self):
-        batch = _rl_batch(gap=0.5)
-        ref = torch.full((2, 4), 0.1)
-        without = _loss(DROLoss(dro_beta=0.1, beta=0.0), batch)
-        with_kl = _loss(DROLoss(dro_beta=0.1, beta=0.01), batch, ref_logps=ref)
-        assert with_kl > without
+    def test_adds_reference_kl_penalty(self):
+        labels = torch.tensor([[1, 1]])
+        logps = torch.tensor([[-0.5, -1.0]])
+        old_logps = torch.tensor([[-0.6, -1.1]])
+        ref_logps = torch.tensor([[-0.7, -0.8]])
+        advantages = torch.tensor([[1.0]])
+        mask = labels != -100
+
+        plain = DROLoss(dro_beta=0.5)(
+            {'labels': labels}, {'logps': logps}, old_logps=old_logps, advantages=advantages)
+        with_kl = DROLoss(dro_beta=0.5, beta=0.01)(
+            {'labels': labels}, {'logps': logps}, old_logps=old_logps, ref_logps=ref_logps,
+            advantages=advantages)
+
+        expected = plain['loss'] + 0.01 * _seq_mean(_k3_kl(logps, ref_logps, mask), mask)
+        torch.testing.assert_close(with_kl['loss'], expected)
+
+    def test_registered_in_mapping(self):
+        assert torch_loss_mapping.get('dro') is DROLoss
+
+
+class TestDPPOTVLoss:
+
+    def test_masks_positive_advantage_tokens_beyond_the_tv_threshold(self):
+        labels = torch.tensor([[1, 1]])
+        logps = torch.tensor([[0.0, -math.log(2)]])
+        old_logps = torch.tensor([[-math.log(2), -math.log(2)]])
+        advantages = torch.tensor([[1.0]])
+
+        result = DPPOTVLoss(epsilon=0.2)({'labels': labels}, {'logps': logps}, old_logps=old_logps,
+                                         advantages=advantages)
+
+        # Token 0: prob - old_prob = 0.5 > epsilon_high -> invalid. Token 1 survives with ratio 1.
+        assert result['loss'].item() == pytest.approx(math.log(2) / 2)
+
+    def test_negative_advantage_uses_the_low_divergence_branch(self):
+        labels = torch.tensor([[1, 1]])
+        logps = torch.tensor([[0.0, -math.log(2)]])
+        old_logps = torch.tensor([[-math.log(2), -math.log(2)]])
+        advantages = torch.tensor([[-1.0]])
+
+        result = DPPOTVLoss(epsilon=0.2)({'labels': labels}, {'logps': logps}, old_logps=old_logps,
+                                         advantages=advantages)
+
+        # Token 0 is now valid (0.5 >= -epsilon). Token 1 contributes +log(2); token 0 contributes 0.
+        assert result['loss'].item() == pytest.approx(-math.log(2) / 2)
+
+    def test_truncates_the_ratio_at_clip_ratio_c(self):
+        labels = torch.tensor([[1]])
+        logps = torch.tensor([[-5.0]])
+        old_logps = torch.tensor([[-10.0]])  # ratio = exp(5) ~= 148, truncated to 20
+        advantages = torch.tensor([[1.0]])
+
+        result = DPPOTVLoss(epsilon=0.2, clip_ratio_c=20.0)(
+            {'labels': labels}, {'logps': logps}, old_logps=old_logps, advantages=advantages)
+
+        assert result['loss'].item() == pytest.approx(100.0)
+
+    def test_adds_reference_kl_penalty(self):
+        labels = torch.tensor([[1, 1]])
+        logps = torch.tensor([[-1.0, -2.0]])
+        old_logps = logps.clone()
+        ref_logps = torch.tensor([[-1.3, -1.8]])
+        advantages = torch.tensor([[1.0]])
+        mask = labels != -100
+
+        plain = DPPOTVLoss()({'labels': labels}, {'logps': logps}, old_logps=old_logps, advantages=advantages)
+        with_kl = DPPOTVLoss(beta=0.1)(
+            {'labels': labels}, {'logps': logps}, old_logps=old_logps, ref_logps=ref_logps,
+            advantages=advantages)
+
+        torch.testing.assert_close(with_kl['loss'], plain['loss'] + 0.1 * _seq_mean(_k3_kl(logps, ref_logps, mask),
+                                                                                   mask))
+
+    def test_registered_in_mapping(self):
+        assert torch_loss_mapping.get('dppo_tv') is DPPOTVLoss
+
+
+class TestDPPOKLLoss:
+
+    def test_masks_high_binary_kl_for_positive_advantage(self):
+        labels = torch.tensor([[1]])
+        logps = torch.tensor([[math.log(0.9)]])
+        old_logps = torch.tensor([[math.log(0.3)]])
+        advantages = torch.tensor([[1.0]])
+
+        result = DPPOKLLoss(epsilon=0.2)({'labels': labels}, {'logps': logps}, old_logps=old_logps,
+                                         advantages=advantages)
+
+        assert result['loss'].item() == pytest.approx(0.0)
+
+    def test_probability_decrease_stays_valid_via_the_or_condition(self):
+        labels = torch.tensor([[1]])
+        logps = torch.tensor([[math.log(0.3)]])
+        old_logps = torch.tensor([[math.log(0.9)]])
+        advantages = torch.tensor([[1.0]])
+
+        result = DPPOKLLoss(epsilon=0.2)({'labels': labels}, {'logps': logps}, old_logps=old_logps,
+                                         advantages=advantages)
+
+        # binary_kl is large but prob <= old_prob keeps the positive branch valid.
+        expected = -(1.0) * (0.3 / 0.9) * math.log(0.3)
+        assert result['loss'].item() == pytest.approx(expected)
+
+    def test_adds_reference_kl_penalty(self):
+        labels = torch.tensor([[1, 1]])
+        logps = torch.tensor([[-1.0, -2.0]])
+        old_logps = logps.clone()
+        ref_logps = torch.tensor([[-1.3, -1.8]])
+        advantages = torch.tensor([[1.0]])
+        mask = labels != -100
+
+        plain = DPPOKLLoss()({'labels': labels}, {'logps': logps}, old_logps=old_logps, advantages=advantages)
+        with_kl = DPPOKLLoss(beta=0.1)(
+            {'labels': labels}, {'logps': logps}, old_logps=old_logps, ref_logps=ref_logps,
+            advantages=advantages)
+
+        torch.testing.assert_close(with_kl['loss'], plain['loss'] + 0.1 * _seq_mean(_k3_kl(logps, ref_logps, mask),
+                                                                                   mask))
+
+    def test_registered_in_mapping(self):
+        assert torch_loss_mapping.get('dppo_kl') is DPPOKLLoss
 
 
 class TestGeoMeanLoss:
-    """T10a-05 (GeoMean): sequence-level geometric-mean ratio, degenerate hand-check."""
 
-    def test_zero_log_ratio_hand_computed(self):
-        # log_ratio = 0 everywhere -> seq_ratio = 1, seq_adv = adv -> loss = -mean(adv).
-        loss = _loss(GeoMeanLoss(), _rl_batch(adv=1.0, gap=0.0))
-        assert loss == pytest.approx(-1.0, abs=1e-6)
-        loss_neg = _loss(GeoMeanLoss(), _rl_batch(adv=-2.0, gap=0.0))
-        assert loss_neg == pytest.approx(2.0, abs=1e-6)
+    def test_unclipped_ratios_reduce_to_the_sequence_advantage(self):
+        labels = torch.tensor([[1, 1, -100]])
+        logps = torch.tensor([[-0.2, -0.3, 0.0]])
+        old_logps = torch.tensor([[-0.3, -0.2, 0.0]])  # log ratios +0.1 / -0.1 cancel in the mean
+        advantages = torch.tensor([[2.0]])
 
-    def test_epsilon_bounds_geometric_ratio(self):
-        # A gap beyond epsilon clips the log-ratio, so loss stays finite and bounded.
-        loss = _loss(GeoMeanLoss(), _rl_batch(adv=1.0, gap=10.0))
-        assert math.isfinite(loss)
+        result = GeoMeanLoss()({'labels': labels}, {'logps': logps}, old_logps=old_logps,
+                               advantages=advantages)
 
+        assert result['loss'].item() == pytest.approx(-2.0)
 
-class TestKLCovLoss:
-    """T10a-07 (KLCov): covariance-selected tokens get the extra |log-ratio| KL."""
+    def test_positive_advantage_clips_the_log_ratio_pessimistically(self):
+        labels = torch.tensor([[1, 1, -100]])
+        logps = torch.tensor([[-0.5, -0.5, 0.0]])
+        old_logps = torch.tensor([[-1.0, -1.0, 0.0]])  # log ratio 0.5 > epsilon = 0.2
+        advantages = torch.tensor([[1.0]])
 
-    def test_all_selected_penalty_hand_computed(self):
-        # kl_cov_ratio=1.0 selects every token; the whole formula re-computed independently:
-        # per_token = -adv * exp(gap) + ppo_kl_coef * |gap|, token-mean over identical tokens.
-        gap, coef = 0.4, 2.0
-        batch = _rl_batch(gap=gap)
-        klcov = _loss(KLCovLoss(kl_cov_ratio=1.0, ppo_kl_coef=coef), batch)
-        expected = -1.0 * math.exp(gap) + coef * abs(gap)
-        assert klcov == pytest.approx(expected, abs=1e-6)
+        result = GeoMeanLoss(epsilon=0.2)({'labels': labels}, {'logps': logps}, old_logps=old_logps,
+                                          advantages=advantages)
 
-    def test_invalid_ratio_raises(self):
-        with pytest.raises(ValueError, match='kl_cov_ratio'):
-            KLCovLoss(kl_cov_ratio=0.0)
+        assert result['loss'].item() == pytest.approx(-math.exp(0.2))
 
-    def test_finite_with_default_ratio(self):
-        assert math.isfinite(_loss(KLCovLoss(), _rl_batch(gap=0.3)))
+    def test_masked_positions_are_excluded_from_the_geometric_mean(self):
+        labels = torch.tensor([[1, 1, -100]])
+        logps = torch.tensor([[-0.5, -0.5, 0.0]])
+        old_logps = torch.tensor([[-1.0, -1.0, 0.0]])
+        advantages = torch.tensor([[1.0]])
 
+        baseline = GeoMeanLoss(epsilon=0.2)(
+            {'labels': labels}, {'logps': logps}, old_logps=old_logps, advantages=advantages)
 
-class TestClipCovLoss:
-    """T10a-08 (ClipCov): PPO clipping with covariance zeroing -- contract anchors."""
+        wild = logps.clone()
+        wild_old = old_logps.clone()
+        wild[0, 2] = 100.0
+        wild_old[0, 2] = -100.0
+        perturbed = GeoMeanLoss(epsilon=0.2)(
+            {'labels': labels}, {'logps': wild}, old_logps=wild_old, advantages=advantages)
 
-    def test_invalid_ratio_raises(self):
-        with pytest.raises(ValueError, match='clip_cov_ratio'):
-            ClipCovLoss(clip_cov_ratio=0.0)
+        torch.testing.assert_close(perturbed['loss'], baseline['loss'])
 
-    def test_finite_and_kl_adds(self):
-        batch = _rl_batch(gap=0.3)
-        ref = torch.full((2, 4), 0.0)
-        assert math.isfinite(_loss(ClipCovLoss(), batch))
-        base = _loss(ClipCovLoss(beta=0.0), batch)
-        with_kl = _loss(ClipCovLoss(beta=0.01), batch, ref_logps=ref)
-        assert with_kl > base
+    def test_zero_advantage_gives_zero(self):
+        labels = torch.tensor([[1, 1]])
+        logps = torch.tensor([[-0.5, -1.0]])
+        result = GeoMeanLoss()({'labels': labels}, {'logps': logps}, old_logps=logps,
+                               advantages=torch.zeros(1, 1))
+        assert result['loss'].item() == pytest.approx(0.0)
 
+    def test_adds_reference_kl_penalty(self):
+        labels = torch.tensor([[1, 1]])
+        logps = torch.tensor([[-0.5, -1.0]])
+        old_logps = logps.clone()
+        ref_logps = torch.tensor([[-0.7, -0.8]])
+        advantages = torch.tensor([[1.0]])
+        mask = labels != -100
 
-class TestDPPOLosses:
-    """T10a-10: DPPO-TV and DPPO-KL both degenerate to the REINFORCE term at log_ratio 0."""
+        plain = GeoMeanLoss()({'labels': labels}, {'logps': logps}, old_logps=old_logps,
+                              advantages=advantages)
+        with_kl = GeoMeanLoss(beta=0.1)({'labels': labels}, {'logps': logps}, old_logps=old_logps,
+                                       ref_logps=ref_logps, advantages=advantages)
 
-    def test_tv_and_kl_equal_gpg_at_zero_gap(self):
-        batch = _rl_batch(gap=0.0, adv=1.0)
-        gpg = _loss(GPGLoss(), batch)
-        tv = _loss(DPPOTVLoss(), batch)
-        kl = _loss(DPPOKLLoss(), batch)
-        assert tv == pytest.approx(gpg, abs=1e-6)
-        assert kl == pytest.approx(gpg, abs=1e-6)
+        torch.testing.assert_close(with_kl['loss'], plain['loss'] + 0.1 * _seq_mean(_k3_kl(logps, ref_logps, mask),
+                                                                                   mask))
 
-    def test_finite_with_nonzero_gap(self):
-        batch = _rl_batch(gap=0.5)
-        assert math.isfinite(_loss(DPPOTVLoss(), batch))
-        assert math.isfinite(_loss(DPPOKLLoss(), batch))
+    def test_registered_in_mapping(self):
+        assert torch_loss_mapping.get('geo_mean') is GeoMeanLoss
 
 
 class TestREALLoss:
-    """T10a-04 (REAL): group soft-constraint, hand-computed against the closed form."""
 
-    def _real_batch(self, advs, token_logp=0.3, old=0.1):
-        n = len(advs)
-        labels = torch.ones(n, 2, dtype=torch.long)
-        logps = torch.full((n, 2), token_logp, requires_grad=True)
-        old_logps = torch.full((n, 2), old)
-        advantages = torch.tensor([[a, a] for a in advs], dtype=torch.float32)
-        return {'labels': labels}, {'logps': logps}, old_logps, advantages
+    def test_matches_the_group_soft_constraint_closed_form(self):
+        labels = torch.tensor([[1, 1], [1, 1]])
+        logps = torch.zeros(2, 2)
+        advantages = torch.tensor([[1.0], [-1.0]])
 
-    def test_mixed_group_hand_computed(self):
-        # One group of 4: scores all 0.2 (tau=0.5 -> scaled 0.4), advantages [1,-1,1,-1].
-        # neg = log(1 + 2*exp(0.4)); pos = log(1 + 2*exp(-0.4)); loss = neg + pos (one group).
-        fn = REALLoss(real_tau=0.5, num_generations=4)
-        batch = self._real_batch([1.0, -1.0, 1.0, -1.0])
-        inputs, outputs, old_logps, advantages = batch
-        out = fn(inputs, outputs, old_logps=old_logps, ref_logps=None, advantages=advantages)
-        expected = math.log(1 + 2 * math.exp(0.4)) + math.log(1 + 2 * math.exp(-0.4))
-        assert out['loss'].item() == pytest.approx(expected, rel=1e-5)
+        result = REALLoss(real_tau=0.5, num_generations=2)(
+            {'labels': labels}, {'logps': logps}, old_logps=logps, advantages=advantages)
 
-    def test_degenerate_group_zero_but_connected(self):
-        # An all-positive group carries no contrastive signal: the loss is exactly zero
-        # while staying connected to autograd (x * 0.0, not a detached constant).
-        fn = REALLoss(real_tau=0.5, num_generations=2)
-        inputs, outputs, old_logps, advantages = self._real_batch([1.0, 2.0])
-        out = fn(inputs, outputs, old_logps=old_logps, ref_logps=None, advantages=advantages)
-        assert out['loss'].item() == pytest.approx(0.0, abs=1e-9)
-        assert out['loss'].requires_grad
+        # One balanced group with both scores at 0: log(1+e^0) for each side.
+        assert result['loss'].item() == pytest.approx(2 * math.log(2))
 
-    def test_indivisible_batch_rejected(self):
-        fn = REALLoss(real_tau=0.5, num_generations=3)
-        inputs, outputs, old_logps, advantages = self._real_batch([1.0, -1.0, 1.0, -1.0])
-        with pytest.raises(AssertionError):
-            fn(inputs, outputs, old_logps=old_logps, ref_logps=None, advantages=advantages)
+    def test_all_positive_group_is_skipped_but_stays_connected(self):
+        labels = torch.tensor([[1, 1], [1, 1]])
+        logps = torch.zeros(2, 2, requires_grad=True)
+        advantages = torch.tensor([[1.0], [2.0]])
 
+        result = REALLoss(real_tau=0.5, num_generations=2)(
+            {'labels': labels}, {'logps': logps}, old_logps=logps.detach(), advantages=advantages)
 
-class TestSdarLoss:
-    """T10a-11: the confidence-gated self-distillation auxiliary, hand-computed."""
+        assert result['loss'].item() == pytest.approx(0.0)
+        result['loss'].backward()
+        assert logps.grad is not None
 
-    def _batch(self):
-        student = torch.tensor([[0.2, 0.4]], requires_grad=True)
-        teacher = torch.tensor([[0.4, 0.2]])
-        mask = torch.ones(1, 2)
-        return student, teacher, mask
+    def test_rejects_batch_not_divisible_by_num_generations(self):
+        labels = torch.tensor([[1], [1], [1]])
+        logps = torch.zeros(3, 1)
+        advantages = torch.tensor([[1.0], [-1.0], [1.0]])
 
-    def test_hand_computed(self):
-        student, teacher, mask = self._batch()
-        loss, metrics = compute_sdar_loss(student, teacher, mask, gate_beta=5.0)
-        # delta = [0.2, -0.2]; gate = [sigmoid(1), sigmoid(-1)] = [0.73106, 0.26894]
-        # kl = [0.2, -0.2]; gated = [0.14621, -0.05379]; token-mean = 0.04621.
-        gate = [1 / (1 + math.exp(-1.0)), 1 / (1 + math.exp(1.0))]
-        expected = (gate[0] * 0.2 + gate[1] * -0.2) / 2
-        assert loss.item() == pytest.approx(expected, abs=1e-6)
-        assert 0.0 <= metrics['sdar/gate_mean'] <= 1.0
+        with pytest.raises(AssertionError, match='num_generations'):
+            REALLoss(num_generations=2)({'labels': labels}, {'logps': logps}, old_logps=logps,
+                                        advantages=advantages)
 
-    def test_gradient_only_through_student(self):
-        student, teacher, mask = self._batch()
-        teacher = teacher.clone().requires_grad_(True)
-        loss, _ = compute_sdar_loss(student, teacher, mask)
-        loss.backward()
-        assert student.grad is not None and torch.isfinite(student.grad).all()
-        assert teacher.grad is None
+    def test_uses_the_unclamped_log_ratio(self):
+        labels = torch.tensor([[1], [1]])
+        logps = torch.tensor([[10.0], [-10.0]])
+        old_logps = torch.zeros(2, 1)  # log ratios +10 / -10, beyond the base ±5 clamp
+        advantages = torch.tensor([[1.0], [-1.0]])
 
-    def test_aggregation_modes(self):
-        student, teacher, mask = self._batch()
-        token_mean, _ = compute_sdar_loss(student, teacher, mask, loss_agg_mode='token-mean')
-        seq_sum, _ = compute_sdar_loss(student, teacher, mask, loss_agg_mode='seq-mean-token-sum')
-        seq_mean, _ = compute_sdar_loss(student, teacher, mask, loss_agg_mode='seq-mean-token-mean')
-        # One sequence of two valid tokens: seq-mean-token-sum = 2 * token-mean; seq-mean-token-mean == token-mean.
-        assert seq_sum.item() == pytest.approx(2 * token_mean.item(), abs=1e-6)
-        assert seq_mean.item() == pytest.approx(token_mean.item(), abs=1e-6)
+        result = REALLoss(real_tau=0.5, num_generations=2)(
+            {'labels': labels}, {'logps': logps}, old_logps=old_logps, advantages=advantages)
 
-    def test_unknown_agg_mode_raises(self):
-        student, teacher, mask = self._batch()
-        with pytest.raises(ValueError, match='loss_agg_mode'):
-            compute_sdar_loss(student, teacher, mask, loss_agg_mode='nope')
+        # Scores +10 / -10 -> scaled ±20, so both soft constraints are ~e^-20. A ±5 clamp would
+        # instead leave a ~9e-5 loss.
+        assert result['loss'].item() < 1e-6
 
-    def test_high_beta_saturates_gate(self):
-        # A huge gate_beta makes the gate a hard 0/1 step on the sign of delta.
-        student = torch.tensor([[0.0, 0.0]])
-        teacher = torch.tensor([[1.0, -1.0]])
-        mask = torch.ones(1, 2)
-        loss, metrics = compute_sdar_loss(student, teacher, mask, gate_beta=100.0)
-        # gate ~ [1, 0]; kl = [1, -1]; gated = [1, 0]; token-mean = 0.5.
-        assert loss.item() == pytest.approx(0.5, abs=1e-3)
+    def test_adds_reference_kl_penalty(self):
+        labels = torch.tensor([[1, 1], [1, 1]])
+        logps = torch.zeros(2, 2)
+        ref_logps = torch.full((2, 2), -0.4)
+        advantages = torch.tensor([[1.0], [-1.0]])
+        mask = labels != -100
+
+        plain = REALLoss(real_tau=0.5, num_generations=2)(
+            {'labels': labels}, {'logps': logps}, old_logps=logps, advantages=advantages)
+        with_kl = REALLoss(real_tau=0.5, num_generations=2, beta=0.1)(
+            {'labels': labels}, {'logps': logps}, old_logps=logps, ref_logps=ref_logps,
+            advantages=advantages)
+
+        expected_kl = (_k3_kl(logps, ref_logps, mask) * mask).sum() / mask.sum()
+        torch.testing.assert_close(with_kl['loss'], plain['loss'] + 0.1 * expected_kl)
+
+    def test_registered_in_mapping(self):
+        assert torch_loss_mapping.get('real') is REALLoss
 
 
-def _opsd_batch(gap=0.3):
-    torch.manual_seed(42)
-    labels = torch.ones(1, 2, dtype=torch.long)
-    logps = torch.full((1, 2), 0.5)
-    return {'labels': labels}, {'logps': logps}, logps.detach() + gap
+class TestThinVariantCoverage:
+    """Numeric assertions for variants that previously only asserted ``isfinite``."""
 
+    def test_gspo_uses_the_sequence_level_ratio(self):
+        labels = torch.tensor([[1, 1]])
+        logps = torch.tensor([[-0.1, -0.1]])
+        old_logps = torch.tensor([[-0.2, -0.2]])  # per-token log ratio 0.1 -> sequence ratio e^0.1
+        advantages = torch.tensor([[1.0]])
 
-class TestMOPDLoss:
-    """T10a-06: the multi-teacher mixture fusion."""
+        result = GSPOLoss(epsilon=0.2)({'labels': labels}, {'logps': logps}, old_logps=old_logps,
+                                      advantages=advantages)
 
-    def test_single_teacher_weight_one_equals_opsd(self):
-        # K=1, w=[1.0]: logsumexp of one unit-weighted channel is that channel.
-        inputs, outputs, teacher = _opsd_batch(gap=0.3)
-        mopd = MOPDLoss()([t for t in [teacher]], teacher_weights=[1.0])if False else MOPDLoss()
-        a = mopd(inputs, outputs, teacher_logps=[teacher], teacher_weights=[1.0])['loss'].item()
-        b = OPSDLoss()(inputs, outputs, teacher_logps=teacher)['loss'].item()
-        assert a == pytest.approx(b, abs=1e-6)
+        assert result['loss'].item() == pytest.approx(-math.exp(0.1))
 
-    def test_bare_tensor_delegates_to_opsd(self):
-        inputs, outputs, teacher = _opsd_batch(gap=0.3)
-        a = MOPDLoss()(inputs, outputs, teacher_logps=teacher)['loss'].item()
-        b = OPSDLoss()(inputs, outputs, teacher_logps=teacher)['loss'].item()
-        assert a == pytest.approx(b, abs=1e-9)
+    def test_sapo_soft_gate_at_unit_ratio(self):
+        labels = torch.tensor([[1, 1]])
+        logps = torch.tensor([[-0.5, -0.5]])
 
-    def test_two_teacher_mixture_hand_computed(self):
-        # student logp 0.5; teachers [0.0, -1.0]; equal weights ->
-        # mix = log(0.5*1 + 0.5*e^-1); r = mix - 0.5; per-token = exp(r) - r - 1; token-mean over 2.
-        inputs, outputs, _ = _opsd_batch()
-        t1, t2 = torch.zeros(1, 2), torch.full((1, 2), -1.0)
-        out = MOPDLoss()(inputs, outputs, teacher_logps=[t1, t2], teacher_weights=[0.5, 0.5])
-        mix = math.log(0.5 + 0.5 * math.exp(-1.0))
-        r = mix - 0.5
-        expected = math.exp(r) - r - 1.0
-        assert out['loss'].item() == pytest.approx(expected, abs=1e-6)
+        positive = SAPOLoss(epsilon=0.2, tau_pos=1.0, tau_neg=1.0)(
+            {'labels': labels}, {'logps': logps}, old_logps=logps, advantages=torch.tensor([[1.0]]))
+        negative = SAPOLoss(epsilon=0.2, tau_pos=1.0, tau_neg=1.0)(
+            {'labels': labels}, {'logps': logps}, old_logps=logps, advantages=torch.tensor([[-1.0]]))
 
-    def test_uniform_weights_default(self):
-        # teacher_weights=None means 1/K each -- same as passing them explicitly.
-        inputs, outputs, _ = _opsd_batch()
-        t1, t2 = torch.zeros(1, 2), torch.full((1, 2), -1.0)
-        a = MOPDLoss()(inputs, outputs, teacher_logps=[t1, t2])['loss'].item()
-        b = MOPDLoss()(inputs, outputs, teacher_logps=[t1, t2], teacher_weights=[0.5, 0.5])['loss'].item()
-        assert a == pytest.approx(b, abs=1e-9)
+        # sigmoid(0) * 4 / tau = 2 at ratio 1, so the loss is -2 * advantage.
+        assert positive['loss'].item() == pytest.approx(-2.0)
+        assert negative['loss'].item() == pytest.approx(2.0)
 
-    @pytest.mark.parametrize('weights', [[0.5], [-0.5, 1.5], [0.0, 0.0]])
-    def test_invalid_weights_raise(self, weights):
-        inputs, outputs, _ = _opsd_batch()
-        t1, t2 = torch.zeros(1, 2), torch.full((1, 2), -1.0)
-        with pytest.raises(ValueError):
-            MOPDLoss()(inputs, outputs, teacher_logps=[t1, t2], teacher_weights=weights)
+    def test_cispo_clamped_ratio_times_logp(self):
+        labels = torch.tensor([[1, 1]])
+        logps = torch.tensor([[-0.5, -0.5]])
+        advantages = torch.tensor([[1.0]])
 
-    def test_backward_produces_finite_grads(self):
-        # T10a-14 (MOPD instance): gradients flow through the student logps.
-        logps = torch.full((1, 2), 0.5, requires_grad=True)
-        inputs = {'labels': torch.ones(1, 2, dtype=torch.long)}
-        outputs = {'logps': logps}
-        t1, t2 = torch.zeros(1, 2), torch.full((1, 2), -1.0)
-        out = MOPDLoss()(inputs, outputs, teacher_logps=[t1, t2])
-        out['loss'].backward()
-        assert logps.grad is not None and torch.isfinite(logps.grad).all()
+        result = CISPOLoss(epsilon=0.2)({'labels': labels}, {'logps': logps}, old_logps=logps,
+                                       advantages=advantages)
+
+        # ratio = 1 (not clamped), per-token = -1 * 1 * (-0.5) = 0.5, token-mean = 0.5.
+        assert result['loss'].item() == pytest.approx(0.5)
+
+    def test_dr_grpo_normalizes_by_batch_times_max_completion_length(self):
+        labels = torch.tensor([[1, 1]])
+        logps = torch.tensor([[-0.5, -0.5]])
+        advantages = torch.tensor([[1.0]])
+
+        result = DRGRPOLoss(epsilon=0.2, max_completion_length=4)(
+            {'labels': labels}, {'logps': logps}, old_logps=logps, advantages=advantages)
+
+        # Two tokens at -1.0 each -> -2.0 / (batch 1 * max_completion_length 4) = -0.5.
+        assert result['loss'].item() == pytest.approx(-0.5)
