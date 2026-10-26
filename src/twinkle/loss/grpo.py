@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import numpy as np
 from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Union
+
+import numpy as np
 
 from twinkle.data_format import LossOutput
 from twinkle.loss.base import Loss
@@ -28,7 +29,7 @@ class GRPOLoss(Loss):
     def __init__(
         self,
         epsilon: float = 0.2,
-        epsilon_high: Optional[float] = None,
+        epsilon_high: float | None = None,
         beta: float = 0.0,
         entropy_coef: float = 0.0,
         ignore_index: int = -100,
@@ -40,20 +41,20 @@ class GRPOLoss(Loss):
         # legacy ``GRPOTrainer`` applied inline (and dev carried in ``_ConfiguredGRPOLoss`` /
         # ``_AdvancedGRPOLoss``): sequence-level IS, dual-clip, entropy filter/logging, truncated-IS
         # rollout correction, off-policy sequence masking, FIPO future-KL weighting and SDAR distillation.
-        importance_sampling_level: str = 'token',
-        delta: Optional[float] = None,
+        importance_sampling_level: str = "token",
+        delta: float | None = None,
         top_entropy_quantile: float = 1.0,
         log_entropy: bool = False,
-        rollout_importance_sampling_mode: Optional[str] = None,
+        rollout_importance_sampling_mode: str | None = None,
         rollout_importance_sampling_threshold: float = 2.0,
         log_rollout_offpolicy_metrics: bool = False,
-        off_policy_sequence_mask_delta: Optional[float] = None,
+        off_policy_sequence_mask_delta: float | None = None,
         overlong_filter: bool = False,
-        loss_type: str = 'grpo',
+        loss_type: str = "grpo",
         fipo_decay_rate: float = 32.0,
-        fipo_clip_range: Optional[float] = 0.2,
+        fipo_clip_range: float | None = 0.2,
         fipo_clip_high_only: bool = True,
-        fipo_safety_threshold: Optional[float] = 4.0,
+        fipo_safety_threshold: float | None = 4.0,
         sdar_loss_coef: float = 0.0,
         sdar_gate_beta: float = 5.0,
         **kwargs,
@@ -64,9 +65,9 @@ class GRPOLoss(Loss):
         self.entropy_coef = entropy_coef
         self.enable_sampling_replay = enable_sampling_replay
         if enable_sampling_replay and beta != 0.0:
-            raise ValueError('sampling replay does not support a GRPO KL penalty (beta must be 0)')
+            raise ValueError("sampling replay does not support a GRPO KL penalty (beta must be 0)")
         if enable_sampling_replay and entropy_coef != 0.0:
-            raise ValueError('sampling replay does not support a GRPO entropy bonus')
+            raise ValueError("sampling replay does not support a GRPO entropy bonus")
         self.ignore_index = ignore_index
 
         self.importance_sampling_level = importance_sampling_level
@@ -79,7 +80,7 @@ class GRPOLoss(Loss):
         self.off_policy_sequence_mask_delta = off_policy_sequence_mask_delta
         self.overlong_filter = overlong_filter
         self.loss_type = loss_type
-        self.fipo_gamma = 2.0**(-1.0 / fipo_decay_rate)
+        self.fipo_gamma = 2.0 ** (-1.0 / fipo_decay_rate)
         self.fipo_clip_range = fipo_clip_range
         self.fipo_clip_high_only = fipo_clip_high_only
         self.fipo_safety_threshold = fipo_safety_threshold
@@ -93,9 +94,16 @@ class GRPOLoss(Loss):
         # so a plain GSPO run stays on the ±5-clamped base path exactly as before; only when one of the
         # controls below is active does the ±20-clamped configured pipeline take over (which then also
         # reads ``importance_sampling_level``).
-        self._advanced = (loss_type == 'fipo' or delta is not None or top_entropy_quantile < 1.0 or log_entropy
-                          or overlong_filter or rollout_importance_sampling_mode is not None
-                          or log_rollout_offpolicy_metrics or off_policy_sequence_mask_delta is not None)
+        self._advanced = (
+            loss_type == "fipo"
+            or delta is not None
+            or top_entropy_quantile < 1.0
+            or log_entropy
+            or overlong_filter
+            or rollout_importance_sampling_mode is not None
+            or log_rollout_offpolicy_metrics
+            or off_policy_sequence_mask_delta is not None
+        )
         # ``_distill_wrap`` marks the SDAR auxiliary objective, which reads the rollout logits/logps.
         self._distill_wrap = sdar_loss_coef > 0.0
         # The configured pipeline recomputes the surrogate and aggregation itself and never calls
@@ -106,11 +114,12 @@ class GRPOLoss(Loss):
         # only ``_compute_per_token_loss`` (e.g. GPG) still compose, since the pipeline calls that hook.
         if self._advanced and type(self)._reduce_loss is not GRPOLoss._reduce_loss:
             raise ValueError(
-                f'{type(self).__name__} is a group-/sequence-level objective (it overrides `_reduce_loss`) '
-                'that the advanced GRPO ratio/entropy/rollout controls would bypass. Drop the conflicting '
-                'control (importance_sampling_level / delta / top_entropy_quantile / log_entropy / '
-                'overlong_filter / rollout_importance_sampling_mode / log_rollout_offpolicy_metrics / '
-                'off_policy_sequence_mask_delta / fipo) to use this loss_type.')
+                f"{type(self).__name__} is a group-/sequence-level objective (it overrides `_reduce_loss`) "
+                "that the advanced GRPO ratio/entropy/rollout controls would bypass. Drop the conflicting "
+                "control (importance_sampling_level / delta / top_entropy_quantile / log_entropy / "
+                "overlong_filter / rollout_importance_sampling_mode / log_rollout_offpolicy_metrics / "
+                "off_policy_sequence_mask_delta / fipo) to use this loss_type."
+            )
         # Gate the expensive forward paths: entropy for the bonus OR the advanced entropy
         # logging/filtering; logits for the SDAR auxiliary term.
         self.require_entropy = entropy_coef > 0.0 or log_entropy or top_entropy_quantile < 1.0
@@ -121,10 +130,10 @@ class GRPOLoss(Loss):
 
     def _compute_log_importance_weights(
         self,
-        per_token_logps: 'torch.Tensor',
-        per_token_old_logps: 'torch.Tensor',
-        loss_mask: 'torch.Tensor',
-    ) -> 'torch.Tensor':
+        per_token_logps: "torch.Tensor",
+        per_token_old_logps: "torch.Tensor",
+        loss_mask: "torch.Tensor",
+    ) -> "torch.Tensor":
         """
         Compute log importance sampling weights at ``self.importance_sampling_level``.
 
@@ -144,25 +153,28 @@ class GRPOLoss(Loss):
             log_weights: [batch, seq_len] log importance weights
         """
         import torch
+
         log_ratio = per_token_logps - per_token_old_logps
         # Clamp for numerical stability (±5 bounds ratio to [exp(-5), exp(5)] ≈ [0.007, 148])
         log_ratio = torch.clamp(log_ratio, min=-5.0, max=5.0)
-        if self.importance_sampling_level == 'token':
+        if self.importance_sampling_level == "token":
             return log_ratio
         sequence = ((log_ratio * loss_mask).sum(-1) / loss_mask.sum(-1).clamp(min=1.0)).unsqueeze(-1)
-        if self.importance_sampling_level == 'sequence':
+        if self.importance_sampling_level == "sequence":
             return sequence
-        if self.importance_sampling_level == 'sequence_token':
+        if self.importance_sampling_level == "sequence_token":
             return per_token_logps - per_token_logps.detach() + sequence.detach()
-        raise ValueError(f'Unknown importance_sampling_level={self.importance_sampling_level!r}. '
-                         "Expected 'token', 'sequence' or 'sequence_token'.")
+        raise ValueError(
+            f"Unknown importance_sampling_level={self.importance_sampling_level!r}. "
+            "Expected 'token', 'sequence' or 'sequence_token'."
+        )
 
     def _compute_per_token_loss(
         self,
-        ratio: 'torch.Tensor',
-        advantages: 'torch.Tensor',
-        per_token_logps: 'torch.Tensor',
-    ) -> 'torch.Tensor':
+        ratio: "torch.Tensor",
+        advantages: "torch.Tensor",
+        per_token_logps: "torch.Tensor",
+    ) -> "torch.Tensor":
         """
         Compute per-token loss with PPO clipping.
 
@@ -177,6 +189,7 @@ class GRPOLoss(Loss):
             per_token_loss: [batch, seq_len] loss for each token
         """
         import torch
+
         clipped_ratio = torch.clamp(ratio, 1 - self.epsilon, 1 + self.epsilon_high)
         loss1 = ratio * advantages
         loss2 = clipped_ratio * advantages
@@ -184,10 +197,10 @@ class GRPOLoss(Loss):
 
     def _aggregate_loss(
         self,
-        per_token_loss: 'torch.Tensor',
-        loss_mask: 'torch.Tensor',
+        per_token_loss: "torch.Tensor",
+        loss_mask: "torch.Tensor",
         **kwargs,
-    ) -> 'torch.Tensor':
+    ) -> "torch.Tensor":
         """
         Aggregate per-token loss to scalar.
 
@@ -206,7 +219,7 @@ class GRPOLoss(Loss):
         # Each sequence contributes equally regardless of length.
         return ((per_token_loss * loss_mask).sum(-1) / loss_mask.sum(-1).clamp(min=1.0)).mean()
 
-    def _loss_num_tokens(self, loss_mask: 'torch.Tensor'):
+    def _loss_num_tokens(self, loss_mask: "torch.Tensor"):
         """Token denominator reported in ``LossOutput.num_tokens``.
 
         0 (default) => framework uses the PER-TOKEN-MEAN accumulation path, where each
@@ -219,12 +232,12 @@ class GRPOLoss(Loss):
 
     def _pad_and_align_to_batch(
         self,
-        data: 'Union[torch.Tensor, List, np.ndarray]',
-        mask: 'torch.Tensor',
-        device: 'torch.device',
-        dtype: 'torch.dtype',
+        data: "torch.Tensor | list | np.ndarray",
+        mask: "torch.Tensor",
+        device: "torch.device",
+        dtype: "torch.dtype",
         fill_value: float = 0.0,
-    ) -> 'torch.Tensor':
+    ) -> "torch.Tensor":
         """Align data to mask: scalars broadcast, sequences scatter.
 
         Two valid per-sample sequence forms are supported and disambiguated
@@ -255,8 +268,9 @@ class GRPOLoss(Loss):
                 data = data.unsqueeze(1)
             if data.shape[1] == 1:
                 assert data.shape[0] == batch_size, (
-                    f'scalar broadcast expects data.shape[0]==batch_size, '
-                    f'got data.shape={tuple(data.shape)} mask.shape={(batch_size, seq_len)}')
+                    f"scalar broadcast expects data.shape[0]==batch_size, "
+                    f"got data.shape={tuple(data.shape)} mask.shape={(batch_size, seq_len)}"
+                )
                 fill = torch.full((batch_size, seq_len), fill_value, dtype=dtype, device=device)
                 expanded = data.expand(batch_size, seq_len)
                 return torch.where(mask, expanded, fill)
@@ -266,7 +280,8 @@ class GRPOLoss(Loss):
         if isinstance(data, (list, tuple)):
             if all(isinstance(x, (int, float)) for x in data):  # Flat scalars
                 return self._pad_and_align_to_batch(
-                    torch.tensor(data, dtype=dtype, device=device), mask, device, dtype, fill_value)
+                    torch.tensor(data, dtype=dtype, device=device), mask, device, dtype, fill_value
+                )
             data = [torch.as_tensor(s, dtype=dtype, device=device) for s in data]
 
         # Scatter sequences
@@ -296,14 +311,16 @@ class GRPOLoss(Loss):
     @staticmethod
     def _alignment_supported(n_pos: int, n_sample: int, last_pos: int) -> bool:
         """Whether one ragged row fits the response-only or full-sequence form."""
-        return (n_sample == 1 or n_sample == n_pos or n_pos == 0 or (n_sample > 0 and last_pos < n_sample))
+        return n_sample == 1 or n_sample == n_pos or n_pos == 0 or (n_sample > 0 and last_pos < n_sample)
 
     @staticmethod
     def _raise_alignment_mismatch(sample_index: int, n_pos: int, n_sample: int, seq_len: int):
-        raise AssertionError(f'data/mask length mismatch at sample {sample_index}: '
-                             f'n_pos={n_pos}, n_sample={n_sample}, seq_len={seq_len} '
-                             '(expected n_sample == n_pos for response-only form, or all masked positions '
-                             'to exist in the per-sample full-sequence form)')
+        raise AssertionError(
+            f"data/mask length mismatch at sample {sample_index}: "
+            f"n_pos={n_pos}, n_sample={n_sample}, seq_len={seq_len} "
+            "(expected n_sample == n_pos for response-only form, or all masked positions "
+            "to exist in the per-sample full-sequence form)"
+        )
 
     @staticmethod
     def _alignment_rows(data, batch_size: int):
@@ -347,10 +364,10 @@ class GRPOLoss(Loss):
                 # The shape does not map one row per sample; the in-loss check
                 # remains the only applicable validation for this batch.
                 continue
-            for index, (sample, row) in enumerate(zip(samples, rows)):
+            for index, (sample, row) in enumerate(zip(samples, rows, strict=False)):
                 if not isinstance(sample, dict):
                     continue
-                labels = sample.get('labels')
+                labels = sample.get("labels")
                 if labels is None:
                     continue
                 if not torch.is_tensor(labels):
@@ -366,7 +383,7 @@ class GRPOLoss(Loss):
                 if not self._alignment_supported(n_pos, n_sample, last_pos):
                     self._raise_alignment_mismatch(index, n_pos, n_sample, labels.shape[-1])
 
-    def _resolve_loss_mask(self, inputs: Dict, labels: 'torch.Tensor') -> 'torch.Tensor':
+    def _resolve_loss_mask(self, inputs: dict, labels: "torch.Tensor") -> "torch.Tensor":
         """Positions this loss may score: trainable *and* log-prob-bearing.
 
         ``labels`` alone answers "should this token be scored", which is all SFT
@@ -380,8 +397,9 @@ class GRPOLoss(Loss):
         ``labels != ignore_index`` and old trajectories train exactly as before.
         """
         import torch
+
         trainable = (labels != self.ignore_index).bool()
-        completion_mask = inputs.get('completion_mask')
+        completion_mask = inputs.get("completion_mask")
         if completion_mask is None:
             return trainable
         if not torch.is_tensor(completion_mask):
@@ -390,23 +408,27 @@ class GRPOLoss(Loss):
         if completion_mask.dim() == 1:
             completion_mask = completion_mask.unsqueeze(0)
         if completion_mask.shape != trainable.shape:
-            raise ValueError(f'completion_mask shape {tuple(completion_mask.shape)} does not match labels shape '
-                             f'{tuple(trainable.shape)}. A misaligned mask would apply importance ratios to '
-                             'the wrong tokens, so it is refused rather than broadcast.')
+            raise ValueError(
+                f"completion_mask shape {tuple(completion_mask.shape)} does not match labels shape "
+                f"{tuple(trainable.shape)}. A misaligned mask would apply importance ratios to "
+                "the wrong tokens, so it is refused rather than broadcast."
+            )
         loss_mask = trainable & completion_mask.bool()
         if self.enable_sampling_replay and not bool((loss_mask == trainable).all()):
-            raise ValueError('sampling replay does not support turns generated outside the sampled policy: '
-                             'they are trainable but have no sampling mask to replay against.')
+            raise ValueError(
+                "sampling replay does not support turns generated outside the sampled policy: "
+                "they are trainable but have no sampling mask to replay against."
+            )
         return loss_mask
 
     def _base_grpo(
         self,
-        inputs: Dict,
-        outputs: Dict,
+        inputs: dict,
+        outputs: dict,
         *,
-        old_logps: Optional[Union['torch.Tensor', List[List[float]]]] = None,
-        ref_logps: Optional['torch.Tensor'] = None,
-        advantages: Optional[Union['torch.Tensor', List[float], np.ndarray]] = None,
+        old_logps: Union["torch.Tensor", list[list[float]]] | None = None,
+        ref_logps: Optional["torch.Tensor"] = None,
+        advantages: Union["torch.Tensor", list[float], np.ndarray] | None = None,
         **kwargs,
     ):
         """
@@ -428,25 +450,26 @@ class GRPOLoss(Loss):
             **kwargs: Additional arguments
         """
         import torch
+
         if self.enable_sampling_replay:
             if old_logps is None:
-                raise ValueError('old_logps are required when sampling replay is enabled')
-        labels = inputs.get('labels')
+                raise ValueError("old_logps are required when sampling replay is enabled")
+        labels = inputs.get("labels")
         assert labels is not None, "inputs must contain 'labels'"
         if not torch.is_tensor(labels):
             labels = torch.as_tensor(labels)
         if labels.dim() == 1:
             labels = labels.unsqueeze(0)
 
-        logps = outputs.get('logps')
+        logps = outputs.get("logps")
         if self.enable_sampling_replay and logps is None:
-            raise RuntimeError('sampling replay logps must be computed by the model forward')
+            raise RuntimeError("sampling replay logps must be computed by the model forward")
         loss_mask = self._resolve_loss_mask(inputs, labels)
         if logps is None:
-            logits = outputs.get('logits')
+            logits = outputs.get("logits")
             if logits.shape[1] != labels.shape[1]:
                 # some mllm return logits with image tokens, exclude here
-                logits = logits[:, -labels.shape[1]:]
+                logits = logits[:, -labels.shape[1] :]
             masked_labels = labels.clone()
             masked_labels[~loss_mask] = 0
             logps = selective_log_softmax(logits, masked_labels)
@@ -494,18 +517,19 @@ class GRPOLoss(Loss):
 
         # ── Compute loss ────────────────────────────────────────────────
         log_importance_weights = self._compute_log_importance_weights(logps, old_logps, loss_mask)
-        return self._reduce_loss(logps, old_logps, ref_logps, advantages, loss_mask, log_importance_weights,
-                                 outputs, **kwargs)
+        return self._reduce_loss(
+            logps, old_logps, ref_logps, advantages, loss_mask, log_importance_weights, outputs, **kwargs
+        )
 
     def _reduce_loss(
         self,
-        logps: 'torch.Tensor',
-        old_logps: 'torch.Tensor',
-        ref_logps: Optional['torch.Tensor'],
-        advantages: 'torch.Tensor',
-        loss_mask: 'torch.Tensor',
-        log_importance_weights: 'torch.Tensor',
-        outputs: Dict,
+        logps: "torch.Tensor",
+        old_logps: "torch.Tensor",
+        ref_logps: Optional["torch.Tensor"],
+        advantages: "torch.Tensor",
+        loss_mask: "torch.Tensor",
+        log_importance_weights: "torch.Tensor",
+        outputs: dict,
         **kwargs,
     ) -> LossOutput:
         """Reduce the per-token importance weights to the scalar ``LossOutput``.
@@ -516,18 +540,21 @@ class GRPOLoss(Loss):
         -- byte-for-byte identical to inlining it at the tail of ``__call__``.
         """
         import torch
+
         ratio = torch.exp(log_importance_weights)
 
         per_token_loss = self._compute_per_token_loss(ratio, advantages, logps)
 
         if self.beta > 0.0 and ref_logps is not None:
-            per_token_kl = (torch.exp(ref_logps - logps) - (ref_logps - logps) - 1)
+            per_token_kl = torch.exp(ref_logps - logps) - (ref_logps - logps) - 1
             per_token_loss = per_token_loss + self.beta * per_token_kl
 
         if self.entropy_coef > 0.0:
-            entropies = outputs.get('entropies')
-            assert entropies is not None, ('entropy_coef > 0 requires outputs[\'entropies\'] — make sure the '
-                                           "loss instance's require_entropy flag was set before the forward call.")
+            entropies = outputs.get("entropies")
+            assert entropies is not None, (
+                "entropy_coef > 0 requires outputs['entropies'] — make sure the "
+                "loss instance's require_entropy flag was set before the forward call."
+            )
             # entropies may come in fp32 from the kernel; cast to match logps dtype
             # so the final per_token_loss stays consistent (bf16 under amp).
             per_token_loss = per_token_loss - self.entropy_coef * entropies.to(per_token_loss.dtype)
@@ -545,15 +572,15 @@ class GRPOLoss(Loss):
 
     def __call__(
         self,
-        inputs: Dict,
-        outputs: Dict,
+        inputs: dict,
+        outputs: dict,
         *,
-        old_logps: Optional[Union['torch.Tensor', List[List[float]]]] = None,
-        ref_logps: Optional['torch.Tensor'] = None,
-        advantages: Optional[Union['torch.Tensor', List[float], np.ndarray]] = None,
-        rollout_logps: Optional[Union['torch.Tensor', List[List[float]]]] = None,
-        truncated: Optional[List[bool]] = None,
-        teacher_logps: Optional[Union['torch.Tensor', List[List[float]]]] = None,
+        old_logps: Union["torch.Tensor", list[list[float]]] | None = None,
+        ref_logps: Optional["torch.Tensor"] = None,
+        advantages: Union["torch.Tensor", list[float], np.ndarray] | None = None,
+        rollout_logps: Union["torch.Tensor", list[list[float]]] | None = None,
+        truncated: list[bool] | None = None,
+        teacher_logps: Union["torch.Tensor", list[list[float]]] | None = None,
         **kwargs,
     ):
         """Compute the GRPO loss, applying any advanced controls this instance was built with.
@@ -565,32 +592,41 @@ class GRPOLoss(Loss):
         is exactly :meth:`_base_grpo`.
         """
         if not (self._advanced or self._distill_wrap):
-            return self._base_grpo(inputs, outputs, old_logps=old_logps, ref_logps=ref_logps,
-                                   advantages=advantages, **kwargs)
+            return self._base_grpo(
+                inputs, outputs, old_logps=old_logps, ref_logps=ref_logps, advantages=advantages, **kwargs
+            )
 
         if self._advanced:
             result = self._configured_grpo(
-                inputs, outputs, old_logps=old_logps, ref_logps=ref_logps, advantages=advantages,
-                rollout_logps=rollout_logps, truncated=truncated, **kwargs)
+                inputs,
+                outputs,
+                old_logps=old_logps,
+                ref_logps=ref_logps,
+                advantages=advantages,
+                rollout_logps=rollout_logps,
+                truncated=truncated,
+                **kwargs,
+            )
         else:
             result = self._base_grpo(
-                inputs, outputs, old_logps=old_logps, ref_logps=ref_logps, advantages=advantages, **kwargs)
+                inputs, outputs, old_logps=old_logps, ref_logps=ref_logps, advantages=advantages, **kwargs
+            )
 
-        loss = result['loss']
-        channel_loss = result.get('channel_loss')
+        loss = result["loss"]
+        channel_loss = result.get("channel_loss")
         if self._distill_wrap:
             loss = self._add_sdar(loss, inputs, outputs, teacher_logps)
             result = LossOutput(loss=loss, num_tokens=0)
         else:
-            result = LossOutput(loss=loss, num_tokens=result['num_tokens'])
+            result = LossOutput(loss=loss, num_tokens=result["num_tokens"])
         if channel_loss is not None:
-            result['channel_loss'] = channel_loss
+            result["channel_loss"] = channel_loss
         return result
 
     def _configured_grpo(
         self,
-        inputs: Dict,
-        outputs: Dict,
+        inputs: dict,
+        outputs: dict,
         *,
         old_logps=None,
         ref_logps=None,
@@ -606,34 +642,36 @@ class GRPOLoss(Loss):
         intersect with ``completion_mask`` the way the base :meth:`_resolve_loss_mask` does.
         """
         import torch
-        labels = inputs['labels']
+
+        labels = inputs["labels"]
         if not torch.is_tensor(labels):
             labels = torch.as_tensor(labels)
         if labels.dim() == 1:
             labels = labels.unsqueeze(0)
-        logps = outputs.get('logps')
+        logps = outputs.get("logps")
         if logps is None:
             raise RuntimeError('The advanced GRPO controls require outputs["logps"].')
         alignment_mask = labels.ne(self.ignore_index)
         device, dtype = logps.device, logps.dtype
-        old = (logps.detach() if old_logps is None else self._pad_and_align_to_batch(
-            old_logps, alignment_mask, device, dtype))
+        old = (
+            logps.detach()
+            if old_logps is None
+            else self._pad_and_align_to_batch(old_logps, alignment_mask, device, dtype)
+        )
         advantages = self._pad_and_align_to_batch(advantages, alignment_mask, device, dtype)
         mask = alignment_mask.clone()
 
-        channel_loss: Dict[str, 'torch.Tensor'] = {}
+        channel_loss: dict[str, torch.Tensor] = {}
         entropy_mask = None
         if self.require_entropy:
-            entropies = outputs.get('entropies')
+            entropies = outputs.get("entropies")
             if entropies is None:
                 raise RuntimeError('Entropy logging/filtering requires outputs["entropies"].')
             if self.log_entropy:
                 count = alignment_mask.sum().detach().float()
-                channel_loss['entropy'] = torch.stack(
-                    ((entropies * alignment_mask).sum().detach().float(), count))
+                channel_loss["entropy"] = torch.stack(((entropies * alignment_mask).sum().detach().float(), count))
             if self.top_entropy_quantile < 1.0 and alignment_mask.any():
-                threshold = torch.quantile(
-                    entropies[alignment_mask].float(), 1.0 - self.top_entropy_quantile)
+                threshold = torch.quantile(entropies[alignment_mask].float(), 1.0 - self.top_entropy_quantile)
                 entropy_mask = entropies.ge(threshold)
 
         if truncated is not None:
@@ -642,7 +680,7 @@ class GRPOLoss(Loss):
 
         log_ratio, ratio = self._advanced_importance_weights(logps, old, mask)
         per_token_loss = self._dual_clip_per_token_loss(ratio, advantages, logps)
-        if self.loss_type == 'fipo':
+        if self.loss_type == "fipo":
             per_token_loss = per_token_loss * self._fipo_weights(log_ratio, ratio, advantages, mask)
         if entropy_mask is not None:
             per_token_loss = per_token_loss * entropy_mask
@@ -659,12 +697,13 @@ class GRPOLoss(Loss):
             rollout_log_ratio = old - rollout
             if self.log_rollout_offpolicy_metrics:
                 count = mask.sum().detach().float()
-                channel_loss['rollout_log_ratio'] = torch.stack(
-                    ((rollout_log_ratio.abs() * mask).sum().detach().float(), count))
+                channel_loss["rollout_log_ratio"] = torch.stack(
+                    ((rollout_log_ratio.abs() * mask).sum().detach().float(), count)
+                )
             if self.rollout_importance_sampling_mode is not None:
                 per_token_loss = per_token_loss * self._rollout_is_weights(rollout_log_ratio, mask)
         elif self.rollout_importance_sampling_mode is not None:
-            raise ValueError('rollout_importance_sampling_mode requires rollout_logps from the sampler.')
+            raise ValueError("rollout_importance_sampling_mode requires rollout_logps from the sampler.")
 
         if self.off_policy_sequence_mask_delta is not None:
             old_policy = rollout if rollout is not None else old
@@ -673,13 +712,13 @@ class GRPOLoss(Loss):
             keep = ~((sequence_delta > self.off_policy_sequence_mask_delta) & (sequence_advantage < 0))
             mask = mask & keep.unsqueeze(-1)
 
-        if self.loss_type == 'fipo':
+        if self.loss_type == "fipo":
             loss = (per_token_loss * mask).sum() / mask.sum().clamp(min=1.0)
         else:
             loss = self._aggregate_loss(per_token_loss, mask, **kwargs)
         result = LossOutput(loss=loss, num_tokens=0)
         if channel_loss:
-            result['channel_loss'] = channel_loss
+            result["channel_loss"] = channel_loss
         return result
 
     def _advanced_importance_weights(self, logps, old_logps, mask):
@@ -689,24 +728,26 @@ class GRPOLoss(Loss):
         consumes it directly. The ±20 clamp is the legacy stability bound for this pipeline.
         """
         import torch
+
         log_ratio = torch.clamp(logps - old_logps, min=-20.0, max=20.0)
-        if self.importance_sampling_level == 'token':
+        if self.importance_sampling_level == "token":
             log_weights = log_ratio
         else:
             sequence = ((log_ratio * mask).sum(-1) / mask.sum(-1).clamp(min=1.0)).unsqueeze(-1)
-            if self.importance_sampling_level == 'sequence':
+            if self.importance_sampling_level == "sequence":
                 log_weights = sequence
-            elif self.importance_sampling_level == 'sequence_token':
+            elif self.importance_sampling_level == "sequence_token":
                 # GSPO-token: grad flows through the per-token logp, the sequence weight is a constant.
                 log_weights = logps - logps.detach() + sequence.detach()
             else:
-                raise ValueError(f'Unknown importance_sampling_level={self.importance_sampling_level!r}.')
+                raise ValueError(f"Unknown importance_sampling_level={self.importance_sampling_level!r}.")
         return log_ratio, torch.exp(log_weights)
 
     def _dual_clip_per_token_loss(self, ratio, advantages, logps):
         """PPO clip with an optional dual-clip floor ``delta`` on the raw ratio (legacy ordering)."""
         import torch
-        if self.delta is None or self.loss_type not in {'grpo', 'dapo', 'fipo', 'bnpo', 'dr_grpo'}:
+
+        if self.delta is None or self.loss_type not in {"grpo", "dapo", "fipo", "bnpo", "dr_grpo"}:
             return self._compute_per_token_loss(ratio, advantages, logps)
         clipped_ratio = torch.clamp(ratio, 1 - self.epsilon, 1 + self.epsilon_high)
         dual_clipped_ratio = torch.clamp(ratio, max=self.delta)
@@ -715,24 +756,25 @@ class GRPOLoss(Loss):
     def _rollout_is_weights(self, log_ratio, mask):
         """Truncated importance-sampling weights correcting the policy-vs-sampler (rollout) gap."""
         import torch
+
         ratio = torch.exp(torch.clamp(log_ratio, min=-20.0, max=20.0))
         mode = self.rollout_importance_sampling_mode
         threshold = self.rollout_importance_sampling_threshold
-        if mode == 'token_truncate':
+        if mode == "token_truncate":
             return torch.clamp(ratio, max=threshold)
-        if mode == 'token_mask':
+        if mode == "token_mask":
             return torch.where(ratio <= threshold, ratio, torch.zeros_like(ratio))
-        sequence = torch.exp((torch.log(ratio.clamp(min=1e-10)) * mask).sum(-1)
-                             / mask.sum(-1).clamp(min=1.0))
-        if mode == 'sequence_truncate':
+        sequence = torch.exp((torch.log(ratio.clamp(min=1e-10)) * mask).sum(-1) / mask.sum(-1).clamp(min=1.0))
+        if mode == "sequence_truncate":
             return torch.clamp(sequence, max=threshold).unsqueeze(-1).expand_as(ratio)
-        if mode == 'sequence_mask':
+        if mode == "sequence_mask":
             return ratio * (sequence <= threshold).unsqueeze(-1)
         return ratio
 
     def _fipo_weights(self, log_ratio, ratio, advantages, mask):
         """FIPO's detached future-KL influence weight (block-matmul of the decayed future log-ratio)."""
         import torch
+
         future_delta = log_ratio.masked_fill(~mask, 0.0)
         if self.delta is not None:
             # Dual-clip participation: high-ratio tokens do not contribute to the future KL.
@@ -745,8 +787,8 @@ class GRPOLoss(Loss):
             block_positions = torch.arange(start, end, device=log_ratio.device).unsqueeze(0)
             distance = block_positions - positions
             decay = torch.pow(
-                torch.as_tensor(self.fipo_gamma, dtype=log_ratio.dtype, device=log_ratio.device),
-                distance.clamp(min=0))
+                torch.as_tensor(self.fipo_gamma, dtype=log_ratio.dtype, device=log_ratio.device), distance.clamp(min=0)
+            )
             decay = decay * (distance >= 0).to(log_ratio.dtype)
             future_kl += torch.matmul(future_delta[:, start:end], decay.t())
         weights = torch.exp(future_kl.masked_fill(~mask, 0.0))
@@ -763,10 +805,10 @@ class GRPOLoss(Loss):
         if teacher_logps is None or self.sdar_loss_coef <= 0:
             return loss
         from twinkle.loss.sdar import compute_sdar_loss
-        student_logps = rl_outputs['logps']
-        response_mask = rl_inputs['labels'].ne(self.ignore_index)
-        teacher = self._pad_and_align_to_batch(
-            teacher_logps, response_mask, student_logps.device, student_logps.dtype)
+
+        student_logps = rl_outputs["logps"]
+        response_mask = rl_inputs["labels"].ne(self.ignore_index)
+        teacher = self._pad_and_align_to_batch(teacher_logps, response_mask, student_logps.device, student_logps.dtype)
         sdar_loss, _ = compute_sdar_loss(student_logps, teacher, response_mask, self.sdar_gate_beta)
         return loss + self.sdar_loss_coef * sdar_loss
 
@@ -784,22 +826,23 @@ class PPOLoss(GRPOLoss):
             sequence and then averages the sequences.
     """
 
-    _LOSS_AGG_MODES = {'token-mean', 'seq-mean-token-mean'}
+    _LOSS_AGG_MODES = {"token-mean", "seq-mean-token-mean"}
 
-    def __init__(self, loss_agg_mode: Literal['token-mean', 'seq-mean-token-mean'] = 'token-mean', **kwargs):
+    def __init__(self, loss_agg_mode: Literal["token-mean", "seq-mean-token-mean"] = "token-mean", **kwargs):
         super().__init__(**kwargs)
         if loss_agg_mode not in self._LOSS_AGG_MODES:
-            raise ValueError(f'Unsupported PPO loss_agg_mode: {loss_agg_mode}. '
-                             f'Expected one of {sorted(self._LOSS_AGG_MODES)}.')
+            raise ValueError(
+                f"Unsupported PPO loss_agg_mode: {loss_agg_mode}. Expected one of {sorted(self._LOSS_AGG_MODES)}."
+            )
         self.loss_agg_mode = loss_agg_mode
 
     def _aggregate_loss(
         self,
-        per_token_loss: 'torch.Tensor',
-        loss_mask: 'torch.Tensor',
+        per_token_loss: "torch.Tensor",
+        loss_mask: "torch.Tensor",
         **kwargs,
-    ) -> 'torch.Tensor':
-        if self.loss_agg_mode == 'token-mean':
+    ) -> "torch.Tensor":
+        if self.loss_agg_mode == "token-mean":
             return (per_token_loss * loss_mask).sum() / loss_mask.sum().clamp(min=1.0)
         return super()._aggregate_loss(per_token_loss, loss_mask, **kwargs)
 
@@ -813,7 +856,7 @@ class GSPOLoss(GRPOLoss):
     """
 
     def __init__(self, *args, **kwargs):
-        kwargs.setdefault('importance_sampling_level', 'sequence')
+        kwargs.setdefault("importance_sampling_level", "sequence")
         super().__init__(*args, **kwargs)
 
 
@@ -839,12 +882,13 @@ class SAPOLoss(GRPOLoss):
 
     def _compute_per_token_loss(
         self,
-        ratio: 'torch.Tensor',
-        advantages: 'torch.Tensor',
-        per_token_logps: 'torch.Tensor',
-    ) -> 'torch.Tensor':
+        ratio: "torch.Tensor",
+        advantages: "torch.Tensor",
+        per_token_logps: "torch.Tensor",
+    ) -> "torch.Tensor":
         """Soft-gated loss."""
         import torch
+
         gate_pos = torch.sigmoid(self.tau_pos * (ratio - 1)) * (4.0 / self.tau_pos)
         gate_neg = torch.sigmoid(self.tau_neg * (ratio - 1)) * (4.0 / self.tau_neg)
         is_positive = advantages > 0
@@ -862,8 +906,8 @@ class CISPOLoss(GRPOLoss):
     def micro_batch_scale(self, inputs, indices):
         token_counts = []
         for model_input in inputs:
-            labels = model_input['labels']
-            if hasattr(labels, 'ne'):
+            labels = model_input["labels"]
+            if hasattr(labels, "ne"):
                 token_counts.append(int(labels.ne(self.ignore_index).sum().item()))
             else:
                 token_counts.append(sum(int(token != self.ignore_index) for token in labels))
@@ -874,10 +918,10 @@ class CISPOLoss(GRPOLoss):
 
     def _compute_per_token_loss(
         self,
-        ratio: 'torch.Tensor',
-        advantages: 'torch.Tensor',
-        per_token_logps: 'torch.Tensor',
-    ) -> 'torch.Tensor':
+        ratio: "torch.Tensor",
+        advantages: "torch.Tensor",
+        per_token_logps: "torch.Tensor",
+    ) -> "torch.Tensor":
         """Clamped ratio * advantage * log_prob."""
         import torch
 
@@ -886,13 +930,13 @@ class CISPOLoss(GRPOLoss):
 
     def _aggregate_loss(
         self,
-        per_token_loss: 'torch.Tensor',
-        loss_mask: 'torch.Tensor',
+        per_token_loss: "torch.Tensor",
+        loss_mask: "torch.Tensor",
         **kwargs,
-    ) -> 'torch.Tensor':
+    ) -> "torch.Tensor":
         """Sum over all tokens, divide by total token count."""
         # Use provided num_items_in_batch if available, otherwise use mask sum
-        num_items = kwargs.get('num_items_in_batch', loss_mask.sum())
+        num_items = kwargs.get("num_items_in_batch", loss_mask.sum())
         return (per_token_loss * loss_mask).sum() / num_items
 
 
@@ -928,15 +972,16 @@ class BNPOLoss(GRPOLoss):
       sequence-mean as the micro size approaches 1).
     """
 
-    def __init__(self, *args, token_mean_scope: str = 'micro', **kwargs):
+    def __init__(self, *args, token_mean_scope: str = "micro", **kwargs):
         super().__init__(*args, **kwargs)
-        assert token_mean_scope in ('global', 'micro'), \
-            f'token_mean_scope must be global|micro, got {token_mean_scope!r}'
+        assert token_mean_scope in ("global", "micro"), (
+            f"token_mean_scope must be global|micro, got {token_mean_scope!r}"
+        )
         self.token_mean_scope = token_mean_scope
         # 'global' 返回的是 token 和（梯度在下游按 num_tokens=Σmask 归一）。必须同步告诉展示层
         # 这是 sum-reduction，否则 LossMetric（metric/loss.py）不会除以 num_tokens，会把每个 micro 的
         # token 和当均值直接平均，展示出一个被 token 数放大的巨大 loss（梯度不受影响，纯展示失真）。
-        self.reduction = 'sum' if token_mean_scope == 'global' else 'mean'
+        self.reduction = "sum" if token_mean_scope == "global" else "mean"
 
     def micro_batch_scale(self, inputs, indices):
         """The weight one micro-batch carries, which has to follow ``token_mean_scope``.
@@ -950,26 +995,26 @@ class BNPOLoss(GRPOLoss):
         the global token-mean and erase the distinction this scope exists to make -- which
         is the +3.2e-4 vs +0.031 per-token pg_loss measured above.
         """
-        if self.token_mean_scope == 'global':
+        if self.token_mean_scope == "global":
             return 1.0
         return super().micro_batch_scale(inputs, indices)
 
     def _aggregate_loss(
         self,
-        per_token_loss: 'torch.Tensor',
-        loss_mask: 'torch.Tensor',
+        per_token_loss: "torch.Tensor",
+        loss_mask: "torch.Tensor",
         **kwargs,
-    ) -> 'torch.Tensor':
+    ) -> "torch.Tensor":
         """global: return the token SUM (the global division is done downstream via
         num_tokens=Σmask). micro (legacy): local token-mean, later equal-weighted across
         micro/dp groups."""
         summed = (per_token_loss * loss_mask).sum()
-        if self.token_mean_scope == 'global':
+        if self.token_mean_scope == "global":
             return summed
         return summed / loss_mask.sum().clamp(min=1.0)
 
-    def _loss_num_tokens(self, loss_mask: 'torch.Tensor'):
-        if self.token_mean_scope == 'global':
+    def _loss_num_tokens(self, loss_mask: "torch.Tensor"):
+        if self.token_mean_scope == "global":
             return loss_mask.sum().clamp(min=1.0)
         return 0
 
@@ -994,10 +1039,10 @@ class DRGRPOLoss(GRPOLoss):
 
     def _aggregate_loss(
         self,
-        per_token_loss: 'torch.Tensor',
-        loss_mask: 'torch.Tensor',
+        per_token_loss: "torch.Tensor",
+        loss_mask: "torch.Tensor",
         **kwargs,
-    ) -> 'torch.Tensor':
+    ) -> "torch.Tensor":
         """Normalize by batch_size * max_completion_length."""
         batch_size = loss_mask.shape[0]
         return (per_token_loss * loss_mask).sum() / (batch_size * self.max_completion_length)
@@ -1025,20 +1070,21 @@ class REALLoss(GRPOLoss):
 
     def _reduce_loss(
         self,
-        logps: 'torch.Tensor',
-        old_logps: 'torch.Tensor',
-        ref_logps: Optional['torch.Tensor'],
-        advantages: 'torch.Tensor',
-        loss_mask: 'torch.Tensor',
-        log_importance_weights: 'torch.Tensor',
-        outputs: Dict,
+        logps: "torch.Tensor",
+        old_logps: "torch.Tensor",
+        ref_logps: Optional["torch.Tensor"],
+        advantages: "torch.Tensor",
+        loss_mask: "torch.Tensor",
+        log_importance_weights: "torch.Tensor",
+        outputs: dict,
         **kwargs,
     ) -> LossOutput:
         import torch
+
         batch_size = loss_mask.shape[0]
         assert self.num_generations > 0 and batch_size % self.num_generations == 0, (
-            f'REAL needs num_generations ({self.num_generations}) to divide the batch ({batch_size}) '
-            'into whole groups.')
+            f"REAL needs num_generations ({self.num_generations}) to divide the batch ({batch_size}) into whole groups."
+        )
         mask_sum = loss_mask.sum(-1).clamp(min=1.0)
 
         # Per-sequence score = mean token log importance ratio. Legacy REAL uses the UNCLAMPED token log
@@ -1067,10 +1113,10 @@ class REALLoss(GRPOLoss):
             zeros = torch.zeros(batch_scores.size(0), 1, device=batch_scores.device, dtype=batch_scores.dtype)
 
             # Negative loss: log(1 + sum(exp(S_neg)))
-            neg_input = scaled_scores.masked_fill(~batch_neg_mask, float('-inf'))
+            neg_input = scaled_scores.masked_fill(~batch_neg_mask, float("-inf"))
             neg_loss = torch.logsumexp(torch.cat([neg_input, zeros], dim=1), dim=1)
             # Positive loss: log(1 + sum(exp(-S_pos)))
-            pos_input = (-scaled_scores).masked_fill(~batch_pos_mask, float('-inf'))
+            pos_input = (-scaled_scores).masked_fill(~batch_pos_mask, float("-inf"))
             pos_loss = torch.logsumexp(torch.cat([pos_input, zeros], dim=1), dim=1)
 
             loss = (neg_loss + pos_loss).sum() / group_rewards.size(0)
