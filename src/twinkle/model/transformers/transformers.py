@@ -1127,7 +1127,10 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             return result
 
         forbidden_name_patterns = [r'bias', r'layernorm', r'rmsnorm', r'(?:^|\.)norm(?:$|\.)', r'_norm(?:$|\.)']
-        decay_parameters = get_parameter_names(self.model, [torch.nn.LayerNorm], forbidden_name_patterns)
+        # Match names from the same unwrapped model used by _get_trainable_parameters.
+        # DDP's module prefix otherwise changes optimizer groups for later tenants.
+        decay_parameters = get_parameter_names(
+            self.strategy.unwrap_model(self.model), [torch.nn.LayerNorm], forbidden_name_patterns)
         params = self._get_trainable_parameters(adapter_name)
         decay_param_names = [n for n, p in params.items() if (n in decay_parameters and p.requires_grad)]
         no_decay_param_names = [n for n, p in params.items() if (n not in decay_parameters and p.requires_grad)]
