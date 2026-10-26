@@ -12,6 +12,9 @@ function of the exempted call.
 
 The allowed exemptions are:
 
+- ``_submit_group`` submits a batch of dev async futures from within its caller's
+  single ``call_backend(_submit_group, ...)``; it is already inside that boundary;
+
 - the ray ``Queue.get`` inside ``sample_stream``'s ``_stream_queue``: it bridges the
   sampler actor's process boundary and is bounded by a dedicated double-timeout,
   not by ``call_backend``;
@@ -27,6 +30,7 @@ from __future__ import annotations
 
 # (module_relpath under src/twinkle/server, innermost enclosing function name)
 BACKEND_CALL_EXEMPTIONS: frozenset[tuple[str, str]] = frozenset({
+    ('sampler/twinkle_handlers.py', '_submit_group'),
     ('sampler/twinkle_handlers.py', '_stream_queue'),
     ('sampler/twinkle_handlers.py', '_stream_generation'),
 })

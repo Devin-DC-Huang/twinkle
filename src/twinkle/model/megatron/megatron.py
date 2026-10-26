@@ -794,7 +794,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
                 # rank skip the PP collectives while the others wait, and a degraded value would
                 # mask the failure.
                 logger.warning(
-                    "[nccl_safe] forward_step_func data processing error on rank: %s: %s", type(e).__name__, e
+                    "[forward_step] data processing error on rank: %s: %s", type(e).__name__, e
                 )
                 raise
             return output_tensor, partial(
