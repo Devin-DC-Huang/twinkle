@@ -27,18 +27,18 @@ on its strategy). What the two families DO share is the smaller contact surface
 the mcore-specific hooks). A second megatron-side strategy, if one ever appears,
 would take ``MegatronStrategy`` itself as the reference face.
 """
-
 from __future__ import annotations
-import os
+
 from abc import ABC, abstractmethod
 from contextlib import contextmanager, nullcontext
-from typing import Any
+import os
+from typing import Any, Dict, Optional
 
 # Env flags transformers/accelerate read to pick their FSDP-aware loading path (rank0 load,
 # meta-device placement, no full CPU materialization per rank).
 _FSDP_EFFICIENT_LOADING_ENV = {
-    "ACCELERATE_USE_FSDP": "true",
-    "FSDP_CPU_RAM_EFFICIENT_LOADING": "true",
+    'ACCELERATE_USE_FSDP': 'true',
+    'FSDP_CPU_RAM_EFFICIENT_LOADING': 'true',
 }
 
 
@@ -81,7 +81,7 @@ class TransformerStrategyBase(ABC):
         ...
 
     @abstractmethod
-    def get_full_state_dict(self, model) -> dict[str, Any]:
+    def get_full_state_dict(self, model) -> Dict[str, Any]:
         """Collect the full state dict (parameters and persistent buffers)."""
         ...
 
@@ -91,27 +91,25 @@ class TransformerStrategyBase(ABC):
         ...
 
     @abstractmethod
-    def get_adapter_state_dict(self, model, adapter_name: str) -> dict[str, Any]:
+    def get_adapter_state_dict(self, model, adapter_name: str) -> Dict[str, Any]:
         """Collect LoRA parameters, trained modules_to_save copies and their buffers."""
         ...
 
     @abstractmethod
-    def save_optimizer_checkpoint(
-        self, model, optimizer, output_path: str, *, param_name_mapping: dict[str, str] | None = None
-    ) -> None:
+    def save_optimizer_checkpoint(self, model, optimizer, output_path: str, *,
+                                  param_name_mapping: Optional[Dict[str, str]] = None) -> None:
         """Persist optimizer state under ``output_path``."""
         ...
 
     @abstractmethod
-    def load_optimizer_checkpoint(
-        self, model, optimizer, input_path: str, *, param_name_mapping: dict[str, str] | None = None
-    ) -> None:
+    def load_optimizer_checkpoint(self, model, optimizer, input_path: str, *,
+                                  param_name_mapping: Optional[Dict[str, str]] = None) -> None:
         """Restore optimizer state from ``input_path``."""
         ...
 
     # ── layer 2: required, with a universal default ────────────────────────
 
-    def init_kwargs(self) -> dict[str, Any]:
+    def init_kwargs(self) -> Dict[str, Any]:
         """Extra kwargs the model construction call needs for this strategy.
 
         Strategies without engine-specific load kwargs return an empty dict.
@@ -139,17 +137,14 @@ class TransformerStrategyBase(ABC):
         when one is passed. Strategies that cannot move either piece still refuse.
         """
         raise NotImplementedError(
-            f"{type(self).__name__} does not support weight offload, which the colocation "
-            "flow requires. Use a strategy with offload support (accelerate / native FSDP / deepspeed / megatron)."
-        )
+            f'{type(self).__name__} does not support weight offload, which the colocation '
+            'flow requires. Use a strategy with offload support (accelerate / native FSDP / deepspeed / megatron).')
 
     def reload_to_gpu(self, model, optimizer=None) -> None:
         """Bring back whatever :meth:`offload_to_cpu` moved; a no-op when nothing was moved."""
         from twinkle.model.offload import offload_record
-
         if not any(offload_record(self)):
             return
         raise NotImplementedError(
-            f"{type(self).__name__} does not support weight offload, which the colocation "
-            "flow requires. Use a strategy with offload support (accelerate / native FSDP / deepspeed / megatron)."
-        )
+            f'{type(self).__name__} does not support weight offload, which the colocation '
+            'flow requires. Use a strategy with offload support (accelerate / native FSDP / deepspeed / megatron).')

@@ -3,9 +3,8 @@ import os
 import re
 import shutil
 from abc import ABC, abstractmethod
-from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import TYPE_CHECKING, Any, Optional, Protocol, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Protocol, Type, Union
 
 from twinkle import Platform, remote_function, torch_util
 from twinkle.data_format import InputFeature, ModelOutput
@@ -21,31 +20,31 @@ if TYPE_CHECKING:
     import torch
     from torch.optim import Optimizer
     from torch.optim.lr_scheduler import LRScheduler
-    from transformers import PretrainedConfig, PreTrainedModel
+    from transformers import PreTrainedModel, PretrainedConfig
 
 
 def copy_checkpoint_args(output_dir: str, checkpoint_dir: str) -> None:
     """Copy the run-level CLI metadata into a completed checkpoint on the master rank."""
     if not Platform.is_master():
         return
-    source = os.path.join(output_dir, "args.json")
-    target = os.path.join(checkpoint_dir, "args.json")
+    source = os.path.join(output_dir, 'args.json')
+    target = os.path.join(checkpoint_dir, 'args.json')
     if os.path.isfile(source) and os.path.realpath(source) != os.path.realpath(target):
         shutil.copy2(source, target)
 
 
-def rotate_checkpoints(output_dir: str, current_checkpoint_dir: str, save_total_limit: int | None) -> None:
+def rotate_checkpoints(output_dir: str, current_checkpoint_dir: str, save_total_limit: Optional[int]) -> None:
     """Retain the newest completed checkpoint directories, always protecting the current save."""
     if save_total_limit is None:
         return
     if save_total_limit < 1:
-        raise ValueError("save_total_limit must be >= 1.")
+        raise ValueError('save_total_limit must be >= 1.')
     if not Platform.is_master() or not os.path.isdir(output_dir):
         return
     current = os.path.realpath(current_checkpoint_dir)
     checkpoints = []
     for entry in os.scandir(output_dir):
-        if not entry.is_dir(follow_symlinks=False) or re.fullmatch(r"checkpoint-(?:\d+|final)", entry.name) is None:
+        if not entry.is_dir(follow_symlinks=False) or re.fullmatch(r'checkpoint-(?:\d+|final)', entry.name) is None:
             continue
         path = os.path.realpath(entry.path)
         checkpoints.append((path == current, entry.stat(follow_symlinks=False).st_mtime_ns, entry.name, path))
@@ -54,15 +53,13 @@ def rotate_checkpoints(output_dir: str, current_checkpoint_dir: str, save_total_
         shutil.rmtree(checkpoint_path)
 
 
-def _freeze_then_activate(
-    named_params,
-    *,
-    freeze_ratio: float = 0.0,
-    freeze_names=(),
-    freeze_regex: str | None = None,
-    trainable_names=(),
-    trainable_regex: str | None = None,
-) -> None:
+def _freeze_then_activate(named_params,
+                          *,
+                          freeze_ratio: float = 0.0,
+                          freeze_names=(),
+                          freeze_regex: Optional[str] = None,
+                          trainable_names=(),
+                          trainable_regex: Optional[str] = None) -> None:
     """Mutate ``requires_grad`` on a list of ``(name, param)`` pairs: freeze_* then trainable_*.
 
     The pure core of :meth:`TrainableModel.freeze_parameters`, split out so the ordering / matching
@@ -124,19 +121,24 @@ class ModelLoaderProtocol(Protocol):
     this Protocol structurally without inheriting it.
     """
 
-    def build_config(self, model_dir: str, **kwargs) -> "PretrainedConfig": ...
+    def build_config(self, model_dir: str, **kwargs) -> 'PretrainedConfig':
+        ...
 
-    def process_config(self, config: "PretrainedConfig") -> "PretrainedConfig": ...
+    def process_config(self, config: 'PretrainedConfig') -> 'PretrainedConfig':
+        ...
 
-    def build_processor(self, model_dir: str, config: "PretrainedConfig", **kwargs) -> Any: ...
+    def build_processor(self, model_dir: str, config: 'PretrainedConfig', **kwargs) -> Any:
+        ...
 
-    def process_tokenizer(self, tokenizer: Any) -> Any: ...
+    def process_tokenizer(self, tokenizer: Any) -> Any:
+        ...
 
-    def build_model(
-        self, model_dir: str, config: "PretrainedConfig", processor: Any, **kwargs
-    ) -> "PreTrainedModel": ...
+    def build_model(self, model_dir: str, config: 'PretrainedConfig', processor: Any,
+                    **kwargs) -> 'PreTrainedModel':
+        ...
 
-    def process_model(self, model: "PreTrainedModel") -> "PreTrainedModel": ...
+    def process_model(self, model: 'PreTrainedModel') -> 'PreTrainedModel':
+        ...
 
 
 class TrainableModel(ABC):
@@ -157,8 +159,8 @@ class TrainableModel(ABC):
     """
 
     _checkpoint_engine = None
-    _async_write_executor: ThreadPoolExecutor | None = None
-    _async_write_future: Future | None = None
+    _async_write_executor: Optional[ThreadPoolExecutor] = None
+    _async_write_future: Optional[Future] = None
 
     # -- async checkpoint persistence (staging/write separation) --------------------
     #
@@ -175,7 +177,6 @@ class TrainableModel(ABC):
 
     def _stage(self) -> None:
         """Hook for subclasses needing extra synchronous staging work before a write is submitted."""
-        return
 
     def submit_async_write(self, fn: Callable[[], None]) -> None:
         """Run ``fn`` (pure file I/O over already-staged CPU payloads) on the background writer."""
@@ -183,7 +184,7 @@ class TrainableModel(ABC):
         self._join_async_save()
         self._async_write_future = executor.submit(fn)
 
-    @remote_function(dispatch="all", collect="none", lazy_collect=False)
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
     def wait_async_saves(self) -> None:
         """Join and re-raise any failure from the in-flight background write."""
         self._join_async_save()
@@ -191,7 +192,8 @@ class TrainableModel(ABC):
     def _async_save_executor(self) -> ThreadPoolExecutor:
         # Lazily created so instances that never save asynchronously pay nothing.
         if self._async_write_executor is None:
-            self._async_write_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="async-save")
+            self._async_write_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix='async-save')
         return self._async_write_executor
 
     def _join_async_save(self) -> None:
@@ -210,90 +212,114 @@ class TrainableModel(ABC):
 
     def __del__(self):
         # Best-effort: an unjoined in-flight write at teardown loses the checkpoint silently otherwise.
-        executor = getattr(self, "_async_write_executor", None)
+        executor = getattr(self, '_async_write_executor', None)
         if executor is not None:
             self.shutdown_async_saves()
 
     @abstractmethod
-    def forward(self, *, inputs: dict[str, Any], **kwargs) -> ModelOutput: ...
+    def forward(self, *, inputs: Dict[str, Any], **kwargs) -> ModelOutput:
+        ...
 
     @abstractmethod
-    def forward_only(self, *, inputs: dict[str, Any], **kwargs) -> ModelOutput: ...
+    def forward_only(self, *, inputs: Dict[str, Any], **kwargs) -> ModelOutput:
+        ...
 
     @abstractmethod
-    def calculate_loss(self, **kwargs) -> float: ...
+    def calculate_loss(self, **kwargs) -> float:
+        ...
 
     @abstractmethod
-    def backward(self, **kwargs) -> None: ...
+    def backward(self, **kwargs) -> None:
+        ...
 
     @abstractmethod
-    def forward_backward(self, *, inputs: dict[str, Any], **kwargs) -> ModelOutput: ...
+    def forward_backward(self, *, inputs: Dict[str, Any], **kwargs) -> ModelOutput:
+        ...
 
     @abstractmethod
-    def clip_grad_norm(self, max_grad_norm: float = 1.0, norm_type=2, **kwargs) -> float: ...
+    def clip_grad_norm(self, max_grad_norm: float = 1.0, norm_type=2, **kwargs) -> float:
+        ...
 
     @abstractmethod
-    def step(self, **kwargs) -> None: ...
+    def step(self, **kwargs) -> None:
+        ...
 
     @abstractmethod
-    def zero_grad(self, **kwargs) -> None: ...
+    def zero_grad(self, **kwargs) -> None:
+        ...
 
     @abstractmethod
-    def lr_step(self, **kwargs) -> None: ...
+    def lr_step(self, **kwargs) -> None:
+        ...
 
     @abstractmethod
-    def clip_grad_and_step(self, max_grad_norm: float = 1.0, norm_type=2, **kwargs) -> None: ...
+    def clip_grad_and_step(self, max_grad_norm: float = 1.0, norm_type=2, **kwargs) -> None:
+        ...
 
     @abstractmethod
-    def set_loss(
-        self,
-        loss_cls: Loss | type[Loss] | str | Callable[[InputFeature, ModelOutput, ...], "torch.Tensor"],
-        **kwargs,
-    ) -> None: ...
+    def set_loss(self, loss_cls: Union[Loss, Type[Loss], str, Callable[[InputFeature, ModelOutput, ...],
+                                                                       'torch.Tensor']], **kwargs) -> None:
+        ...
 
     @abstractmethod
-    def set_optimizer(self, optimizer_cls: Union["Optimizer", type["Optimizer"], str], **kwargs) -> None: ...
+    def set_optimizer(self, optimizer_cls: Union['Optimizer', Type['Optimizer'], str], **kwargs) -> None:
+        ...
 
     @abstractmethod
-    def set_lr_scheduler(self, scheduler_cls: Union["LRScheduler", type["LRScheduler"], str], **kwargs) -> None: ...
+    def set_lr_scheduler(self, scheduler_cls: Union['LRScheduler', Type['LRScheduler'], str], **kwargs) -> None:
+        ...
 
     @abstractmethod
-    def save(self, name: str, output_dir: str | None = None, **kwargs) -> str: ...
+    def save(self, name: str, output_dir: Optional[str] = None, **kwargs) -> str:
+        ...
 
     @abstractmethod
-    def load(self, name: str, output_dir: str | None = None, **kwargs) -> None: ...
+    def load(self, name: str, output_dir: Optional[str] = None, **kwargs) -> None:
+        ...
 
     @abstractmethod
-    def get_state_dict(self, **kwargs) -> dict[str, Any]: ...
+    def get_state_dict(self, **kwargs) -> Dict[str, Any]:
+        ...
 
     @abstractmethod
-    def resume_from_checkpoint(
-        self, checkpoint_dir: str, *, resume_only_model: bool = False, **kwargs
-    ) -> dict[str, Any]: ...
+    def resume_from_checkpoint(self,
+                               checkpoint_dir: str,
+                               *,
+                               resume_only_model: bool = False,
+                               **kwargs) -> Dict[str, Any]:
+        ...
 
     @abstractmethod
-    def apply_patch(self, patch_cls: Patch | type[Patch] | str, **kwargs) -> None: ...
+    def apply_patch(self, patch_cls: Union[Patch, Type[Patch], str], **kwargs) -> None:
+        ...
 
     @abstractmethod
-    def add_metric(self, metric_cls: Metric | str, is_training: bool | None = None, **kwargs) -> None: ...
+    def add_metric(self, metric_cls: Union[Metric, str], is_training: Optional[bool] = None, **kwargs) -> None:
+        ...
 
     @abstractmethod
-    def calculate_metric(self, is_training: bool, **kwargs) -> dict[str, Any]: ...
+    def calculate_metric(self, is_training: bool, **kwargs) -> Dict[str, Any]:
+        ...
 
     @abstractmethod
-    def empty_cache(self, **kwargs) -> None: ...
+    def empty_cache(self, **kwargs) -> None:
+        ...
 
     @abstractmethod
-    def add_adapter_to_model(self, adapter_name: str, config_or_dir, **kwargs) -> None: ...
+    def add_adapter_to_model(self, adapter_name: str, config_or_dir, **kwargs) -> None:
+        ...
 
     @abstractmethod
-    def set_template(self, template_cls: Template | type[Template] | str, **kwargs) -> None: ...
+    def set_template(self, template_cls: Union[Template, Type[Template], str], **kwargs) -> None:
+        ...
 
     @abstractmethod
-    def set_processor(self, processor_cls: InputProcessor | type[InputProcessor] | str, **kwargs) -> None: ...
+    def set_processor(self, processor_cls: Union[InputProcessor, Type[InputProcessor], str], **kwargs) -> None:
+        ...
 
     @abstractmethod
-    def get_train_configs(self, **kwargs) -> str: ...
+    def get_train_configs(self, **kwargs) -> str:
+        ...
 
     @staticmethod
     def _not_encoded(inputs):
@@ -318,13 +344,14 @@ class TrainableModel(ABC):
         # `*input_ids` key (it has `messages` + media), so keying on the suffix distinguishes the two
         # without a bare-`input_ids`-only probe misreading a group row as raw and re-encoding it.
         return not any(
-            k in ("input_ids", "input_embedding") or k.endswith("_input_ids") or k.endswith("_input_embedding")
-            for k in inputs
-        )
+            k in ('input_ids', 'input_embedding') or k.endswith('_input_ids') or k.endswith('_input_embedding')
+            for k in inputs)
 
-    def upload_to_hub(
-        self, checkpoint_dir: str, hub_model_id: str, hub_token: str | None = None, async_upload: bool = True
-    ) -> None:
+    def upload_to_hub(self,
+                      checkpoint_dir: str,
+                      hub_model_id: str,
+                      hub_token: Optional[str] = None,
+                      async_upload: bool = True) -> None:
         """Upload model checkpoint to hub.
 
         Args:
@@ -335,12 +362,11 @@ class TrainableModel(ABC):
         """
         if async_upload:
             HubOperation.async_push_to_hub(
-                repo_id=hub_model_id, folder_path=checkpoint_dir, token=hub_token, private=True
-            )
+                repo_id=hub_model_id, folder_path=checkpoint_dir, token=hub_token, private=True)
         else:
             HubOperation.push_to_hub(repo_id=hub_model_id, folder_path=checkpoint_dir, token=hub_token, private=True)
 
-    @remote_function(dispatch="all", collect="none", lazy_collect=False)
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
     @timed
     def offload_to_cpu(self, *, offload_model: bool = True, offload_optimizer: bool = True) -> None:
         """Hand this rank's training memory back so a colocated process can use the device.
@@ -371,7 +397,6 @@ class TrainableModel(ABC):
         """
         if not offload_model and not offload_optimizer:
             from twinkle.model.offload import record_offload, release_caching_allocator
-
             record_offload(self.strategy, model=False, optimizer=False)
             release_caching_allocator()
             return
@@ -383,7 +408,7 @@ class TrainableModel(ABC):
         else:
             self.strategy.offload_to_cpu(self.model, optimizer, offload_model=False)
 
-    @remote_function(dispatch="all", collect="none", lazy_collect=False)
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
     @timed
     def reload_to_gpu(self) -> None:
         """Bring back what :meth:`offload_to_cpu` released, to the device it was moved off.
@@ -393,7 +418,7 @@ class TrainableModel(ABC):
         """
         self.strategy.reload_to_gpu(self.model, self._colocation_optimizer())
 
-    def _colocation_optimizer(self) -> Optional["Optimizer"]:
+    def _colocation_optimizer(self) -> Optional['Optimizer']:
         """The default group's optimizer, or None before one exists.
 
         Resolved through the group on every call rather than cached: a model offloaded before its
@@ -403,16 +428,14 @@ class TrainableModel(ABC):
         group = self.optimizer_group.get(self._get_default_group())
         return group.optimizer if group is not None else None
 
-    @remote_function(dispatch="all", collect="none", lazy_collect=False)
-    def freeze_parameters(
-        self,
-        *,
-        freeze_ratio: float = 0.0,
-        freeze_names=(),
-        freeze_regex: str | None = None,
-        trainable_names=(),
-        trainable_regex: str | None = None,
-    ) -> None:
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
+    def freeze_parameters(self,
+                          *,
+                          freeze_ratio: float = 0.0,
+                          freeze_names=(),
+                          freeze_regex: Optional[str] = None,
+                          trainable_names=(),
+                          trainable_regex: Optional[str] = None) -> None:
         """Set ``requires_grad`` on this rank's parameters for full-parameter freeze / activate.
 
         This is the driver-facing handle for a full-parameter run's ``freeze_parameters`` /
@@ -446,40 +469,37 @@ class TrainableModel(ABC):
             freeze_names=freeze_names,
             freeze_regex=freeze_regex,
             trainable_names=trainable_names,
-            trainable_regex=trainable_regex,
-        )
+            trainable_regex=trainable_regex)
 
     def _should_bind_device_id_for_process_group(self, backend: str) -> bool:
-        return backend in ("nccl", "hccl")
+        return backend in ('nccl', 'hccl')
 
     def _try_init_process_group(self):
         import torch
         import torch.distributed as dist
-
         if not dist.is_initialized() and Platform.get_world_size() > 1:
             torch_util.set_device()
             backend = Platform.device_backend()
-            if backend == "hccl":
+            if backend == 'hccl':
                 # fix: In multi-job NPU runs, HCCL default ports may collide (bind/listen failures).
                 # fix: Inject deterministic per-job port ranges before PG init to reduce cross-job conflicts.
                 # Keep training-side HCCL sockets on a per-job port layout to
                 # avoid collisions with other jobs on the same host.
                 from twinkle.utils.platforms import ensure_hccl_socket_env
-
-                master_port = int(os.environ.get("MASTER_PORT", "29500"))
+                master_port = int(os.environ.get('MASTER_PORT', '29500'))
                 ensure_hccl_socket_env(master_port)
             init_kwargs = {
-                "backend": backend,
-                "init_method": "env://",
-                "rank": Platform.get_rank(),
-                "world_size": Platform.get_world_size(),
+                'backend': backend,
+                'init_method': 'env://',
+                'rank': Platform.get_rank(),
+                'world_size': Platform.get_world_size(),
             }
             if self._should_bind_device_id_for_process_group(backend):
-                init_kwargs["device_id"] = torch.device(Platform.get_local_device())
+                init_kwargs['device_id'] = torch.device(Platform.get_local_device())
             dist.init_process_group(**init_kwargs)
-            if backend == "hccl":
+            if backend == 'hccl':
                 default_pg = dist.distributed_c10d._get_default_group()
-                if getattr(default_pg, "bound_device_id", None) is not None:
+                if getattr(default_pg, 'bound_device_id', None) is not None:
                     # If the default HCCL PG keeps a bound device id, PyTorch may
                     # propagate that binding into later Gloo subgroup creation. That
                     # breaks the metrics/object-gather path on NPU, so clear it

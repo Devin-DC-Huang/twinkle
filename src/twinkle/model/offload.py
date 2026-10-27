@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Placement records and optimizer-state moves shared by colocate offload."""
+from typing import Tuple
 
 import torch
 
@@ -26,10 +27,10 @@ def release_caching_allocator() -> None:
     Torch.empty_cache()
 
 
-def offload_record(strategy) -> tuple[bool, bool]:
+def offload_record(strategy) -> Tuple[bool, bool]:
     return (
-        bool(getattr(strategy, "_offloaded_model", False)),
-        bool(getattr(strategy, "_offloaded_optimizer", False)),
+        bool(getattr(strategy, '_offloaded_model', False)),
+        bool(getattr(strategy, '_offloaded_optimizer', False)),
     )
 
 
@@ -55,7 +56,7 @@ def move_optimizer_state(optimizer, device) -> None:
 def move_grads(module, device) -> None:
     """``module.to`` moves parameters, not ``param.grad``."""
     for param in module.parameters():
-        grad = getattr(param, "grad", None)
+        grad = getattr(param, 'grad', None)
         if torch.is_tensor(grad):
             param.grad = grad.to(device)
 
@@ -63,4 +64,4 @@ def move_grads(module, device) -> None:
 def parameter_device(module):
     for param in module.parameters():
         return param.device
-    return torch.device("cpu")
+    return torch.device('cpu')
