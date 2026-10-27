@@ -129,7 +129,14 @@ class ServerLauncher:
         self._ray_initialized = True
 
     def _start_serve(self) -> None:
-        """Start Ray Serve with http_options from config."""
+        """Start Ray Serve with http_options from config, or attach to a running instance.
+
+        Serve's http_options are cluster-scoped: when a Serve instance is already running on
+        the cluster (another deployment started it), it is REUSED -- shutting it down here
+        would kill every live application, which is exactly wrong for coexisting deployments.
+        The running instance's listener (host/port/TLS) wins; the request is logged so the
+        operator can see which knobs were ignored.
+        """
         if self._serve_started:
             return
 
@@ -137,12 +144,16 @@ class ServerLauncher:
 
         try:
             from ray.serve.context import _get_global_client
-            _get_global_client()
-            # Serve is running, shut it down before re-starting
-            serve.shutdown()
+            client = _get_global_client()
         except Exception:
-            # Serve not running — nothing to shut down
-            pass
+            client = None
+        if client is not None:
+            requested = self.config.http_options.model_dump()
+            logger.info('Ray Serve is already running on this cluster; reusing it. Its listener '
+                        '(host/port) was fixed when Serve first started; the requested '
+                        f'http_options {requested} take effect only through route prefixes.')
+            self._serve_started = True
+            return
 
         http_options = self.config.http_options.model_dump()
         serve_kwargs: dict[str, Any] = {'http_options': http_options}
@@ -215,12 +226,15 @@ class ServerLauncher:
         serve.run(app, name=name, route_prefix=route_prefix)
         logger.info(f'Deployed {name} at {route_prefix}')
 
-    def launch(self) -> None:
+    def launch(self, blocking: bool = True) -> None:
         """Launch the server with all configured applications.
 
         Blocks the calling thread to keep the server running. Installs signal
         handlers for SIGINT/SIGTERM so that ``serve.shutdown()`` is called on
-        termination instead of leaving orphaned deployments.
+        termination instead of leaving orphaned deployments. With
+        ``blocking=False`` the call returns once every application was
+        submitted -- detached deployments own their lifetime on the Ray
+        cluster, not in this driver.
         """
         # Apply Ray Serve patches before initializing Ray
         apply_ray_serve_patches()
@@ -286,6 +300,9 @@ class ServerLauncher:
         for app_spec in applications:
             logger.info('  Endpoint: http://%s:%s%s', host, port, app_spec.route_prefix)
 
+        if not blocking:
+            return
+
         # Graceful shutdown via signal handling
         shutdown_event = threading.Event()
 
@@ -343,6 +360,7 @@ def launch_server(
     config: ServerConfig | None = None,
     config_path: str | Path | None = None,
     ray_namespace: str | None = None,
+    blocking: bool = True,
 ) -> None:
     """Launch a twinkle server — the single launch choke point.
 
@@ -350,7 +368,9 @@ def launch_server(
     ``config_path`` (a YAML file) must be provided. When a path is given the
     config is loaded via :meth:`ServerConfig.from_yaml` here, so there is one
     construction path: load config → ``ServerLauncher(config=...)`` →
-    ``launch()``. The call blocks until a SIGINT/SIGTERM signal is received.
+    ``launch()``. The call blocks until a SIGINT/SIGTERM signal is received,
+    unless ``blocking=False`` (detached deployment: the driver exits and the
+    applications stay up on the Ray cluster).
 
     Raises:
         ValueError: neither ``config`` nor ``config_path`` was provided.
@@ -375,4 +395,4 @@ def launch_server(
         config=config,
         ray_namespace=ray_namespace or config.ray_namespace,
     )
-    launcher.launch()
+    launcher.launch(blocking=blocking)

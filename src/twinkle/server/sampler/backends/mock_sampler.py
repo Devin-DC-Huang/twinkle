@@ -188,6 +188,10 @@ class MockSampler:
 
     @remote_function()
     def set_template(self, template_cls: Any, **kwargs: Any) -> None:
+        # Mirror the base sampler's rule: pin to this sampler's own model when the caller
+        # (the construct-time template pin) did not carry a model_id.
+        if 'model_id' not in kwargs and hasattr(self, 'model_id'):
+            kwargs['model_id'] = self.model_id
         self.template = construct_template(template_cls, **kwargs)
 
     @remote_function()
