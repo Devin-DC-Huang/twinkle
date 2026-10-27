@@ -853,16 +853,13 @@ class VLLMEngine(BaseSamplerEngine):
                 logger.warning('Failed to unload LoRA %s: %s', adapter_path, exc)
 
     async def sleep(self, level: int = 2) -> None:
-        """
-        Offload weights and/or KV cache from GPU memory.
+        """Release colocated vLLM memory. Matches the installed vLLM levels.
 
-        Used in colocated mode to free GPU memory for training.
-
-        Args:
-            level: Sleep level.
-                1 = offload KV cache only
-                2 = offload KV cache and weights
+        0 leaves the engine resident (swift v4: do not sleep). 1 offloads weights to CPU and
+        discards the KV cache. 2 discards weights and KV; vLLM keeps named buffers.
         """
+        if int(level) <= 0:
+            return
         if not self.enable_sleep_mode:
             logger.warning('sleep_mode not enabled, skipping sleep')
             return
