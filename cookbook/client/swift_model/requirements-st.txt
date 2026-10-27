@@ -1,4 +1,0 @@
-# Pinned dependency for the dev on-demand/ST CS investigation.
-# The constructor blocker is documented in README-st.md.
-ms-swift @ git+https://github.com/modelscope/ms-swift.git@7e4203a961416952e1c8ea5b8fb1763139d56bfa
-sentence-transformers==6.2.0
