@@ -161,20 +161,20 @@ def plan_micro_batches(
     padding_free: bool,
     min_micro_batches: int = 1,
 ) -> list[list[int]]:
+    """Plan contiguous fixed batches or token-packed dynamic batches.
+
+    ``min_micro_batches`` only applies to dynamic batching. Fixed batches keep
+    their configured size, with a possibly smaller final batch.
+    """
     if not inputs:
         raise ValueError("cannot plan micro-batches for empty inputs")
+    if not config.dynamic_batching:
+        return [
+            list(range(start, min(start + config.micro_batch_size, len(inputs))))
+            for start in range(0, len(inputs), config.micro_batch_size)
+        ]
     if min_micro_batches <= 0 or min_micro_batches > len(inputs):
         raise ValueError(f"invalid min_micro_batches={min_micro_batches} for {len(inputs)} inputs")
-    if not config.dynamic_batching:
-        group_count = max(min_micro_batches, math.ceil(len(inputs) / config.micro_batch_size))
-        base_size, remainder = divmod(len(inputs), group_count)
-        groups = []
-        start = 0
-        for group_index in range(group_count):
-            size = base_size + int(group_index < remainder)
-            groups.append(list(range(start, start + size)))
-            start += size
-        return groups
     lengths = [sequence_length(model_input) for model_input in inputs]
     capacity = config.max_tokens_per_micro_batch
     oversized = [length for length in lengths if length > capacity]
