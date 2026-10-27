@@ -1,17 +1,27 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
-
 import time
-from datetime import datetime, timezone
-from pydantic import BaseModel, Field, model_validator
+from datetime import UTC, datetime, timezone
 from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 def _now_iso() -> str:
     # UTC-aware so _parse_timestamp (which reads timestamps back as UTC) agrees with
     # it and with time.time(); a naive local string would be misread as UTC and skew
     # every expiry comparison by the host's UTC offset.
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
+
+
+class RuntimeContext(BaseModel):
+    """Allocation identity passed to a worker; never a client request payload."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    namespace: str
+    registry_name: str
+    instance_id: str
 
 
 class SessionRecord(BaseModel):
@@ -35,6 +45,9 @@ class ModelRecord(BaseModel):
     lora_config: Any = None
     replica_id: str | None = None
     created_at: str = Field(default_factory=_now_iso)
+    controller_epoch: str | None = None
+    training_namespace: str | None = None
+    instance_id: str | None = None
 
 
 class SamplingSessionRecord(BaseModel):
@@ -52,37 +65,15 @@ class FutureFailureRecord(BaseModel):
 
     reason_code: str
     message: str
-    attribution: Literal['user', 'server']
+    attribution: Literal["user", "server"]
     details: list[dict[str, Any]] | None = None
     diagnostic: str | None = None
-
-
-# Canonical set of protocol-independent failure reason codes. The Twinkle and Tinker
-# gateways each map this same key set to their own wire vocabularies; keeping the set
-# in one place lets a consistency test catch a map that drifts out of coverage.
-FAILURE_REASON_CODES: frozenset[str] = frozenset({
-    'invalid_request',
-    'request_rejected',
-    'resource_not_found',
-    'full_mode_busy',
-    'input_tokens_exceeded',
-    'batch_size_invalid',
-    'rate_limit_exceeded',
-    'resource_quota_exceeded',
-    'cancelled',
-    'endpoint_unavailable',
-    'state_contention',
-    'backend_gate_unavailable',
-    'orphaned_replica',
-    'execution_timeout',
-    'deadline_exceeded',
-    'internal_error',
-})
 
 
 class FutureRecord(BaseModel):
     """Represents an async task future / request status."""
 
+    owner_token: str | None = None
     status: str
     model_id: str | None = None
     reason: str | None = None
@@ -96,13 +87,13 @@ class FutureRecord(BaseModel):
     created_at: str = Field(default_factory=_now_iso)
     updated_at: str = Field(default_factory=_now_iso)
 
-    @model_validator(mode='after')
+    @model_validator(mode="after")
     def result_and_failure_match_status(self) -> FutureRecord:
-        is_failure = self.status in ('failed', 'cancelled')
+        is_failure = self.status in ("failed", "cancelled")
         if is_failure and self.failure is None:
-            raise ValueError(f'{self.status} future requires failure')
+            raise ValueError(f"{self.status} future requires failure")
         if is_failure and self.result is not None:
-            raise ValueError(f'{self.status} future cannot carry result')
+            raise ValueError(f"{self.status} future cannot carry result")
         if not is_failure and self.failure is not None:
-            raise ValueError(f'{self.status} future cannot carry failure')
+            raise ValueError(f"{self.status} future cannot carry failure")
         return self

@@ -1,6 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
-
 import functools
 import time
 
@@ -22,7 +21,7 @@ def _session_touch_transform(existing: dict | None, *, now: float) -> dict | Non
     if existing is None:
         return None
     updated = dict(existing)
-    updated['last_heartbeat'] = now
+    updated["last_heartbeat"] = now
     return updated
 
 
@@ -34,7 +33,7 @@ class SessionManager(BaseManager[SessionRecord]):
     """
 
     def __init__(self, backend: StateBackend, expiration_timeout: float) -> None:
-        super().__init__(backend, 'session::', SessionRecord, expiration_timeout)
+        super().__init__(backend, "session::", SessionRecord, expiration_timeout)
 
     # ----- Session-specific operations -----
 
@@ -56,7 +55,7 @@ class SessionManager(BaseManager[SessionRecord]):
         except ConcurrencyError as e:
             # touch() is per-heartbeat best-effort — losing one round under
             # contention is recoverable as soon as the next heartbeat arrives.
-            logger.warning('SessionManager.touch dropped due to contention: %s', e)
+            logger.warning("SessionManager.touch dropped due to contention: %s", e)
             return False
         return result is not None
 
@@ -66,6 +65,13 @@ class SessionManager(BaseManager[SessionRecord]):
         if record is None:
             return None
         return record.last_heartbeat
+
+    async def get_last_heartbeats(self, session_ids: list[str]) -> dict[str, float | None]:
+        records = await self._backend.mget([self._make_key(identity) for identity in session_ids])
+        return {
+            identity: SessionRecord.model_validate(record).last_heartbeat if record is not None else None
+            for identity, record in zip(session_ids, records, strict=True)
+        }
 
     # ----- Cleanup -----
 

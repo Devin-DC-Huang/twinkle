@@ -2,11 +2,11 @@
 """
 Processor Lifecycle Manager Mixin for Twinkle Server.
 
-Mirrors AdapterManagerMixin but adds a global per-token processor limit.
+Adds a global per-token processor limit to session resources.
 Sessions are tracked via session ID; processors expire when their session expires.
 """
-from __future__ import annotations
 
+from __future__ import annotations
 from abc import abstractmethod
 
 from twinkle.utils.logger import get_logger
@@ -18,7 +18,7 @@ logger = get_logger()
 class ProcessorManagerMixin(SessionResourceMixin):
     """Mixin for processor lifecycle management with session-based expiration.
 
-    Mirrors AdapterManagerMixin with an additional per-token processor limit.
+    Manages processor sessions with a global per-token processor limit.
 
     Inheriting classes should:
     1. Call _init_processor_manager() in __init__
@@ -30,7 +30,7 @@ class ProcessorManagerMixin(SessionResourceMixin):
     """
 
     # Set resource type for logging
-    _resource_type = 'Processor'
+    _resource_type = "Processor"
 
     def _init_processor_manager(
         self,
@@ -61,7 +61,7 @@ class ProcessorManagerMixin(SessionResourceMixin):
             return False
         try:
             renewed = await self.state.renew_processor_quota(
-                info['token'],
+                info["token"],
                 resource_id,
                 lease_seconds=self._processor_quota_lease_seconds,
             )
@@ -69,10 +69,10 @@ class ProcessorManagerMixin(SessionResourceMixin):
             # Keep the local processor during a transient backend outage. Once the
             # backend recovers, a lost/expired reservation returns False and the
             # countdown loop removes the unaccounted local resource.
-            logger.warning('[ProcessorManager] Failed to renew quota lease for %s: %r', resource_id, exc)
+            logger.warning("[ProcessorManager] Failed to renew quota lease for %s: %r", resource_id, exc)
             return True
         if not renewed:
-            logger.warning('[ProcessorManager] Quota lease for %s was lost; expiring local processor', resource_id)
+            logger.warning("[ProcessorManager] Quota lease for %s was lost; expiring local processor", resource_id)
         return renewed
 
     async def _on_resource_expired(self, resource_id: str) -> None:
@@ -80,9 +80,7 @@ class ProcessorManagerMixin(SessionResourceMixin):
 
         ``_on_processor_expired`` is the supported extension point: the
         processor-domain name is kept deliberately so subclass authors override a
-        method named for processors rather than the generic base-class hook. It is
-        ``async`` to match the sibling ``AdapterManagerMixin._on_adapter_expired``
-        contract, so both resource kinds expose the same extension-point shape.
+        method named for processors rather than the generic base-class hook.
         """
         await self._on_processor_expired(resource_id)
 

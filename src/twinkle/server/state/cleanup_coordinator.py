@@ -13,8 +13,8 @@ module deliberately does NOT import ``telemetry``: the resource-count publishing
 is driven through the ``on_become_leader`` / ``on_lose_leader`` callbacks so the
 telemetry dependency stays isolated to ``count_publisher``.
 """
-from __future__ import annotations
 
+from __future__ import annotations
 import asyncio
 import functools
 import time
@@ -37,7 +37,7 @@ logger = get_logger()
 # inside the shared StateBackend: the winner runs cleanup + publishes metrics,
 # the others stay quiet.
 
-LEADER_KEY = 'cleanup_leader'  # actual backend key: '<key_prefix>cleanup_leader'
+LEADER_KEY = "cleanup_leader"  # actual backend key: '<key_prefix>cleanup_leader'
 LEASE_TTL = 30  # seconds — leader loses the lease after this without a renew
 LEASE_RENEW = 10  # seconds — must be < LEASE_TTL/2 so two missed renews still beat the TTL
 
@@ -71,6 +71,7 @@ class ResourceCleanupCoordinator:
         self._on_become_leader = on_become_leader
         self._on_lose_leader = on_lose_leader
 
+        self._lifecycle_lock = asyncio.Lock()
         self._cleanup_task: asyncio.Task | None = None
         self._cleanup_running = False
         self._leader_id = uuid.uuid4().hex
@@ -94,10 +95,10 @@ class ResourceCleanupCoordinator:
         current_time = time.time()
         cutoff_time = current_time - self._expiration_timeout
 
-        session_mgr = self._managers['sessions']
-        model_mgr = self._managers['models']
-        sampling_mgr = self._managers['sampling_sessions']
-        future_mgr = self._managers['futures']
+        session_mgr = self._managers["sessions"]
+        model_mgr = self._managers["models"]
+        sampling_mgr = self._managers["sampling_sessions"]
+        future_mgr = self._managers["futures"]
 
         # Determine expired sessions and remove them in a SINGLE pass, then cascade
         # the SAME set to dependent resources. Using one authoritative set closes the
@@ -113,10 +114,10 @@ class ResourceCleanupCoordinator:
         await self._sweep_processor_quotas()
 
         return {
-            'sessions': sessions_removed,
-            'models': models_removed,
-            'sampling_sessions': samplings_removed,
-            'futures': futures_removed,
+            "sessions": sessions_removed,
+            "models": models_removed,
+            "sampling_sessions": samplings_removed,
+            "futures": futures_removed,
         }
 
     async def _cleanup_loop(self) -> None:
@@ -132,27 +133,25 @@ class ResourceCleanupCoordinator:
                     continue
                 stats = await self.cleanup_expired_resources()
                 if any(stats.values()):
-                    logger.debug(f'[ServerState Cleanup] Removed expired resources: {stats}')
+                    logger.debug(f"[ServerState Cleanup] Removed expired resources: {stats}")
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.warning(f'[ServerState Cleanup] Error during cleanup: {e}')
+                logger.warning(f"[ServerState Cleanup] Error during cleanup: {e}")
                 continue
 
     # ----- Leader election -----
 
     async def _leader_loop(self) -> None:
         """Acquire and renew the cleanup-leader lease every LEASE_RENEW seconds."""
-        await self._try_acquire_or_renew()  # Race for leadership at startup
         while self._leader_running:
             try:
-                await asyncio.sleep(LEASE_RENEW)
                 await self._try_acquire_or_renew()
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.warning(f'[ServerState Leader] renew error: {e}')
-                continue
+                logger.warning(f"[ServerState Leader] renew error: {e}")
+            await asyncio.sleep(LEASE_RENEW)
 
     async def _try_acquire_or_renew(self) -> None:
         was_leader = self._is_leader
@@ -163,30 +162,21 @@ class ResourceCleanupCoordinator:
                     functools.partial(_renew_if_owner, owner=self._leader_id),
                     ttl=LEASE_TTL,
                 )
-                self._is_leader = (val == self._leader_id)
+                self._is_leader = val == self._leader_id
             else:
                 self._is_leader = await self._backend.set_nx(LEADER_KEY, self._leader_id, ttl=LEASE_TTL)
         except Exception as e:
-            logger.warning(f'[ServerState Leader] backend error during election: {e}')
+            logger.warning(f"[ServerState Leader] backend error during election: {e}")
             self._is_leader = False
-            if was_leader:
-                # Our renewal failed but our lease value may still be sitting in the
-                # backend, so a plain ``set_nx`` would keep returning False for up to
-                # LEASE_TTL and leadership would stall unclaimed. Best-effort delete
-                # ONLY when we were the leader (never steal a lease another replica
-                # legitimately holds), swallowing errors so a delete failure cannot
-                # escape the election loop. The next tick can then re-acquire.
-                try:
-                    await self._backend.delete(LEADER_KEY)
-                except Exception:
-                    pass
+            # A renewal failure does not prove current ownership. Leave the key
+            # untouched: our lease expires naturally, or a successor owns it.
 
         if self._is_leader and not was_leader:
-            logger.info(f'[ServerState] became cleanup leader (id={self._leader_id[:8]})')
+            logger.info(f"[ServerState] became cleanup leader (id={self._leader_id[:8]})")
             if self._on_become_leader is not None:
                 await self._on_become_leader()
         elif not self._is_leader and was_leader:
-            logger.warning(f'[ServerState] lost cleanup leadership (id={self._leader_id[:8]})')
+            logger.warning(f"[ServerState] lost cleanup leadership (id={self._leader_id[:8]})")
             if self._on_lose_leader is not None:
                 await self._on_lose_leader()
 
@@ -199,49 +189,45 @@ class ResourceCleanupCoordinator:
         ``ServerState``) so the implementation and its guard can never drift apart into
         a double-start.
         """
-        if self._cleanup_running:
-            return False
-        # Rebuild in-memory indexes from backend data before the loops start.
-        await self._managers['models'].rebuild_indexes()
-        self._cleanup_running = True
-        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
-        self._leader_running = True
-        self._leader_task = asyncio.create_task(self._leader_loop())
-        return True
+        async with self._lifecycle_lock:
+            if self._cleanup_running:
+                return False
+            await self._managers["models"].rebuild_indexes()
+            self._cleanup_running = True
+            self._leader_running = True
+            self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+            self._leader_task = asyncio.create_task(self._leader_loop())
+            return True
 
     async def stop(self) -> bool:
         """Stop the background cleanup + leader-election tasks. Returns ``False`` if not running."""
-        if not self._cleanup_running:
-            return False
-        self._cleanup_running = False
-        if self._cleanup_task:
-            self._cleanup_task.cancel()
-            self._cleanup_task = None
-        self._leader_running = False
-        if self._leader_task:
-            self._leader_task.cancel()
-            self._leader_task = None
-        if self._is_leader:
-            # Release callback registration; the lease itself expires on its own TTL —
-            # update_atomic can't express "atomic delete", so we accept a short outage
-            # where the gauge reads 0 between leaders.
-            if self._on_lose_leader is not None:
+        async with self._lifecycle_lock:
+            if not self._cleanup_running:
+                return False
+            self._cleanup_running = self._leader_running = False
+            tasks = [task for task in (self._cleanup_task, self._leader_task) if task is not None]
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self._cleanup_task = self._leader_task = None
+            was_leader, self._is_leader = self._is_leader, False
+            # Do not delete an uncertain lease; its original TTL is the fence.
+            if was_leader and self._on_lose_leader is not None:
                 await self._on_lose_leader()
-            self._is_leader = False
-        return True
+            return True
 
     async def get_cleanup_stats(self) -> dict[str, Any]:
         """Get current cleanup configuration and resource counts."""
         return {
-            'expiration_timeout': self._expiration_timeout,
-            'cleanup_interval': self._cleanup_interval,
-            'cleanup_running': self._cleanup_running,
-            'is_leader': self._is_leader,
-            'leader_id': self._leader_id,
-            'resource_counts': {
-                'sessions': await self._managers['sessions'].count(),
-                'models': await self._managers['models'].count(),
-                'sampling_sessions': await self._managers['sampling_sessions'].count(),
-                'futures': await self._managers['futures'].count(),
+            "expiration_timeout": self._expiration_timeout,
+            "cleanup_interval": self._cleanup_interval,
+            "cleanup_running": self._cleanup_running,
+            "is_leader": self._is_leader,
+            "leader_id": self._leader_id,
+            "resource_counts": {
+                "sessions": await self._managers["sessions"].count(),
+                "models": await self._managers["models"].count(),
+                "sampling_sessions": await self._managers["sampling_sessions"].count(),
+                "futures": await self._managers["futures"].count(),
             },
         }

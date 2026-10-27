@@ -12,26 +12,31 @@ class can be lined up against its tinker counterpart):
 ``twinkle_client/utils/patch_tinker.py`` shows two SDKs can coexist in one process,
 so a semantically-equal but differently-named exception must be lookup-able.
 """
-from __future__ import annotations
 
+from __future__ import annotations
 from enum import StrEnum
-from pydantic import Field, field_validator, model_validator
 from typing import Any, Literal, Optional
+
+from pydantic import Field, field_validator, model_validator
 
 from .base import ResponseModel
 
-# Closed value set, kept in sync with the server-side ``QueueState`` enum values
-# (a consistency test asserts the two sets are equal). Wire fields carrying a queue
-# state declare this alias, never a bare ``str`` (naming ruling 4).
-QueueStateLiteral = Literal['active', 'paused_rate_limit', 'paused_capacity', 'unknown']
+
+class QueueState(StrEnum):
+    """Scheduling hints; these are independent of a task's lifecycle status."""
+
+    ACTIVE = "active"
+    PAUSED_RATE_LIMIT = "paused_rate_limit"
+    PAUSED_CAPACITY = "paused_capacity"
+    UNKNOWN = "unknown"
 
 
 class ErrorCategory(StrEnum):
     """Error attribution. Matches tinker's ``RequestErrorCategory``."""
 
-    Unknown = 'unknown'
-    Server = 'server'
-    User = 'user'
+    Unknown = "unknown"
+    Server = "server"
+    User = "user"
 
 
 class ErrorPayload(ResponseModel):
@@ -54,15 +59,15 @@ class ErrorPayload(ResponseModel):
     traceback: str | None = Field(default=None, max_length=65536)
     details: list[dict[str, Any]] | None = None
 
-    @field_validator('category', mode='before')
+    @field_validator("category", mode="before")
     @classmethod
     def normalize_legacy_category(cls, value: Any) -> Any:
         if isinstance(value, str):
             return value.lower()
         return value
 
-    @model_validator(mode='after')
+    @model_validator(mode="after")
     def traceback_is_server_only(self) -> ErrorPayload:
         if self.traceback is not None and self.category is not ErrorCategory.Server:
-            raise ValueError('traceback is only valid for server errors')
+            raise ValueError("traceback is only valid for server errors")
         return self

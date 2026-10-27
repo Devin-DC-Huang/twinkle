@@ -22,7 +22,7 @@ the spec, so a later reader cannot merge these away):
    ``status_code`` -- an execution-time failure is delivered with HTTP 200, so the
    value is systematically unequal to the response status code.
 4. A closed value set on a wire field is declared as ``Literal`` / enum, never a
-   bare ``str`` (see ``QueueStateLiteral`` in ``errors.py``).
+   bare ``str`` (see ``QueueState`` in ``errors.py``).
 
 Field roles
 -----------
@@ -45,24 +45,25 @@ name -- decides whether it reaches the backend:
 The role lives in the field's ``json_schema_extra`` so that one declaration site
 carries it -- there is deliberately no second per-endpoint parameter table.
 """
-from __future__ import annotations
 
+from __future__ import annotations
 from enum import StrEnum
+from typing import Any, Optional
+
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.fields import FieldInfo
-from typing import Any, Optional
 
 
 class StrictRequest(BaseModel):
     """Request bodies. Typos fail loudly."""
 
-    model_config = ConfigDict(frozen=True, extra='forbid')
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
 
 class ResponseModel(BaseModel):
     """Response bodies. An old client tolerates new server fields."""
 
-    model_config = ConfigDict(frozen=True, extra='ignore')
+    model_config = ConfigDict(frozen=True, extra="ignore")
 
 
 class DataModel(BaseModel):
@@ -81,24 +82,24 @@ class DataModel(BaseModel):
     which carry strict types; it does not belong to the field set.
     """
 
-    model_config = ConfigDict(frozen=True, extra='allow')
+    model_config = ConfigDict(frozen=True, extra="allow")
 
 
 class FieldRole(StrEnum):
     """How a declared request field relates to the backend call."""
 
-    Control = 'control'
-    BackendKwarg = 'backend_kwarg'
-    Passthrough = 'passthrough'
+    Control = "control"
+    BackendKwarg = "backend_kwarg"
+    Passthrough = "passthrough"
 
 
 # Keys under which field metadata is stored in a field's ``json_schema_extra``.
-FIELD_ROLE_KEY = 'twinkle_field_role'
-BACKEND_ONLY_KEY = 'twinkle_backend_only'
+FIELD_ROLE_KEY = "twinkle_field_role"
+BACKEND_ONLY_KEY = "twinkle_backend_only"
 
 
 def _with_extra(field_kwargs: dict[str, Any], **extra: Any) -> FieldInfo:
-    merged = dict(field_kwargs.pop('json_schema_extra', None) or {})
+    merged = dict(field_kwargs.pop("json_schema_extra", None) or {})
     merged.update(extra)
     return Field(json_schema_extra=merged, **field_kwargs)
 
@@ -114,10 +115,13 @@ def backend_kwarg(*backends: str, **field_kwargs: Any) -> FieldInfo:
     constant default would make it carry a non-``None`` value on every deployment,
     so the "non-``None`` on the wrong backend" check would reject every request.
     """
-    return _with_extra(field_kwargs, **{
-        FIELD_ROLE_KEY: FieldRole.BackendKwarg.value,
-        BACKEND_ONLY_KEY: tuple(backends) or None,
-    })
+    return _with_extra(
+        field_kwargs,
+        **{
+            FIELD_ROLE_KEY: FieldRole.BackendKwarg.value,
+            BACKEND_ONLY_KEY: tuple(backends) or None,
+        },
+    )
 
 
 def backend_only(*backends: str, **field_kwargs: Any) -> FieldInfo:
@@ -128,7 +132,7 @@ def backend_only(*backends: str, **field_kwargs: Any) -> FieldInfo:
     :func:`backend_kwarg` with a non-empty backend tuple, not a second mechanism.
     """
     if not backends:
-        raise ValueError('backend_only() requires at least one backend; use backend_kwarg() for an unrestricted field')
+        raise ValueError("backend_only() requires at least one backend; use backend_kwarg() for an unrestricted field")
     return backend_kwarg(*backends, **field_kwargs)
 
 
@@ -141,12 +145,12 @@ def passthrough(**field_kwargs: Any) -> FieldInfo:
     and ``inspect.signature`` cannot see such a read -- so any such check rejects valid
     requests. A misspelled plugin argument therefore still surfaces from the plugin.
     """
-    field_kwargs.setdefault('default_factory', dict)
+    field_kwargs.setdefault("default_factory", dict)
     return _with_extra(field_kwargs, **{FIELD_ROLE_KEY: FieldRole.Passthrough.value})
 
 
 def _read_extra(field_info: FieldInfo, key: str) -> Any:
-    extra = getattr(field_info, 'json_schema_extra', None)
+    extra = getattr(field_info, "json_schema_extra", None)
     if isinstance(extra, dict):
         return extra.get(key)
     return None

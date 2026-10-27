@@ -1,10 +1,12 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
 
+import getpass
 import hashlib
 import inspect
 import os
 import re
+import tempfile
 from collections import defaultdict
 from contextlib import contextmanager
 from datetime import timedelta
@@ -25,14 +27,24 @@ def __getattr__(name: str):
         return FileLock
     raise AttributeError(f'module {__name__!r} has no attribute {name!r}')
 
-_LOCK_DIR = '.locks'
-os.makedirs(_LOCK_DIR, exist_ok=True)
+
+# Workers may start in read-only or different working directories. Keep their
+# locks in one writable runtime directory, without creating it during import.
+# TWINKLE_HOME overrides the default per-user temporary directory.
+_LOCK_DIR = os.path.abspath(
+    os.path.join(
+        os.path.expanduser(
+            os.environ.get("TWINKLE_HOME") or os.path.join(tempfile.gettempdir(), "twinkle", getpass.getuser())
+        ),
+        ".locks",
+    )
+)
 
 # Coordination store: derived from MASTER_PORT so every rank of a group agrees on it without
 # talking to each other first. A collision with another job's MASTER_PORT surfaces as a bind
 # error at store creation, not as silent misbehaviour.
-_COORD_PORT_OFFSET = int(os.environ.get('TWINKLE_COORD_PORT_OFFSET', 10091))
-_COORD_TIMEOUT = timedelta(seconds=int(os.environ.get('TWINKLE_COORD_TIMEOUT', 21600)))
+_COORD_PORT_OFFSET = int(os.environ.get("TWINKLE_COORD_PORT_OFFSET", 10091))
+_COORD_TIMEOUT = timedelta(seconds=int(os.environ.get("TWINKLE_COORD_TIMEOUT", 21600)))
 _store = None
 _store_failed = False
 # One sequence per lock name: the same key is locked repeatedly over a run (encode, then check,
@@ -51,12 +63,12 @@ def _sanitize_lock_name(name: str) -> str:
     Windows does not allow : / \ * ? " < > | in file names.
     """
     # Replace problematic characters with underscores
-    return re.sub(r'[:/\\*?"<>|]', '_', name)
+    return re.sub(r'[:/\\*?"<>|]', "_", name)
 
 
 def acquire_lock(lock: FileLock, blocking: bool):
     try:
-        if 'blocking' in inspect.signature(lock.acquire).parameters:
+        if "blocking" in inspect.signature(lock.acquire).parameters:
             lock.acquire(blocking=blocking)
         else:
             lock.acquire(timeout=(0 if not blocking else None))
@@ -71,10 +83,10 @@ def release_lock(lock: FileLock):
 
 def _get_session_token() -> str:
     """Return a stable token shared by all ranks in the same training run."""
-    return os.environ.get('TWINKLE_SESSION_ID') or str(os.getppid())
+    return os.environ.get("TWINKLE_SESSION_ID") or str(os.getppid())
 
 
-def try_claim_once(key: str, *, payload: str = '', namespace: str = 'claim') -> bool:
+def try_claim_once(key: str, *, payload: str = "", namespace: str = "claim") -> bool:
     """Atomically claim a one-shot slot identified by ``key`` (single-winner).
 
     Stale claims left by a prior session (identified by a session token stored
@@ -90,9 +102,9 @@ def try_claim_once(key: str, *, payload: str = '', namespace: str = 'claim') -> 
     """
     try:
         session = _get_session_token()
-        digest = hashlib.md5(_sanitize_lock_name(key).encode('utf-8')).hexdigest()[:16]
+        digest = hashlib.md5(_sanitize_lock_name(key).encode("utf-8")).hexdigest()[:16]
         os.makedirs(_LOCK_DIR, exist_ok=True)
-        path = os.path.join(_LOCK_DIR, f'{namespace}_{digest}.once')
+        path = os.path.join(_LOCK_DIR, f"{namespace}_{digest}.once")
         return _try_create_claim(path, session, payload)
     except Exception:
         return True
@@ -104,13 +116,13 @@ def _try_create_claim(path: str, session: str, payload: str) -> bool:
         try:
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
             try:
-                os.write(fd, f'{session}\n{payload}'.encode())
+                os.write(fd, f"{session}\n{payload}".encode())
             finally:
                 os.close(fd)
             return True
         except FileExistsError:
             try:
-                with open(path, encoding='utf-8') as f:
+                with open(path, encoding="utf-8") as f:
                     stored = f.readline().strip()
                 if stored == session:
                     return False  # same session, genuine loser
@@ -131,16 +143,17 @@ class PosixFileLock:
 
     def __init__(self, path: str):
         import fcntl
+
         self._path = path
         self._fcntl = fcntl
-        self._fd = open(path, 'w')
+        self._fd = open(path, "w")
         self._pid = os.getpid()
 
     def _ensure_fd(self):
         # After fork, child must reopen so it doesn't share parent's fd state.
         pid = os.getpid()
         if pid != self._pid:
-            self._fd = open(self._path, 'w')
+            self._fd = open(self._path, "w")
             self._pid = pid
 
     def acquire(self):
@@ -161,19 +174,20 @@ class PosixFileLock:
         self.release()
 
     def __getstate__(self):
-        return {'_path': self._path}
+        return {"_path": self._path}
 
     def __setstate__(self, state):
         import fcntl
-        self._path = state['_path']
+
+        self._path = state["_path"]
         self._fcntl = fcntl
-        self._fd = open(self._path, 'w')
+        self._fd = open(self._path, "w")
         self._pid = os.getpid()
 
 
 def _coord_ranks():
     """Rank/world-size of the group sharing one coordination store."""
-    return int(os.environ.get('RANK', 0)), int(os.environ.get('WORLD_SIZE', 1))
+    return int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1))
 
 
 def _is_local_master() -> bool:
@@ -183,17 +197,17 @@ def _is_local_master() -> bool:
     rank reports True and the node tier collapses into 'global master first, then everyone' --
     which is the right degradation when the node layout is not knowable from the env.
     """
-    return int(os.environ.get('LOCAL_RANK', 0)) == 0
+    return int(os.environ.get("LOCAL_RANK", 0)) == 0
 
 
 def _node_index() -> int:
     """Index of this rank's node. torchrun exports GROUP_RANK; derive it otherwise."""
     ## GROUP_RANK和LOCAL_WORLD_SIZE谁设置的？会不会有无法使用的可能性，或者多机条件下
-    group_rank = os.environ.get('GROUP_RANK')
+    group_rank = os.environ.get("GROUP_RANK")
     if group_rank is not None:
         return int(group_rank)
     rank, _ = _coord_ranks()
-    return rank // (int(os.environ.get('LOCAL_WORLD_SIZE', 1)) or 1)
+    return rank // (int(os.environ.get("LOCAL_WORLD_SIZE", 1)) or 1)
 
 
 def _get_store():
@@ -211,16 +225,18 @@ def _get_store():
     rank, _ = _coord_ranks()
     try:
         from torch.distributed import TCPStore
+
         # world_size=None keeps this off the startup path: nobody blocks waiting for peers, and a
         # client simply retries until rank 0 has its server up.
         _store = TCPStore(
-            os.environ.get('MASTER_ADDR', '127.0.0.1'),
+            os.environ.get("MASTER_ADDR", "127.0.0.1"),
             ## _COORD_PORT_OFFSET 干啥用的
-            int(os.environ.get('MASTER_PORT', 29500)) + _COORD_PORT_OFFSET,
+            int(os.environ.get("MASTER_PORT", 29500)) + _COORD_PORT_OFFSET,
             world_size=None,
             is_master=(rank == 0),
             timeout=_COORD_TIMEOUT,
-            wait_for_workers=False)
+            wait_for_workers=False,
+        )
     except Exception:
         # Port taken, torch too old, no network -- degrade to the file lock rather than fail a run
         # over a coordination detail.
@@ -231,13 +247,13 @@ def _get_store():
 def _use_store() -> bool:
     """Whether ranks can be ordered through the store instead of the file lock."""
     _, world_size = _coord_ranks()
-    return world_size > 1 and 'MASTER_ADDR' in os.environ and _get_store() is not None
+    return world_size > 1 and "MASTER_ADDR" in os.environ and _get_store() is not None
 
 
 def _wait_for(store, flag):
     store.wait([flag], _COORD_TIMEOUT)
-    if store.get(flag) != b'1':
-        raise LockPeerError(f'The peer responsible for {flag} failed; refusing to read after it')
+    if store.get(flag) != b"1":
+        raise LockPeerError(f"The peer responsible for {flag} failed; refusing to read after it")
 
 
 @contextmanager
@@ -249,11 +265,11 @@ def _ordered_by_store(key: str, sticky: bool):
     if sticky:
         # The key already identifies the result (a repo id), and the work is idempotent, so one
         # flag serves the whole run: a rank arriving after the flag is set just proceeds.
-        prefix = f'twinkle/lock/{name}'
+        prefix = f"twinkle/lock/{name}"
     else:
-        prefix = f'twinkle/lock/{name}/{_seq[name]}'
+        prefix = f"twinkle/lock/{name}/{_seq[name]}"
         _seq[name] += 1
-    global_flag, node_flag = f'{prefix}/global', f'{prefix}/node{_node_index()}'
+    global_flag, node_flag = f"{prefix}/global", f"{prefix}/node{_node_index()}"
     rank, _ = _coord_ranks()
     is_global_master, is_local_master = rank == 0, _is_local_master()
 
@@ -265,7 +281,7 @@ def _ordered_by_store(key: str, sticky: bool):
             if is_local_master:
                 # Pass the failure down, instead of leaving our own node waiting on a flag that
                 # will never be set.
-                store.set(node_flag, b'0')
+                store.set(node_flag, b"0")
             raise
 
     ok = False
@@ -275,8 +291,8 @@ def _ordered_by_store(key: str, sticky: bool):
     finally:
         if is_local_master:
             # Publish even on failure: a crashed writer must not hang the readers.
-            for flag in ([global_flag, node_flag] if is_global_master else [node_flag]):
-                store.set(flag, b'1' if ok else b'0')
+            for flag in [global_flag, node_flag] if is_global_master else [node_flag]:
+                store.set(flag, b"1" if ok else b"0")
 
 
 @contextmanager
@@ -310,11 +326,10 @@ def processing_lock(lock_file: str, sticky: bool = False):
         return
 
     lock_name = _sanitize_lock_name(lock_file)
-    # Imported here, not at module scope: ``datasets`` is only needed when this fallback path
-    # actually runs, and importing it at module scope made ``import twinkle.loss`` require the
-    # whole HF datasets stack even for losses that never touch it.
     from datasets.utils.filelock import FileLock
-    lock: FileLock = FileLock(os.path.join(_LOCK_DIR, f'{lock_name}.lock'))  # noqa
+
+    os.makedirs(_LOCK_DIR, exist_ok=True)
+    lock: FileLock = FileLock(os.path.join(_LOCK_DIR, f"{lock_name}.lock"))  # noqa
 
     if acquire_lock(lock, False):
         try:

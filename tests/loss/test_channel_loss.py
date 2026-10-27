@@ -160,7 +160,6 @@ def test_transformers_forward_keeps_loss_metadata_out_of_model_call():
         train_status=status,
         accumulate_metrics=lambda _: None,
     )
-
     def get_loss(loss_key=None):
         return group.loss_instance
 
