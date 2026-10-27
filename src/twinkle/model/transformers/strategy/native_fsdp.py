@@ -335,14 +335,17 @@ class NativeFSDPStrategy(TransformerStrategyBase):
         Sharded parameters stay DTensors; ``module.to('cpu')`` is the FSDP2 placement move
         (the same one a colocated FSDP actor uses when parameter offload is requested).
         ``offload_model=False`` leaves the shard resident. :meth:`reload_to_gpu` restores
-        only the pieces this call moved, back to the device they occupied.
+        only the pieces this call moved, back to the device they occupied. Passing neither
+        piece still releases the caching allocator before return.
         """
         import torch
-        from twinkle.model.offload import move_grads, move_optimizer_state, parameter_device, record_offload
+        from twinkle.model.offload import (
+            move_grads, move_optimizer_state, parameter_device, record_offload, release_caching_allocator)
 
         module = self.unwrap_model(model)
         if not offload_model and optimizer is None:
             record_offload(self, model=False, optimizer=False)
+            release_caching_allocator()
             return
         if getattr(self, '_offload_device', None) is None:
             self._offload_device = parameter_device(module)

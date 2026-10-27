@@ -531,10 +531,12 @@ class MegatronStrategy:
         """Release this rank's training memory for colocation (buffer-level work is Megatron's
         own offload_to_cpu). ``offload_model=False`` leaves the chunks resident and moves only
         ``optimizer`` when one is passed. Reversed by :meth:`reload_to_gpu`; both read what is
-        currently resident, so a repeated call is a no-op."""
-        from twinkle.model.offload import record_offload
+        currently resident, so a repeated call is a no-op. Passing neither piece still releases
+        the caching allocator before return."""
+        from twinkle.model.offload import record_offload, release_caching_allocator
         if not offload_model and optimizer is None:
             record_offload(self, model=False, optimizer=False)
+            release_caching_allocator()
             return
         # Touch every chunk first so a Megatron-FSDP model still refuses, even when only the
         # optimizer was requested: its parameter storage is not the DDP bucket layout this path moves.

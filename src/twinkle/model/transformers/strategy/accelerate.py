@@ -203,11 +203,13 @@ class AccelerateStrategy(TransformerStrategyBase):
         changes -- nothing is discarded. The device moved off is recorded so the reverse lands
         exactly where the params were. Re-calling either direction is harmless: ``.to`` on an
         already-resident tensor is a no-op, and :meth:`reload_to_gpu` restores only what moved.
+        Passing neither piece still releases the caching allocator before return.
         """
         import torch
-        from twinkle.model.offload import move_optimizer_state, record_offload
+        from twinkle.model.offload import move_optimizer_state, record_offload, release_caching_allocator
         if not offload_model and optimizer is None:
             record_offload(self, model=False, optimizer=False)
+            release_caching_allocator()
             return
         if getattr(self, '_offload_device', None) is None:
             self._offload_device = self.accelerator.device

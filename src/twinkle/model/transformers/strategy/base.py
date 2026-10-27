@@ -138,7 +138,7 @@ class TransformerStrategyBase(ABC):
         """
         raise NotImplementedError(
             f'{type(self).__name__} does not support weight offload, which the colocation '
-            'flow requires. Use a strategy with offload support (accelerate / native FSDP / megatron).')
+            'flow requires. Use a strategy with offload support (accelerate / native FSDP / deepspeed / megatron).')
 
     def reload_to_gpu(self, model, optimizer=None) -> None:
         """Bring back whatever :meth:`offload_to_cpu` moved; a no-op when nothing was moved."""
@@ -147,4 +147,4 @@ class TransformerStrategyBase(ABC):
             return
         raise NotImplementedError(
             f'{type(self).__name__} does not support weight offload, which the colocation '
-            'flow requires. Use a strategy with offload support (accelerate / native FSDP / megatron).')
+            'flow requires. Use a strategy with offload support (accelerate / native FSDP / deepspeed / megatron).')
