@@ -55,8 +55,37 @@ def test_blank_model_still_resets_training_state():
     assert wrapper.active_group == '' and fresh.adapter_name == ''
 
 
-@pytest.mark.parametrize('reset_training_state', [False, True])
-def test_megatron_reload_resets_optimizer_state_only_when_requested(reset_training_state):
+@pytest.mark.parametrize('reload_kwargs', [{}, {'reset_training_state': False}], ids=['default', 'explicit-false'])
+def test_transformers_reload_preserves_training_progress_by_default(reload_kwargs):
+    model = torch.nn.Linear(1, 1, bias=False)
+    model.weight.data.fill_(3)
+    model.weight.grad = torch.ones_like(model.weight)
+    previous = SimpleNamespace(optimizer=object(), cur_step=7)
+    wrapper = object.__new__(TransformersModel)
+    wrapper.__dict__['model'] = model
+    wrapper.model_id = 'local-reset-test'
+    wrapper.optimizer_group = {'': previous}
+    wrapper.strategy = SimpleNamespace(load_full_state_dict=lambda value, state: value.load_state_dict(state))
+    initial = {'weight': torch.ones_like(model.weight)}
+    with patch('twinkle.model.transformers.transformers._read_hf_state_dict', return_value=initial):
+        wrapper.reload_initial_weights(**reload_kwargs)
+    torch.testing.assert_close(model.weight, initial['weight'])
+    assert model.weight.grad is None
+    assert wrapper.optimizer_group[''] is previous and previous.cur_step == 7
+
+
+def test_transformers_reload_propagates_checkpoint_failure():
+    wrapper = object.__new__(TransformersModel)
+    wrapper.model_id = 'unreadable-checkpoint'
+    with patch('twinkle.model.transformers.transformers._read_hf_state_dict',
+               side_effect=OSError('checkpoint unavailable')):
+        with pytest.raises(OSError, match='checkpoint unavailable'):
+            wrapper.reload_initial_weights()
+
+
+@pytest.mark.parametrize('reload_kwargs', [{}, {'reset_training_state': False}, {'reset_training_state': True}],
+                         ids=['default', 'explicit-false', 'reset'])
+def test_megatron_reload_resets_optimizer_state_only_when_requested(reload_kwargs):
     # Exercise the repository method without importing the optional Megatron stack.
     path = Path('src/twinkle/model/megatron/megatron.py')
     model_class = next(node for node in ast.parse(path.read_text()).body
@@ -85,9 +114,9 @@ def test_megatron_reload_resets_optimizer_state_only_when_requested(reset_traini
         _is_model_ddp_wrapped=lambda: False,
         _construct_default_optimizer_group=lambda: fresh,
     )
-    namespace['reload_initial_weights'](wrapper, reset_training_state=reset_training_state)
+    namespace['reload_initial_weights'](wrapper, **reload_kwargs)
     assert model.weight.grad is None
     torch.testing.assert_close(model.weight, original_weights['weight'])
-    assert wrapper.optimizer_group[''] is (fresh if reset_training_state else previous)
-    if reset_training_state:
+    assert wrapper.optimizer_group[''] is (fresh if reload_kwargs.get('reset_training_state') else previous)
+    if reload_kwargs.get('reset_training_state'):
         assert fresh.adapter_name == '' and fresh.optimizer is None and fresh.cur_step == 0

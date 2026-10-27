@@ -759,6 +759,24 @@ def test_hybrid_context_keeps_fft_slot_selected_between_operations(monkeypatch):
     assert fft_wrapper.active_adapters == []
 
 
+def test_hybrid_restores_lora_gradients_if_fft_restore_fails(monkeypatch):
+    from twinkle.model.transformers.hybrid import SpectralHybridTransformersModel
+
+    _, model, manager, spectral = _make_multi_tenant_hybrid()
+    service = object.__new__(SpectralHybridTransformersModel)
+    service.multi_adapter = manager
+    service.fft_slots = spectral
+
+    def fail_restore(_adapter):
+        raise RuntimeError('FFT restore failed')
+
+    monkeypatch.setattr(spectral, 'activate_fft_slot', fail_restore)
+    with pytest.raises(RuntimeError, match='FFT restore failed'):
+        with service._adapter_context('hybrid', disable_lora=True):
+            pass
+    assert all(parameter.requires_grad for name, parameter in model.named_parameters() if 'lora_' in name)
+
+
 def test_hybrid_context_switches_between_two_fft_tenants():
     from twinkle.model.transformers.hybrid import SpectralHybridTransformersModel
 

@@ -161,22 +161,15 @@ class OptimizerGroup(BaseOptimizerGroup):
         else:
             return []
 
+    def _metric_kwargs(self, status: TrainStatus) -> Dict[str, Any]:
+        return {
+            **super()._metric_kwargs(status),
+            'loss_reduction': getattr(self.loss_instance, 'reduction', 'mean'),
+        }
+
     def accumulate_metrics(self, is_training):
         self._ensure_dp_group()
-        status = self.train_status if is_training else self.eval_status
-        if len(status.metrics) > 0 and status.inputs is not None and status.outputs is not None:
-            forward_kwargs = copy(status.forward_kwargs)
-            forward_kwargs.pop('gradient_accumulation_steps', None)
-            for metric in status.metrics:
-                metric.accumulate(
-                    status.inputs,
-                    status.outputs,
-                    lr=self._get_lr(),
-                    step=self.cur_step - 1,
-                    gradient_accumulation_steps=self.gradient_accumulation_steps,
-                    grad_norm=self._last_grad_norm,
-                    loss_reduction=getattr(self.loss_instance, 'reduction', 'mean'),
-                    **forward_kwargs)
+        super().accumulate_metrics(is_training)
 
 
 _default_adapter_name = ''

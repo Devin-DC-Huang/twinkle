@@ -3,22 +3,32 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import pytest
 import torch
 
 from twinkle.model.optimizer_group import BaseOptimizerGroup, TrainStatus
-from twinkle.model.transformers.transformers import TransformersModel
+from twinkle.model.transformers.transformers import OptimizerGroup, TransformersModel
 
 
-def test_forward_kwargs_do_not_duplicate_metric_control_parameters():
+@pytest.mark.parametrize('group_cls,loss_reduction', [(BaseOptimizerGroup, 'mean'), (OptimizerGroup, 'sum')])
+@pytest.mark.parametrize('is_training', [True, False])
+def test_forward_kwargs_do_not_duplicate_metric_control_parameters(group_cls, loss_reduction, is_training):
     metric = Mock()
-    kwargs = {'gradient_accumulation_steps': 2, 'lr': 99, 'step': 99, 'grad_norm': 99, 'loss_reduction': 'sum'}
+    kwargs = {'gradient_accumulation_steps': 99, 'lr': 99, 'step': 99, 'grad_norm': 99,
+              'loss_reduction': 'mean', 'custom_metric_arg': 7}
+    original_kwargs = dict(kwargs)
     status = TrainStatus(inputs=[{}], outputs={'loss': 1.0}, metrics=[metric], forward_kwargs=kwargs)
-    group = BaseOptimizerGroup(train_status=status, cur_step=3, gradient_accumulation_steps=2)
-    group.accumulate_metrics(True)
+    group = group_cls(cur_step=3, gradient_accumulation_steps=2,
+                      loss_instance=SimpleNamespace(reduction='sum'), _last_grad_norm=1.25)
+    if is_training:
+        group.train_status = status
+    else:
+        group.eval_status = status
+    group.accumulate_metrics(is_training)
     metric.accumulate.assert_called_once_with(
-        status.inputs, status.outputs, gradient_accumulation_steps=2, lr=[], step=2, grad_norm=0.0,
-        loss_reduction='sum')
-    assert kwargs['lr'] == 99
+        status.inputs, status.outputs, gradient_accumulation_steps=2, lr=[], step=2, grad_norm=1.25,
+        loss_reduction=loss_reduction, custom_metric_arg=7)
+    assert kwargs == original_kwargs
 
 
 def test_parameter_groups_and_optimizer_restore_are_stable_after_wrapping():
