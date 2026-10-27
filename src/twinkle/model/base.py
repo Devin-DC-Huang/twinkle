@@ -359,8 +359,8 @@ class TrainableModel(ABC):
         default on so existing callers still step the whole trainer aside. Passing both false leaves
         the parameters and optimizer resident and records nothing for :meth:`reload_to_gpu`, but still
         releases this rank's caching allocator: the colocated sampler is another process and cannot
-        use blocks this process is only reserving. A strategy with no offload of its own (deepspeed,
-        Megatron-FSDP) still refuses when a piece is requested.
+        use blocks this process is only reserving. Megatron-FSDP still refuses when a piece is requested,
+        because its parameter storage is not the DDP buckets this path knows how to move.
 
         ``@remote_function`` is what makes the handle reach the workers: under Ray the model on the
         driver is a proxy with no ``strategy`` of its own, so an undecorated method would run against
