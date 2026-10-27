@@ -1,11 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import contextlib
 import gc
+from typing import Any, Literal, Optional
 
 import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
-from typing import Any, Dict, List, Literal, Optional
 
 from twinkle import DeviceMesh, Platform, torch_util
 from twinkle.utils import get_logger
@@ -26,33 +26,33 @@ def finalize_model_grads_for_lora(model, *args, **kwargs):
         return m
 
     base_model = _get_base_model(model[0])
-    if isinstance(base_model, MegatronDDP) or hasattr(base_model, 'finish_grad_sync'):
+    if isinstance(base_model, MegatronDDP) or hasattr(base_model, "finish_grad_sync"):
         return _native_finalize_model_grads(model, *args, **kwargs)
     return None
 
 
 # transformer_engine exposes no per-call FlashAttention version selector; pinning asserts the
 # requested build is installed and switches the other availability flags OFF.
-_FLASH_PIN_FLAGS = {2: 'is_installed', 3: 'v3_is_installed', 4: 'v4_is_installed'}
-_FLASH_PIN_PREFIXES = ('flash_attention_', 'flash_')
+_FLASH_PIN_FLAGS = {2: "is_installed", 3: "v3_is_installed", 4: "v4_is_installed"}
+_FLASH_PIN_PREFIXES = ("flash_attention_", "flash_")
 
 
-def _flash_version_pin(attn_impl: Optional[str]) -> Optional[int]:
+def _flash_version_pin(attn_impl: str | None) -> int | None:
     """The FlashAttention major version ``attn_impl`` pins (accepts both 'flash_3' and
-        'flash_attention_3' spellings); unversioned names -> None."""
+    'flash_attention_3' spellings); unversioned names -> None."""
     if attn_impl is None:
         return None
     key = str(attn_impl).lower()
     for prefix in _FLASH_PIN_PREFIXES:
-        if key.startswith(prefix) and key[len(prefix):].isdigit():
-            return int(key[len(prefix):])
+        if key.startswith(prefix) and key[len(prefix) :].isdigit():
+            return int(key[len(prefix) :])
     return None
 
 
-def _apply_flash_version_pin(attn_impl: Optional[str]) -> Optional[int]:
+def _apply_flash_version_pin(attn_impl: str | None) -> int | None:
     """Force transformer_engine to use exactly the pinned FlashAttention version by switching
-        its module-level flags. MUST run in the model-building process (a driver-side call
-        would not reach a Ray worker)."""
+    its module-level flags. MUST run in the model-building process (a driver-side call
+    would not reach a Ray worker)."""
     version = _flash_version_pin(attn_impl)
     if version is None:
         return None
@@ -60,19 +60,24 @@ def _apply_flash_version_pin(attn_impl: Optional[str]) -> Optional[int]:
 
     if version not in _FLASH_PIN_FLAGS:
         raise NotImplementedError(
-            f'attn_impl={attn_impl!r} pins FlashAttention v{version}, which transformer_engine has no '
-            f'availability flag for. Supported: {sorted(_FLASH_PIN_FLAGS)}.')
+            f"attn_impl={attn_impl!r} pins FlashAttention v{version}, which transformer_engine has no "
+            f"availability flag for. Supported: {sorted(_FLASH_PIN_FLAGS)}."
+        )
     # Only flags this TE build actually defines: v4_is_installed is absent on older versions, and a
     # bare getattr would surface as AttributeError instead of an actionable message.
     present = {v: flag for v, flag in _FLASH_PIN_FLAGS.items() if hasattr(fa_utils, flag)}
     if version not in present:
-        raise ValueError(f'attn_impl={attn_impl!r} requests flash-attn v{version}, but the installed '
-                         f'transformer_engine has no {_FLASH_PIN_FLAGS[version]!r} flag, so this version cannot be '
-                         f'selected. Versions this TE build can pin: {sorted(present)}.')
+        raise ValueError(
+            f"attn_impl={attn_impl!r} requests flash-attn v{version}, but the installed "
+            f"transformer_engine has no {_FLASH_PIN_FLAGS[version]!r} flag, so this version cannot be "
+            f"selected. Versions this TE build can pin: {sorted(present)}."
+        )
     installed = {v: getattr(fa_utils, flag) for v, flag in present.items()}
     if not installed[version]:
-        raise ValueError(f'attn_impl={attn_impl!r} requests flash-attn v{version}, which is not installed. '
-                         f'Detected: ' + ', '.join(f'FA{v}={state}' for v, state in sorted(installed.items())))
+        raise ValueError(
+            f"attn_impl={attn_impl!r} requests flash-attn v{version}, which is not installed. "
+            f"Detected: " + ", ".join(f"FA{v}={state}" for v, state in sorted(installed.items()))
+        )
     for other, flag in present.items():
         if other != version:
             setattr(fa_utils, flag, False)
@@ -80,13 +85,12 @@ def _apply_flash_version_pin(attn_impl: Optional[str]) -> Optional[int]:
 
 
 class MegatronStrategy:
-
     #: ddp_config keys that select Megatron-FSDP; ``use_custom_fsdp`` is megatron's own
     #: deprecated alias for ``use_megatron_fsdp``.
-    _FSDP_KEYS = ('use_megatron_fsdp', 'use_custom_fsdp')
+    _FSDP_KEYS = ("use_megatron_fsdp", "use_custom_fsdp")
 
     @classmethod
-    def uses_fsdp(cls, ddp_config: Optional[Dict[str, Any]]) -> bool:
+    def uses_fsdp(cls, ddp_config: dict[str, Any] | None) -> bool:
         """Whether this ddp_config asks for Megatron-FSDP; public because the wrapper-class,
         checkpoint-sharding and optimizer wiring all read it before a strategy exists."""
         ddp_config = ddp_config or {}
@@ -95,20 +99,21 @@ class MegatronStrategy:
     def __init__(
         self,
         model_dir,
-        device_mesh: Optional[DeviceMesh] = None,
+        device_mesh: DeviceMesh | None = None,
         use_distributed_optimizer: bool = True,
-        mixed_precision: Literal['no', 'fp16', 'bf16'] = 'bf16',
+        mixed_precision: Literal["no", "fp16", "bf16"] = "bf16",
         seed: int = 42,
         variable_seq_lengths: bool = True,
         config: PretrainedConfig = None,
-        ddp_config: Dict[str, Any] = None,
-        bridge_backend='mcore-bridge',
+        ddp_config: dict[str, Any] = None,
+        bridge_backend="mcore-bridge",
         align_grad_reduce: bool = True,
         nccl_comm_warmup: bool = False,
-        attn_impl: Optional[str] = None,
+        attn_impl: str | None = None,
         **kwargs,
     ):
         from megatron.core import mpu
+
         self.device_mesh = device_mesh
         self.use_distributed_optimizer = use_distributed_optimizer
         self.mixed_precision = mixed_precision
@@ -120,6 +125,7 @@ class MegatronStrategy:
         # instance: only the string survives the Ray worker boundary.
         if isinstance(bridge_backend, str):
             from ..bridge import resolve_bridge_backend
+
             self._backend = resolve_bridge_backend(bridge_backend)
         else:
             self._backend = bridge_backend
@@ -128,33 +134,37 @@ class MegatronStrategy:
         # (the model-building) process; attn_impl is consumed here, never forwarded into the config.
         pinned = _apply_flash_version_pin(attn_impl)
         if pinned is not None:
-            logger.info(f'Forcing Flash Attention v{pinned} as the attention backend.')
+            logger.info(f"Forcing Flash Attention v{pinned} as the attention backend.")
         if config is None:
             from transformers import AutoConfig
+
             self.hf_config = AutoConfig.from_pretrained(self.model_dir, trust_remote_code=True)
         else:
             self.hf_config = config
-        num_experts = getattr(self.hf_config, 'num_experts', getattr(self.hf_config, 'num_local_experts', None))
-        if (num_experts not in (None, 0, 1) and (self.device_mesh.tp_world_size or 1) > 1
-                and not getattr(self.device_mesh, 'sequence_parallel', False)):
+        num_experts = getattr(self.hf_config, "num_experts", getattr(self.hf_config, "num_local_experts", None))
+        if (
+            num_experts not in (None, 0, 1)
+            and (self.device_mesh.tp_world_size or 1) > 1
+            and not getattr(self.device_mesh, "sequence_parallel", False)
+        ):
             # Megatron 0.15.3 requires sequence parallelism for MoE training when tensor
             # parallelism is enabled; keep the policy here so launch scripts need not know.
             self.device_mesh.sequence_parallel = True
-            logger.info('Auto-enabled sequence_parallel for MoE model with tensor parallelism.')
-        if 'overlap_grad_reduce' not in self.ddp_config:
-            self.ddp_config['overlap_grad_reduce'] = False
-        if 'overlap_param_gather' not in self.ddp_config:
-            self.ddp_config['overlap_param_gather'] = False
-        if 'align_param_gather' not in self.ddp_config:
-            self.ddp_config['align_param_gather'] = False
-        if 'grad_reduce_in_fp32' not in self.ddp_config:
-            self.ddp_config['grad_reduce_in_fp32'] = True
+            logger.info("Auto-enabled sequence_parallel for MoE model with tensor parallelism.")
+        if "overlap_grad_reduce" not in self.ddp_config:
+            self.ddp_config["overlap_grad_reduce"] = False
+        if "overlap_param_gather" not in self.ddp_config:
+            self.ddp_config["overlap_param_gather"] = False
+        if "align_param_gather" not in self.ddp_config:
+            self.ddp_config["align_param_gather"] = False
+        if "grad_reduce_in_fp32" not in self.ddp_config:
+            self.ddp_config["grad_reduce_in_fp32"] = True
 
         # Determine params_dtype and activation checkpointing kwargs
         params_dtype = torch.bfloat16
-        if self.mixed_precision == 'fp16':
+        if self.mixed_precision == "fp16":
             params_dtype = torch.float16
-        elif self.mixed_precision == 'no':
+        elif self.mixed_precision == "no":
             params_dtype = torch.float32
         self._params_dtype = params_dtype
 
@@ -163,27 +173,28 @@ class MegatronStrategy:
             vpp_size = None
 
         parallel_kwargs = {
-            'tensor_model_parallel_size': self.device_mesh.tp_world_size or 1,
-            'pipeline_model_parallel_size': self.device_mesh.pp_world_size or 1,
-            'context_parallel_size': self.device_mesh.cp_world_size or 1,
-            'expert_model_parallel_size': self.device_mesh.ep_size or 1,
-            'expert_tensor_parallel_size': self.device_mesh.etp_world_size or 1,
-            'virtual_pipeline_model_parallel_size': vpp_size,
+            "tensor_model_parallel_size": self.device_mesh.tp_world_size or 1,
+            "pipeline_model_parallel_size": self.device_mesh.pp_world_size or 1,
+            "context_parallel_size": self.device_mesh.cp_world_size or 1,
+            "expert_model_parallel_size": self.device_mesh.ep_size or 1,
+            "expert_tensor_parallel_size": self.device_mesh.etp_world_size or 1,
+            "virtual_pipeline_model_parallel_size": vpp_size,
         }
         if not vpp_size:
             # non-interleave does not support overlap_p2p_comm
-            kwargs['overlap_p2p_comm'] = False
-        kwargs.setdefault('overlap_p2p_comm', True)
-        kwargs.setdefault('batch_p2p_comm', not kwargs['overlap_p2p_comm'])
+            kwargs["overlap_p2p_comm"] = False
+        kwargs.setdefault("overlap_p2p_comm", True)
+        kwargs.setdefault("batch_p2p_comm", not kwargs["overlap_p2p_comm"])
 
         init_kwargs = {
-            'order': self.device_mesh.order,
+            "order": self.device_mesh.order,
             **parallel_kwargs,
         }
-        if Platform.device_prefix() == 'npu':
-            init_kwargs['create_gloo_process_groups'] = True
+        if Platform.device_prefix() == "npu":
+            init_kwargs["create_gloo_process_groups"] = True
         mpu.initialize_model_parallel(**init_kwargs)
         from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+
         model_parallel_cuda_manual_seed(self.seed)
         self.config = self.get_model_config(self.hf_config, parallel_kwargs, **kwargs)
         self._finalize_quantized_param_config()
@@ -199,14 +210,18 @@ class MegatronStrategy:
         if not self.use_distributed_optimizer:
             # FSDP shards the parameters; only the distributed optimizer maintains matching
             # master-weight shards with a write-back path.
-            raise ValueError('Megatron-FSDP requires use_distributed_optimizer=True: it shards the '
-                             'parameters, and only the distributed optimizer maintains the matching '
-                             'master-weight shards. Drop use_megatron_fsdp, or enable the distributed optimizer.')
-        if self.device_mesh is not None and getattr(self.device_mesh, 'cp_world_size', 1) > 1:
+            raise ValueError(
+                "Megatron-FSDP requires use_distributed_optimizer=True: it shards the "
+                "parameters, and only the distributed optimizer maintains the matching "
+                "master-weight shards. Drop use_megatron_fsdp, or enable the distributed optimizer."
+            )
+        if self.device_mesh is not None and getattr(self.device_mesh, "cp_world_size", 1) > 1:
             # megatron asserts the same pairing on its own CLI; checked here so it fails at
             # config-build time rather than part-way through wrapping on every rank.
-            raise ValueError('Megatron-FSDP does not support context parallelism '
-                             f'(cp_world_size={self.device_mesh.cp_world_size}). Use DDP for a CP run.')
+            raise ValueError(
+                "Megatron-FSDP does not support context parallelism "
+                f"(cp_world_size={self.device_mesh.cp_world_size}). Use DDP for a CP run."
+            )
 
     def _finalize_quantized_param_config(self):
         """Derive the DDP ``fp8/fp4_param_gather`` flags from ``fp8/fp4_param``.
@@ -216,25 +231,28 @@ class MegatronStrategy:
         only the first is a silent no-op whose loss curve simply never moves, so an explicitly
         requested value is honoured, an absent one is filled, and a contradictory one raises.
         """
-        for config_attr, ddp_key in (('fp8_param', 'fp8_param_gather'), ('fp4_param', 'fp4_param_gather')):
+        for config_attr, ddp_key in (("fp8_param", "fp8_param_gather"), ("fp4_param", "fp4_param_gather")):
             if not getattr(self.config, config_attr, False):
                 continue
             if self.ddp_config.get(ddp_key) is False:
                 raise ValueError(
-                    f'{config_attr}=True builds the parameters quantized, but {ddp_key}=False stops the '
-                    f'distributed optimizer from ever writing the updated master weights back into them, so '
-                    f'the model would not train at all. Drop {ddp_key}=False, or turn off {config_attr}.')
+                    f"{config_attr}=True builds the parameters quantized, but {ddp_key}=False stops the "
+                    f"distributed optimizer from ever writing the updated master weights back into them, so "
+                    f"the model would not train at all. Drop {ddp_key}=False, or turn off {config_attr}."
+                )
             self.ddp_config[ddp_key] = True
             if not self.use_distributed_optimizer:
                 # The quantize-back step exists only on DistributedOptimizer.
-                raise ValueError(f'{config_attr}=True requires use_distributed_optimizer=True: quantized '
-                                 'parameters are updated by re-quantizing the distributed optimizer\'s master '
-                                 'shards, which is the only code path that writes them.')
+                raise ValueError(
+                    f"{config_attr}=True requires use_distributed_optimizer=True: quantized "
+                    "parameters are updated by re-quantizing the distributed optimizer's master "
+                    "shards, which is the only code path that writes them."
+                )
 
     @property
     def sequence_parallel(self) -> bool:
         """Read from device_mesh so auto-enable in args.py is visible."""
-        return getattr(self.device_mesh, 'sequence_parallel', False)
+        return getattr(self.device_mesh, "sequence_parallel", False)
 
     @property
     def bridge(self):
@@ -275,27 +293,29 @@ class MegatronStrategy:
 
     def wrap_model(
         self,
-        model: List[nn.Module],
-    ) -> List[nn.Module]:
+        model: list[nn.Module],
+    ) -> list[nn.Module]:
         if self.device_mesh.world_size <= 1:
             from megatron.core.distributed import DistributedDataParallelConfig
+
             ddp_config = DistributedDataParallelConfig(
                 grad_reduce_in_fp32=True,
                 use_distributed_optimizer=False,
             )
             for m in model:
-                if not hasattr(m, 'ddp_config'):
+                if not hasattr(m, "ddp_config"):
                     m.ddp_config = ddp_config
             return model
 
         self._check_device_mesh()
         return self._wrap_with_megatron_ddp(model, self.use_distributed_optimizer, self.ddp_config)
 
-    def unwrap_model(self, model: List[nn.Module]) -> List[nn.Module]:
+    def unwrap_model(self, model: list[nn.Module]) -> list[nn.Module]:
         from megatron.core.distributed import DistributedDataParallel as MegatronDDP
         from megatron.core.distributed import FullyShardedDataParallel as MegatronFSDP
         from megatron.core.transformer.module import Float16Module
         from torch.nn.parallel import DistributedDataParallel as TorchDDP
+
         _models = []
         for _model in model:
             # Unwrap DDP first
@@ -304,23 +324,24 @@ class MegatronStrategy:
             _models.append(_model)
         return _models
 
-    def get_sharded_sd_metadata(self) -> Dict[str, Any]:
+    def get_sharded_sd_metadata(self) -> dict[str, Any]:
         """Optimizer-state sharding metadata; must agree with the wrapper chosen at wrap time,
         so it lives beside that choice. FSDP shards as DTensors, the rest dp_reshardable."""
-        metadata = {'singleton_local_shards': False, 'chained_optim_avoid_prefix': True}
+        metadata = {"singleton_local_shards": False, "chained_optim_avoid_prefix": True}
         if self.uses_fsdp(self.ddp_config):
-            metadata['distrib_optim_sharding_type'] = 'fsdp_dtensor'
+            metadata["distrib_optim_sharding_type"] = "fsdp_dtensor"
         else:
-            metadata['distrib_optim_sharding_type'] = 'dp_reshardable'
+            metadata["distrib_optim_sharding_type"] = "dp_reshardable"
         return metadata
 
-    def finish_param_config(self, model: List[nn.Module], optimizer: Any):
-        self.config.grad_scale_func = getattr(optimizer, 'scale_loss') if optimizer is not None else None
+    def finish_param_config(self, model: list[nn.Module], optimizer: Any):
+        self.config.grad_scale_func = optimizer.scale_loss if optimizer is not None else None
         ddp_config = self.ddp_config
-        if ddp_config['overlap_grad_reduce']:
+        if ddp_config["overlap_grad_reduce"]:
             assert self.config.no_sync_func is None, (
-                'When overlap_grad_reduce is True, config.no_sync_func must be None; '
-                'a custom no_sync_func is not supported when overlapping grad-reduce')
+                "When overlap_grad_reduce is True, config.no_sync_func must be None; "
+                "a custom no_sync_func is not supported when overlapping grad-reduce"
+            )
             self.config.no_sync_func = [model_chunk.no_sync for model_chunk in model]  # noqa
             if len(model) == 1:
                 self.config.no_sync_func = self.config.no_sync_func[0]  # noqa
@@ -331,14 +352,16 @@ class MegatronStrategy:
                 # align_grad_reduce=False opts out of bucket-aligned reduction; grad_sync_func
                 # is the aligned-overlap hook, so clear it (legacy does the same).
                 self.config.grad_sync_func = None
-        if ddp_config['overlap_param_gather'] and ddp_config['align_param_gather']:
+        if ddp_config["overlap_param_gather"] and ddp_config["align_param_gather"]:
             # Only DDP exposes start_param_sync; Megatron-FSDP drives its own parameter
             # all-gathers from module hooks, so there is nothing to hand over.
-            missing = [m for m in model if not hasattr(m, 'start_param_sync')]
+            missing = [m for m in model if not hasattr(m, "start_param_sync")]
             if missing:
-                logger.info('Skipping config.param_sync_func: the data-parallel wrapper '
-                            f'({type(missing[0]).__name__}) does not implement start_param_sync, which is '
-                            'a DDP-only hook. Its parameter gathering is driven internally instead.')
+                logger.info(
+                    "Skipping config.param_sync_func: the data-parallel wrapper "
+                    f"({type(missing[0]).__name__}) does not implement start_param_sync, which is "
+                    "a DDP-only hook. Its parameter gathering is driven internally instead."
+                )
                 return
             self.config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model]  # noqa
             if len(model) == 1:
@@ -346,10 +369,10 @@ class MegatronStrategy:
 
     @staticmethod
     def _wrap_with_megatron_ddp(
-        model: List[nn.Module],
+        model: list[nn.Module],
         use_distributed_optimizer: bool,
-        ddp_config: Dict[str, Any],
-    ) -> List[nn.Module]:
+        ddp_config: dict[str, Any],
+    ) -> list[nn.Module]:
         from megatron.core.distributed import DistributedDataParallel as MegatronDDP
         from megatron.core.distributed import DistributedDataParallelConfig
         from megatron.core.transformer import TransformerConfig
@@ -395,17 +418,21 @@ class MegatronStrategy:
         # The dict's 'loss' must be a real copy: mcore scales the FIRST tuple element in place for
         # gradient accumulation (output_tensor /= num_tokens; /= num_microbatches), so a bare
         # detach() shares storage and the reported loss gets silently divided too.
-        return local_loss, grad_count, {
-            'loss': local_loss.detach().clone(),
-            'logits': logits.detach() if logits is not None else None,
-            'logps': logps.detach() if logps is not None else None,
-            'num_tokens': count
-        }
+        return (
+            local_loss,
+            grad_count,
+            {
+                "loss": local_loss.detach().clone(),
+                "logits": logits.detach() if logits is not None else None,
+                "logps": logps.detach() if logps is not None else None,
+                "num_tokens": count,
+            },
+        )
 
     def get_model_config(
         self,
         hf_config: PretrainedConfig,
-        parallel_kwargs: Dict[str, Any],
+        parallel_kwargs: dict[str, Any],
         **kwargs,
     ):
         return self._backend.build_model_config(hf_config, parallel_kwargs, self, **kwargs)
@@ -413,9 +440,10 @@ class MegatronStrategy:
     def create_megatron_model(
         self,
         load_weights: bool = True,
-    ) -> List[nn.Module]:
+    ) -> list[nn.Module]:
         return self._backend.create_model(
-            self.config, self.model_dir, load_weights=load_weights, move_to_gpu=self._move_model_to_gpu)
+            self.config, self.model_dir, load_weights=load_weights, move_to_gpu=self._move_model_to_gpu
+        )
 
     @staticmethod
     def _move_model_to_gpu(model: nn.Module) -> nn.Module:
@@ -432,9 +460,7 @@ class MegatronStrategy:
         dummy = torch.zeros(1, device=torch_util.get_current_device())
         warmed = 0
         for getter, kwargs in (
-            (mpu.get_data_parallel_group, {
-                'with_context_parallel': True
-            }),
+            (mpu.get_data_parallel_group, {"with_context_parallel": True}),
             (mpu.get_data_parallel_group, {}),
             (mpu.get_context_parallel_group, {}),
             (mpu.get_tensor_model_parallel_group, {}),
@@ -452,12 +478,21 @@ class MegatronStrategy:
                     torch.distributed.all_reduce(dummy, group=group)
                     warmed += 1
         torch_util.synchronize()
-        logger.info(f'NCCL communicator warm-up done ({warmed} groups).')
+        logger.info(f"NCCL communicator warm-up done ({warmed} groups).")
 
     @contextlib.contextmanager
-    def transactional_grad_schedule(self, model_chunks: List[nn.Module], *, forward_only: bool,
-                                    transactional: bool, loss_weight: float, finalize_gradients: bool,
-                                    completing_pending: bool, global_normalizer, **kwargs):
+    def transactional_grad_schedule(
+        self,
+        model_chunks: list[nn.Module],
+        *,
+        forward_only: bool,
+        transactional: bool,
+        loss_weight: float,
+        finalize_gradients: bool,
+        completing_pending: bool,
+        global_normalizer,
+        **kwargs,
+    ):
         """Temporarily rewrite this strategy's gradient hooks for one schedule, then restore
         them -- the mcore ``config`` is shared by every later step, so per-call surgery must be
         undone even when the schedule raises. The model decides WHAT this pass is (the keyword
@@ -477,9 +512,9 @@ class MegatronStrategy:
 
         scale = float(loss_weight)
         if transactional:
-            gradient_accumulation_steps = int(kwargs.get('gradient_accumulation_steps') or 1)
+            gradient_accumulation_steps = int(kwargs.get("gradient_accumulation_steps") or 1)
             if gradient_accumulation_steps < 1:
-                raise ValueError('gradient_accumulation_steps must be positive')
+                raise ValueError("gradient_accumulation_steps must be positive")
             scale = scale / global_normalizer.clamp(min=1) / gradient_accumulation_steps
 
         def transaction_grad_scale(value):
@@ -506,7 +541,7 @@ class MegatronStrategy:
                     config.grad_scale_func = transaction_grad_scale
                 if not forward_only and not finalize_gradients:
                     for model_chunk in model_chunks:
-                        if hasattr(model_chunk, 'no_sync'):
+                        if hasattr(model_chunk, "no_sync"):
                             outer_no_sync.enter_context(model_chunk.no_sync())
                     if isinstance(original_no_sync_func, list):
                         config.no_sync_func = [disabled_no_sync for _ in original_no_sync_func]
@@ -527,14 +562,17 @@ class MegatronStrategy:
             config.finalize_model_grads_func = original_finalize_model_grads_func
 
     @torch.no_grad()
-    def offload_to_cpu(self, model: List[nn.Module], optimizer: Any = None, *, offload_model: bool = True) -> None:
+    def offload_to_cpu(self, model: list[nn.Module], optimizer: Any = None, *, offload_model: bool = True) -> None:
         """Release this rank's training memory for colocation (buffer-level work is Megatron's
         own offload_to_cpu). ``offload_model=False`` leaves the chunks resident and moves only
         ``optimizer`` when one is passed. Reversed by :meth:`reload_to_gpu`; both read what is
-        currently resident, so a repeated call is a no-op."""
-        from twinkle.model.offload import record_offload
+        currently resident, so a repeated call is a no-op. Passing neither piece still releases
+        the caching allocator before return."""
+        from twinkle.model.offload import record_offload, release_caching_allocator
+
         if not offload_model and optimizer is None:
             record_offload(self, model=False, optimizer=False)
+            release_caching_allocator()
             return
         # Touch every chunk first so a Megatron-FSDP model still refuses, even when only the
         # optimizer was requested: its parameter storage is not the DDP bucket layout this path moves.
@@ -547,17 +585,18 @@ class MegatronStrategy:
                 buffers = self._flat_buffers(chunk)
                 for buffer in buffers:
                     buffer.offload_to_cpu()
-                self._move_loose_params(chunk, buffers, 'cpu')
+                self._move_loose_params(chunk, buffers, "cpu")
         if optimizer is not None:
-            self._move_optimizer_state(optimizer, 'cpu')
+            self._move_optimizer_state(optimizer, "cpu")
         record_offload(self, model=offload_model, optimizer=optimizer is not None)
         gc.collect()
         torch_util.empty_cache()
 
     @torch.no_grad()
-    def reload_to_gpu(self, model: List[nn.Module], optimizer: Any = None) -> None:
+    def reload_to_gpu(self, model: list[nn.Module], optimizer: Any = None) -> None:
         """Bring back what :meth:`offload_to_cpu` released. A no-op when nothing was moved."""
         from twinkle.model.offload import clear_offload_record, offload_record
+
         moved_model, moved_optimizer = offload_record(self)
         if not moved_model and not moved_optimizer:
             return
@@ -575,23 +614,25 @@ class MegatronStrategy:
         torch_util.empty_cache()
 
     @staticmethod
-    def _flat_buffers(chunk: nn.Module) -> List[Any]:
+    def _flat_buffers(chunk: nn.Module) -> list[Any]:
         """The flat parameter/gradient buckets of a DDP-wrapped chunk. Cannot duck-type on the
         attribute name: nn.Module already defines ``buffers()`` as a method."""
         from megatron.core.distributed import DistributedDataParallel as MegatronDDP
         from megatron.core.distributed import FullyShardedDataParallel as MegatronFSDP
+
         if isinstance(chunk, MegatronDDP):
             return [*chunk.buffers, *chunk.expert_parallel_buffers]
         if isinstance(chunk, MegatronFSDP):
             raise NotImplementedError(
-                'Offloading a Megatron-FSDP model is not supported: it holds its parameters in '
-                '`param_and_grad_buffer`, which is not the per-bucket structure DDP uses. Freeing '
-                'only the parts this method understands would leave most of the training memory '
-                'resident while reporting success, which defeats the purpose.')
+                "Offloading a Megatron-FSDP model is not supported: it holds its parameters in "
+                "`param_and_grad_buffer`, which is not the per-bucket structure DDP uses. Freeing "
+                "only the parts this method understands would leave most of the training memory "
+                "resident while reporting success, which defeats the purpose."
+            )
         return []
 
     @staticmethod
-    def _move_loose_params(chunk: nn.Module, buffers: List[Any], device: Any) -> None:
+    def _move_loose_params(chunk: nn.Module, buffers: list[Any], device: Any) -> None:
         """Move the parameters no flat buffer holds: frozen ones (a LoRA base weight), chunks
         never wrapped (single-rank / reference models), or runs without a distributed optimizer
         (grad_data exists, param_data stays None). Asks the buffers what they actually hold so
@@ -613,13 +654,14 @@ class MegatronStrategy:
         device left as a parameter.
         """
         from megatron.core.optimizer.optimizer import ChainedOptimizer
+
         optimizers = optimizer.chained_optimizers if isinstance(optimizer, ChainedOptimizer) else [optimizer]
         for _optimizer in optimizers:
             # Megatron wraps a plain torch optimizer; fall back to the object itself so a bare one
             # also works. `optimizer` being None means this rank owns no parameters, which is
             # legitimate under a custom pipeline layout.
-            inner = getattr(_optimizer, 'optimizer', _optimizer)
-            if inner is None or getattr(_optimizer, 'is_stub_optimizer', False):
+            inner = getattr(_optimizer, "optimizer", _optimizer)
+            if inner is None or getattr(_optimizer, "is_stub_optimizer", False):
                 continue
             # The inner param_groups hold the optimizer's own handle on each parameter: separate
             # fp32 master shards under bf16/fp16 (must be moved too), or -- for FP32 training --
@@ -627,7 +669,7 @@ class MegatronStrategy:
             # bytes are safe in the buffer's host copy; reassigning a freed view's .data would
             # detach the optimizer from the buffer the model reads, so skip exactly those.
             for group in inner.param_groups:
-                for param in group['params']:
+                for param in group["params"]:
                     if isinstance(param, torch.Tensor) and param.untyped_storage().size() > 0:
                         param.data = param.data.to(device, non_blocking=True)
             # Momentum/variance are always fresh allocations, never buffer views; the freed-storage
