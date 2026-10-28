@@ -2104,9 +2104,11 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                         save_file(contiguous_dict, os.path.join(checkpoint_dir, 'adapter_model.safetensors'))
                     else:
                         torch.save(contiguous_dict, os.path.join(checkpoint_dir, 'adapter_model.bin'))
-            else:
+            elif Platform.is_master():
+                # Transformers' is_main_process only guards metadata/cleanup, not weight
+                # shard writes. Gather state on every rank above, but write it only once.
                 model.save_pretrained(
-                    checkpoint_dir, state_dict=processed_state_dict, is_main_process=Platform.is_master(),
+                    checkpoint_dir, state_dict=processed_state_dict, is_main_process=True,
                     **save_kwargs)
 
         if async_save:
