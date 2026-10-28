@@ -72,7 +72,6 @@ class RayRuntime:
         return await asyncio.to_thread(lookup)
 
     async def shutdown(self, identity, name, *, observe_removal=None):
-        import ray
         from ray import serve
         from ray.util import list_named_actors
 
@@ -80,29 +79,60 @@ class RayRuntime:
         if deployment is not None:
             await asyncio.gather(asyncio.shield(deployment), return_exceptions=True)
             self.deployments.pop(identity, None)
-        # Both features give workers the controller identity, not a Serve replica ID.
-        actors = []
-        for row in await asyncio.to_thread(list_named_actors, all_namespaces=True):
-            if row["namespace"] != self.namespace or identity not in row["name"]:
-                continue
-            try:
-                # Ray may import the worker class when resolving its handle.
-                # Keep imports and GCS calls outside the controller event loop
-                # so its shutdown deadline and other instances remain live.
-                handle = await asyncio.to_thread(ray.get_actor, row["name"], namespace=self.namespace)
-            except ValueError:
-                continue
-            actors.append(handle)
-            await asyncio.to_thread(ray.kill, handle, no_restart=True)
-        await asyncio.to_thread(serve.delete, name)
-        for handle in actors:
-            try:
-                await asyncio.wait_for(handle.__ray_ready__.remote(), 5)
-            except ray.exceptions.ActorDiedError:
-                continue
-            except ray.exceptions.RayActorError as exc:
-                raise ResourceReleaseError("Owned worker death could not be confirmed", phase="worker_death") from exc
-            raise ResourceReleaseError("Owned worker death could not be confirmed", phase="worker_death")
+        from ray._private.gcs_utils import create_gcs_channel
+        from ray._private.worker import global_worker
+        from ray.core.generated.gcs_pb2 import ActorTableData
+        from ray.core.generated.gcs_service_pb2 import (
+            GetActorInfoRequest,
+            GetNamedActorInfoRequest,
+            KillActorViaGcsRequest,
+        )
+        from ray.core.generated.gcs_service_pb2_grpc import ActorInfoGcsServiceStub
+
+        # ActorHandle deserialization imports the worker's model class. Cleanup
+        # needs only GCS identities, so it must not load that training stack.
+        async with create_gcs_channel(global_worker.gcs_client.address, aio=True) as channel:
+            actors = ActorInfoGcsServiceStub(channel)
+            owned_ids = []
+            for row in await asyncio.to_thread(list_named_actors, all_namespaces=True):
+                if row["namespace"] != self.namespace or identity not in row["name"]:
+                    continue
+                reply = await actors.GetNamedActorInfo(
+                    GetNamedActorInfoRequest(name=row["name"], ray_namespace=self.namespace),
+                    timeout=self.pool.shutdown_timeout,
+                )
+                actor = reply.actor_table_data
+                if (
+                    reply.status.code
+                    or not actor.actor_id
+                    or actor.name != row["name"]
+                    or actor.ray_namespace != self.namespace
+                ):
+                    raise ResourceReleaseError("Owned worker identity could not be confirmed", phase="worker_lookup")
+                owned_ids.append(actor.actor_id)
+                reply = await actors.KillActorViaGcs(
+                    KillActorViaGcsRequest(actor_id=actor.actor_id, force_kill=True, no_restart=True),
+                    timeout=self.pool.shutdown_timeout,
+                )
+                if reply.status.code:
+                    raise ResourceReleaseError("Owned worker termination failed", phase="worker_death")
+            await asyncio.to_thread(serve.delete, name)
+            for actor_id in owned_ids:
+                try:
+                    async with asyncio.timeout(5):
+                        while True:
+                            reply = await actors.GetActorInfo(GetActorInfoRequest(actor_id=actor_id), timeout=5)
+                            if reply.status.code or reply.actor_table_data.actor_id != actor_id:
+                                raise ResourceReleaseError(
+                                    "Owned worker death could not be confirmed", phase="worker_death"
+                                )
+                            if reply.actor_table_data.state == ActorTableData.DEAD:
+                                break
+                            await asyncio.sleep(0.05)
+                except Exception as exc:
+                    raise ResourceReleaseError(
+                        "Owned worker death could not be confirmed", phase="worker_death"
+                    ) from exc
 
         started, status = time.monotonic(), "error"
         try:
