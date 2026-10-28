@@ -58,32 +58,33 @@ class TestDoGradSync:
             assert group.do_grad_sync() is True
 
     def test_first_step_never_syncs_while_accumulating(self):
-        # A single microstep does not fill a four-microstep accumulation window.
+        # cur_step == 1 satisfies (cur_step-1) % gas == 0 but is excluded by cur_step > 1,
+        # so the very first micro step of a run does not trigger a sync.
         group = BaseOptimizerGroup(gradient_accumulation_steps=4, cur_step=1)
         assert group.do_grad_sync() is False
 
     def test_mid_window_steps_do_not_sync(self):
         group = BaseOptimizerGroup(gradient_accumulation_steps=4)
-        for step in (1, 2, 3, 5, 6, 7):
+        for step in (2, 3, 4):
             group.cur_step = step
             assert group.do_grad_sync() is False
 
     def test_syncs_at_accumulation_boundary(self):
         group = BaseOptimizerGroup(gradient_accumulation_steps=4)
-        for step in (4, 8, 12):  # complete windows, including the first
+        for step in (5, 9, 13):  # (step-1) % 4 == 0 and step > 1
             group.cur_step = step
             assert group.do_grad_sync() is True
 
     def test_explicit_argument_updates_state(self):
         group = BaseOptimizerGroup(gradient_accumulation_steps=1)
-        group.cur_step = 4
+        group.cur_step = 5
         # Passing gas explicitly both mutates the stored value and gates on it.
         assert group.do_grad_sync(4) is True
         assert group.gradient_accumulation_steps == 4
 
     def test_none_argument_uses_state_without_mutation(self):
         group = BaseOptimizerGroup(gradient_accumulation_steps=3)
-        group.cur_step = 3  # one complete window
+        group.cur_step = 4  # (4-1) % 3 == 0 and > 1 -> sync
         assert group.do_grad_sync(None) is True
         assert group.gradient_accumulation_steps == 3
 

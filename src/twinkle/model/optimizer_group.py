@@ -128,8 +128,8 @@ class BaseOptimizerGroup:
             gradient_accumulation_steps = self.gradient_accumulation_steps
         else:
             self.gradient_accumulation_steps = gradient_accumulation_steps
-        # backward increments cur_step before this gate: the first window ends at GA.
-        return self.cur_step > 0 and self.cur_step % gradient_accumulation_steps == 0
+        return gradient_accumulation_steps == 1 or ((self.cur_step - 1) % gradient_accumulation_steps == 0
+                                                    and self.cur_step > 1)
 
     def _get_lr(self):
         """Get learning rates from optimizer. Override in subclass."""
@@ -139,7 +139,7 @@ class BaseOptimizerGroup:
         """Accumulate metrics for train/eval status. Override in subclass if needed."""
         status = self.train_status if is_training else self.eval_status
         if metric_step is None:
-            metric_step = self.cur_step
+            metric_step = self.cur_step - 1
         if len(status.metrics) > 0 and status.inputs is not None and status.outputs is not None:
             # forward_kwargs is the raw kwargs the forward was called with. A caller that drives
             # gradient accumulation threads gradient_accumulation_steps through it (the Megatron

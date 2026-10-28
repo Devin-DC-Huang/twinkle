@@ -235,7 +235,7 @@ class OptimizerGroup(BaseOptimizerGroup):
         self._ensure_dp_group()
         status = self.train_status if is_training else self.eval_status
         if metric_step is None:
-            metric_step = self.cur_step
+            metric_step = self.cur_step - 1
         if len(status.metrics) > 0 and status.inputs is not None and status.outputs is not None:
             forward_kwargs = copy(status.forward_kwargs)
             forward_kwargs.pop('gradient_accumulation_steps', None)
@@ -1620,7 +1620,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         if not transactional:
             return outputs
 
-        metric_step = optimizer_config.cur_step
+        metric_step = optimizer_config.cur_step - 1 if finalize_gradients else optimizer_config.cur_step
         optimizer_config.accumulate_metrics(True, include_default=False, metric_step=metric_step)
         status = optimizer_config.train_status
         status.inputs = None
