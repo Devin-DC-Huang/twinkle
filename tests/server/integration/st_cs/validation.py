@@ -54,7 +54,6 @@ def reference(args):
 
 def validate_http(base_url, controller, args):
     from twinkle import init_twinkle_client
-    from twinkle_client.model import MultiLoraTransformersModel
     import ray
     from tests.server.integration.on_demand_training.acceptance_support import wait_until
 
@@ -65,7 +64,7 @@ def validate_http(base_url, controller, args):
     def create(token, label, lr=1e-3, max_length=128):
         client = init_twinkle_client(base_url=base_url, api_key=token)
         clients.append(client)
-        model = MultiLoraTransformersModel(MODEL, transport=client.transport)
+        model = client.model(MODEL)
         model.add_adapter_to_model(label, LoraConfig(r=4, target_modules=['query', 'value']))
         live.append(model)
         configure(model, lr=lr, max_length=max_length)

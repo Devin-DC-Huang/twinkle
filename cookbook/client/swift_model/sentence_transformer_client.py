@@ -9,7 +9,6 @@ from peft import LoraConfig
 from transformers import AutoTokenizer
 
 from twinkle import init_twinkle_client
-from twinkle_client.model import MultiLoraTransformersModel
 
 MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 TEXTS = [
@@ -56,7 +55,7 @@ def main():
     client = init_twinkle_client(base_url=args.base_url, api_key=args.api_key)
     active = None
     try:
-        active = MultiLoraTransformersModel(args.model, transport=client.transport)
+        active = client.model(args.model)
         active.add_adapter_to_model("first", LoraConfig(r=4, target_modules=["query", "value"]))
         configure(active)
         before = vectors(active, batch)
@@ -67,7 +66,7 @@ def main():
         assert delta > 1e-6, "Training did not change embeddings"
         saved = active.save("st-example", save_optimizer=True, consumed_train_samples=2 * len(batch))
         active.remove_adapter()
-        active = MultiLoraTransformersModel(args.model, transport=client.transport)
+        active = client.model(args.model)
         active.add_adapter_to_model("restored", LoraConfig(r=4, target_modules=["query", "value"]))
         configure(active)
         progress = active.resume_from_checkpoint(saved.twinkle_path)

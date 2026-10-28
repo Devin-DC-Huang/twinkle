@@ -114,6 +114,35 @@ def test_model_inline_forward_methods_keep_the_original_endpoints(monkeypatch) -
     assert calls[-1][1]['micro_batch_size'] == 1
 
 
+def test_st_model_factory_keeps_owner_transport_and_lazy_creation(monkeypatch) -> None:
+    from twinkle_client.http import ClientContext, ClientTransport
+    from twinkle_client.http.context import clear_default_transport, set_default_transport
+    from twinkle_client.manager import TwinkleClient
+
+    calls = []
+    transport = ClientTransport(ClientContext(base_url='http://st-server', api_key='owner', session_id='st-session'))
+    other = ClientTransport(ClientContext(base_url='http://other-server', api_key='other'))
+    monkeypatch.setattr(transport._session, 'post', _recorder(calls, lambda url: _completed({'result': {}})))
+    # A later default-client change must not redirect this client's model factory.
+    set_default_transport(other)
+    try:
+        with TwinkleClient(transport=transport) as client:
+            model = client.model('sentence-transformers/all-MiniLM-L6-v2')
+            assert model._transport is transport and calls == []
+            model.add_adapter_to_model('tenant', {'r': 4, 'target_modules': ['query', 'value']})
+            assert [url.rsplit('/', 1)[-1] for url, _ in calls] == ['create', 'add_adapter_to_model']
+            assert all(url.startswith(transport.context.base_url + '/model/sentence-transformers/all-MiniLM-L6-v2/')
+                       for url, _ in calls)
+            assert transport.context.api_key == 'owner' and transport.context.session_id == 'st-session'
+            assert model._training_ids == {'tenant': 'training-test'}
+            restored = client.model('sentence-transformers/all-MiniLM-L6-v2')
+            assert restored._transport is transport and restored._training_ids == {}
+            assert len(calls) == 2
+    finally:
+        clear_default_transport(other)
+        other.close()
+
+
 def test_model_add_adapter_serializes_dict_lora_config(monkeypatch) -> None:
     """Dict input remains compatible with the strict serialized LoRA wire field."""
     from twinkle_client.model import multi_lora_transformers as module
