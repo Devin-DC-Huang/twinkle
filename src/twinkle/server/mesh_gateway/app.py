@@ -7,10 +7,8 @@ import httpx
 import json
 import time
 import uuid
-from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
-from typing import AsyncIterator
 
 from twinkle.server.common.tunnel import TunnelRequest, TunnelResponse
 from twinkle.utils.logger import get_logger
@@ -27,23 +25,15 @@ def create_mesh_gateway_app(
     proxy: ServiceMeshProxy | None = None,
 ) -> FastAPI:
     """Create the CPU-side public gateway for one GPU training service."""
-    owns_proxy = proxy is None
     mesh_proxy = proxy or ServiceMeshProxy(
         gpu_service_id,
         mesh_url=mesh_url,
         timeout_seconds=timeout_seconds,
     )
 
-    @asynccontextmanager
-    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-        yield
-        if owns_proxy:
-            await mesh_proxy.close()
-
     app = FastAPI(
         title='Twinkle Service Mesh Gateway',
         description='Public Twinkle and Tinker gateway for one GPU service',
-        lifespan=lifespan,
     )
 
     @app.get('/health')

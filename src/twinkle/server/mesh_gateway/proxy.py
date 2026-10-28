@@ -2,7 +2,10 @@
 """Client for the platform-provided Service Mesh endpoint."""
 from __future__ import annotations
 
+import asyncio
 import httpx
+from contextlib import asynccontextmanager
+from typing import AsyncIterator
 
 from twinkle.server.common.tunnel import TunnelRequest, TunnelResponse
 
@@ -14,6 +17,7 @@ _QUERY_PATHS = frozenset({
     '/api/v1/twinkle/capacity_info',
     '/api/v1/twinkle/healthz',
 })
+_MAX_INFLIGHT_REQUESTS = 100
 
 
 class ServiceMeshError(Exception):
@@ -35,15 +39,31 @@ class ServiceMeshProxy:
         self._mesh_url = mesh_url
         # The long timeout is for training responses, not connection admission.
         self._timeout = httpx.Timeout(timeout_seconds, connect=5.0, write=30.0, pool=3.0)
-        self._owns_client = client is None
-        self._client = client or httpx.AsyncClient(
-            timeout=self._timeout,
-            trust_env=False,
-        )
+        self._client = client
+        # Preserve the old shared pool's admission bound without sharing its
+        # cancellation-sensitive connection state between independent requests.
+        self._slots = asyncio.Semaphore(_MAX_INFLIGHT_REQUESTS)
 
-    async def close(self) -> None:
-        if self._owns_client:
-            await self._client.aclose()
+    @asynccontextmanager
+    async def _request_client(self) -> AsyncIterator[httpx.AsyncClient]:
+        try:
+            async with asyncio.timeout(self._timeout.pool):
+                await self._slots.acquire()
+        except TimeoutError as exc:
+            raise httpx.PoolTimeout('CPU Gateway forwarding capacity is full.') from exc
+
+        try:
+            if self._client is not None:
+                # Injected clients (e.g. in-process tests) belong to the caller.
+                yield self._client
+            else:
+                # httpcore 1.0.9 may retain an unconnected pool slot after task
+                # cancellation. Dispose of that pool with this request instead
+                # of poisoning every later request to the long-lived gateway.
+                async with httpx.AsyncClient(timeout=self._timeout, trust_env=False) as client:
+                    yield client
+        finally:
+            self._slots.release()
 
     async def forward(self, request_id: str, tunnel_request: TunnelRequest) -> TunnelResponse:
         timeout = self._timeout
@@ -52,20 +72,21 @@ class ServiceMeshProxy:
         elif tunnel_request.method == 'GET' and tunnel_request.path in _QUERY_PATHS:
             timeout = httpx.Timeout(min(self._timeout.read, 15.0), connect=5.0, pool=3.0)
 
-        response = await self._client.post(
-            self._mesh_url,
-            timeout=timeout,
-            json={
-                'header': {
-                    'request_id': request_id,
-                    'service_id': self._service_id,
+        async with self._request_client() as client:
+            response = await client.post(
+                self._mesh_url,
+                timeout=timeout,
+                json={
+                    'header': {
+                        'request_id': request_id,
+                        'service_id': self._service_id,
+                    },
+                    'payload': {
+                        'input': tunnel_request.model_dump(mode='json'),
+                        'parameters': {},
+                    },
                 },
-                'payload': {
-                    'input': tunnel_request.model_dump(mode='json'),
-                    'parameters': {},
-                },
-            },
-        )
+            )
         response.raise_for_status()
 
         try:

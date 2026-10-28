@@ -189,3 +189,143 @@ async def test_client_disconnect_cancels_cpu_forwarding():
     await asyncio.wait_for(app(scope, receive, send), timeout=1)
     assert cancelled.is_set()
     assert messages[0]['status'] == 499
+
+
+@pytest.mark.asyncio
+async def test_cancel_after_connection_assignment_does_not_poison_later_requests(monkeypatch):
+    """Cancel in httpcore's assignment/dispatch gap, then query the same gateway."""
+    from httpcore._async.connection_pool import AsyncPoolRequest
+    from twinkle.server.mesh_gateway import proxy as proxy_module
+
+    assigned = asyncio.Event()
+    interrupt = True
+    wait_for_connection = AsyncPoolRequest.wait_for_connection
+
+    async def pause_after_assignment(self, timeout=None):
+        connection = await wait_for_connection(self, timeout)
+        if interrupt:
+            assigned.set()
+            await asyncio.Event().wait()
+        return connection
+
+    monkeypatch.setattr(AsyncPoolRequest, 'wait_for_connection', pause_after_assignment)
+    # One slot makes the leaked-assignment regression deterministic and quick.
+    client_type = httpx.AsyncClient
+
+    def network_client(**kwargs):
+        kwargs.setdefault('limits', httpx.Limits(max_connections=1))
+        return client_type(**kwargs)
+
+    monkeypatch.setattr(proxy_module.httpx, 'AsyncClient', network_client)
+    body = json.dumps(_mesh_response()).encode()
+    writers = set()
+
+    async def handle(reader, writer):
+        writers.add(writer)
+        try:
+            headers = await reader.readuntil(b'\r\n\r\n')
+            length = next(int(line.split(b':', 1)[1]) for line in headers.split(b'\r\n')
+                          if line.lower().startswith(b'content-length:'))
+            await reader.readexactly(length)
+            writer.write(b'HTTP/1.1 200 OK\r\nContent-Length: ' + str(len(body)).encode() + b'\r\n\r\n' + body)
+            await writer.drain()
+        finally:
+            writers.discard(writer)
+            writer.close()
+
+    server = await asyncio.start_server(handle, '127.0.0.1', 0)
+    port = server.sockets[0].getsockname()[1]
+    proxy = ServiceMeshProxy('gpu-service', mesh_url=f'http://127.0.0.1:{port}/inference')
+    app = create_mesh_gateway_app(gpu_service_id='gpu-service', proxy=proxy)
+    scope = {
+        'type': 'http', 'asgi': {'version': '3.0'}, 'http_version': '1.1', 'method': 'GET',
+        'scheme': 'http', 'path': '/api/v1/models', 'raw_path': b'/api/v1/models',
+        'query_string': b'', 'headers': [], 'server': ('gateway', 80), 'client': ('client', 1234),
+    }
+    sent = False
+    messages = []
+
+    async def receive():
+        nonlocal sent
+        if not sent:
+            sent = True
+            return {'type': 'http.request', 'body': b'', 'more_body': False}
+        await assigned.wait()
+        return {'type': 'http.disconnect'}
+
+    async def send(message):
+        messages.append(message)
+
+    try:
+        async with client_type(transport=httpx.ASGITransport(app=app), base_url='http://gateway') as client:
+            for _ in range(3):
+                sent, interrupt = False, True
+                assigned.clear()
+                messages.clear()
+                await asyncio.wait_for(app(scope, receive, send), timeout=2)
+                assert messages[0]['status'] == 499
+                interrupt = False
+                response = await asyncio.wait_for(client.get('/api/v1/models'), timeout=5)
+                assert response.status_code == 200
+                assert response.json() == {'ok': True}
+    finally:
+        server.close()
+        for writer in list(writers):
+            writer.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_request_scoped_clients_preserve_admission_and_release_cancelled_waiters(monkeypatch):
+    from twinkle.server.mesh_gateway import proxy as proxy_module
+
+    monkeypatch.setattr(proxy_module, '_MAX_INFLIGHT_REQUESTS', 1)
+    busy, release = asyncio.Event(), asyncio.Event()
+    body = json.dumps(_mesh_response()).encode()
+    writers = set()
+    accepted = 0
+
+    async def handle(reader, writer):
+        nonlocal accepted
+        accepted += 1
+        writers.add(writer)
+        try:
+            headers = await reader.readuntil(b'\r\n\r\n')
+            length = next(int(line.split(b':', 1)[1]) for line in headers.split(b'\r\n')
+                          if line.lower().startswith(b'content-length:'))
+            await reader.readexactly(length)
+            busy.set()
+            await release.wait()
+            writer.write(b'HTTP/1.1 200 OK\r\nContent-Length: ' + str(len(body)).encode() + b'\r\n\r\n' + body)
+            await writer.drain()
+        finally:
+            writers.discard(writer)
+            writer.close()
+
+    server = await asyncio.start_server(handle, '127.0.0.1', 0)
+    port = server.sockets[0].getsockname()[1]
+    proxy = ServiceMeshProxy('gpu-service', mesh_url=f'http://127.0.0.1:{port}/inference')
+    proxy._timeout.pool = .1
+    request = TunnelRequest(method='POST', path='/api/v1/optim_step', body={})
+    running = asyncio.create_task(proxy.forward('training-once', request))
+    try:
+        await asyncio.wait_for(busy.wait(), timeout=2)
+        waiting = asyncio.create_task(proxy.forward('cancelled-waiter', request))
+        await asyncio.sleep(0)
+        waiting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiting
+        with pytest.raises(httpx.PoolTimeout):
+            await asyncio.wait_for(proxy.forward('capacity-full', request), timeout=2)
+        assert accepted == 1, 'Rejected/cancelled requests must not reach or replay training'
+        release.set()
+        assert (await asyncio.wait_for(running, timeout=2)).body == {'ok': True}
+        assert (await asyncio.wait_for(proxy.forward('after-release', request), timeout=2)).body == {'ok': True}
+        assert accepted == 2
+    finally:
+        release.set()
+        await asyncio.wait_for(running, timeout=2)
+        server.close()
+        for writer in list(writers):
+            writer.close()
+        await server.wait_closed()
