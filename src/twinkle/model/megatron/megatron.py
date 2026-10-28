@@ -901,7 +901,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
             status.forward_kwargs = {**kwargs, '_metric_loss_key': loss_key}
             status.loss_reduction = 'mean' if transactional else getattr(loss_instance, 'reduction', 'mean')
             if transactional:
-                metric_step = optimizer_config.cur_step - 1 if finalize_gradients else optimizer_config.cur_step
+                metric_step = optimizer_config.cur_step
                 optimizer_config.accumulate_metrics(True, include_default=False, metric_step=metric_step)
                 status.inputs = None
                 status.outputs = None
