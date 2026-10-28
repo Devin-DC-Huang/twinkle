@@ -11,6 +11,26 @@ from twinkle.model.transformers.transformers import TransformersModel
 from twinkle.processor import InputProcessor
 
 
+@pytest.mark.parametrize('padding_free', [False, True])
+@pytest.mark.parametrize('input_count, micro_batch_size, expected_sizes', [
+    (6, 4, [4, 2]),
+    (8, 6, [6, 2]),
+    (8, 4, [4, 4]),
+    (3, 4, [3]),
+    (5, 1, [1, 1, 1, 1, 1]),
+])
+def test_fixed_micro_batch_plan_keeps_full_batches_and_a_short_tail(
+    padding_free, input_count, micro_batch_size, expected_sizes,
+):
+    inputs = [{'input_ids': [index]} for index in range(input_count)]
+
+    plan = plan_micro_batches(inputs, MicroBatchConfig(micro_batch_size=micro_batch_size),
+                              padding_free=padding_free)
+
+    assert [len(batch) for batch in plan] == expected_sizes
+    assert [index for batch in plan for index in batch] == list(range(input_count))
+
+
 @pytest.mark.parametrize('packing_algorithm', ['ffd', 'kk'])
 def test_dynamic_micro_batch_plan_preserves_samples_and_limits_cost(packing_algorithm):
     lengths = [10, 9, 8, 7, 4, 3, 2, 1]
@@ -80,6 +100,7 @@ def test_loss_without_micro_batch_semantics_fails_when_split():
 def test_transformers_forward_backward_keeps_original_default_path():
     class ModelHarness:
         _forward_backward_single = TransformersModel._forward_backward_single
+        _forward_backward_micro_batch = TransformersModel._forward_backward_micro_batch
         _not_encoded = staticmethod(lambda inputs: False)
 
         def _get_default_group(self):
@@ -87,7 +108,10 @@ def test_transformers_forward_backward_keeps_original_default_path():
 
         def __init__(self):
             self.calls = []
-            self.optimizer_group = {'adapter': BaseOptimizerGroup(loss_instance=CrossEntropyLoss())}
+            self.optimizer_group = {'adapter': BaseOptimizerGroup(
+                loss_instance=CrossEntropyLoss(),
+                train_status=SimpleNamespace(loss_value=None, num_tokens=0.0),
+            )}
 
         def forward(self, *, inputs, **_kwargs):
             self.calls.append(('forward', inputs))
@@ -95,6 +119,8 @@ def test_transformers_forward_backward_keeps_original_default_path():
 
         def calculate_loss(self, **_kwargs):
             self.calls.append(('loss', None))
+            self.optimizer_group['adapter'].train_status.loss_value = 2.0
+            self.optimizer_group['adapter'].train_status.num_tokens += 1.0
             return 2.0
 
         def backward(self, **_kwargs):
@@ -110,7 +136,13 @@ def test_transformers_forward_backward_keeps_original_default_path():
     assert outputs['loss'] == 2.0
 
 
-def test_transformers_forward_backward_executes_real_micro_batches():
+@pytest.mark.parametrize('input_count, micro_batch_size, expected_batches', [
+    (4, 2, [[0, 1], [2, 3]]),
+    (6, 4, [[0, 1, 2, 3], [4, 5]]),
+])
+def test_transformers_forward_backward_executes_real_micro_batches(
+    input_count, micro_batch_size, expected_batches,
+):
     class OptimizerConfig(BaseOptimizerGroup):
         def __init__(self):
             super().__init__()
@@ -163,34 +195,129 @@ def test_transformers_forward_backward_executes_real_micro_batches():
             'sample_id': index,
             'input_ids': list(range(index + 1)),
         }
-        for index in range(4)
+        for index in range(input_count)
     ]
 
     outputs = TransformersModel.forward_backward.__wrapped__(
         model,
         inputs=inputs,
         adapter_name='adapter',
-        micro_batch_size=2,
+        micro_batch_size=micro_batch_size,
         sync_gradients=True,
     )
 
-    assert outputs['loss'] == 2.0
-    assert model.forward_batches == [[0, 1], [2, 3]]
-    assert model.backward_calls == [(False, 1.0), (True, 1.0)]
-    assert model.optimizer_group['adapter'].train_status.num_tokens == 1.0
+    assert outputs['loss'] == pytest.approx(2.0)
+    assert model.forward_batches == expected_batches
+    assert [sync for sync, _ in model.backward_calls] == [False, True]
+    assert [loss for _, loss in model.backward_calls] == pytest.approx(
+        [2.0 * len(batch) / input_count for batch in expected_batches])
+    assert model.optimizer_group['adapter'].train_status.num_tokens == pytest.approx(1.0)
 
 
-def test_fixed_micro_batch_plan_can_match_a_larger_dp_micro_batch_count():
-    inputs = [{'input_ids': [index]} for index in range(4)]
+@pytest.mark.parametrize('min_micro_batches', [1, 3, 7])
+def test_fixed_micro_batch_plan_does_not_repartition_for_minimum_count(min_micro_batches):
+    inputs = [{'input_ids': [index]} for index in range(6)]
 
     plan = plan_micro_batches(
         inputs,
-        MicroBatchConfig(micro_batch_size=2),
+        MicroBatchConfig(micro_batch_size=4),
         padding_free=False,
-        min_micro_batches=3,
+        min_micro_batches=min_micro_batches,
     )
 
-    assert plan == [[0, 1], [2], [3]]
+    assert plan == [[0, 1, 2, 3], [4, 5]]
+
+
+def test_fixed_dp_micro_batch_planning_checks_counts_once_without_repartitioning(monkeypatch):
+    from twinkle.model.transformers import transformers as module
+
+    optimizer_config = SimpleNamespace(
+        processor=InputProcessor(padding_free=False),
+        _dp_group=object(),
+        _ensure_dp_group=lambda: None,
+    )
+    calls = []
+
+    def all_gather(states, local_state, *, group):
+        assert group is optimizer_config._dp_group
+        calls.append(local_state['micro_batch_count'])
+        states[:] = [local_state, {'micro_batch_count': 3, 'input_count': 10, 'error': None}]
+
+    monkeypatch.setattr(module.dist, 'get_world_size', lambda _group: 2)
+    monkeypatch.setattr(module.dist, 'all_gather_object', all_gather)
+
+    with pytest.raises(ValueError, match='fixed micro-batch counts differ.*2, 3'):
+        TransformersModel._build_micro_batch_plan(
+            object(),
+            [{'input_ids': [index]} for index in range(6)],
+            MicroBatchConfig(micro_batch_size=4),
+            optimizer_config,
+        )
+
+    assert calls == [2]
+
+
+def test_fixed_dp_micro_batch_planning_accepts_matching_counts_with_different_tails(monkeypatch):
+    from twinkle.model.transformers import transformers as module
+
+    optimizer_config = SimpleNamespace(
+        processor=InputProcessor(padding_free=False),
+        _dp_group=object(),
+        _ensure_dp_group=lambda: None,
+    )
+    calls = []
+
+    def all_gather(states, local_state, *, group):
+        assert group is optimizer_config._dp_group
+        calls.append(local_state['micro_batch_count'])
+        states[:] = [local_state, {'micro_batch_count': 2, 'input_count': 8, 'error': None}]
+
+    monkeypatch.setattr(module.dist, 'get_world_size', lambda _group: 2)
+    monkeypatch.setattr(module.dist, 'all_gather_object', all_gather)
+
+    plan = TransformersModel._build_micro_batch_plan(
+        object(),
+        [{'input_ids': [index]} for index in range(6)],
+        MicroBatchConfig(micro_batch_size=4),
+        optimizer_config,
+    )
+
+    assert plan == [[0, 1, 2, 3], [4, 5]]
+    assert calls == [2]
+
+
+@pytest.mark.parametrize('packing_algorithm', ['ffd', 'kk'])
+def test_dynamic_dp_micro_batch_planning_still_negotiates_a_common_count(monkeypatch, packing_algorithm):
+    from twinkle.model.transformers import transformers as module
+
+    optimizer_config = SimpleNamespace(
+        processor=InputProcessor(padding_free=False),
+        _dp_group=object(),
+        _ensure_dp_group=lambda: None,
+    )
+    calls = []
+
+    def all_gather(states, local_state, *, group):
+        assert group is optimizer_config._dp_group
+        calls.append(local_state['micro_batch_count'])
+        states[:] = [local_state, {'micro_batch_count': 3, 'input_count': 4, 'error': None}]
+
+    monkeypatch.setattr(module.dist, 'get_world_size', lambda _group: 2)
+    monkeypatch.setattr(module.dist, 'all_gather_object', all_gather)
+
+    config = MicroBatchConfig(micro_batch_size=2, dynamic_batching=True,
+                              max_tokens_per_micro_batch=2, packing_algorithm=packing_algorithm)
+    plan = TransformersModel._build_micro_batch_plan(
+        object(),
+        [{'input_ids': [index]} for index in range(4)],
+        config,
+        optimizer_config,
+    )
+
+    assert calls == [2, 3]
+    assert len(plan) == 3
+    assert sorted(index for batch in plan for index in batch) == list(range(4))
+    assert all(1 <= len(batch) <= 2 for batch in plan)
 
 
 def test_dp_micro_batch_planning_propagates_remote_rank_error(monkeypatch):
@@ -226,7 +353,8 @@ def test_dp_micro_batch_planning_propagates_remote_rank_error(monkeypatch):
             OptimizerConfig(),
         )
 
-def test_dp_micro_batch_planning_rejects_common_count_on_all_ranks(monkeypatch):
+@pytest.mark.parametrize('dynamic_batching', [False, True])
+def test_dp_micro_batch_planning_rejects_common_count_on_all_ranks(monkeypatch, dynamic_batching):
     from twinkle.model.transformers import transformers as module
 
     class OptimizerConfig:
@@ -255,13 +383,17 @@ def test_dp_micro_batch_planning_rejects_common_count_on_all_ranks(monkeypatch):
         TransformersModel._build_micro_batch_plan(
             object(),
             [{'input_ids': [1]}, {'input_ids': [2]}],
-            MicroBatchConfig(micro_batch_size=1),
+            MicroBatchConfig(micro_batch_size=1, dynamic_batching=dynamic_batching, max_tokens_per_micro_batch=1),
             OptimizerConfig(),
         )
 
 
 @pytest.mark.parametrize('algorithm', [None, 'ffd', 'kk'])
-def test_forward_only_micro_batches_restore_order_and_slice_masks(algorithm):
+@pytest.mark.parametrize('micro_batch_size, expected_fixed_batches', [
+    (2, [[0, 1], [2, 3], [4]]),
+    (4, [[0, 1, 2, 3], [4]]),
+])
+def test_forward_only_micro_batches_restore_order_and_slice_masks(algorithm, micro_batch_size, expected_fixed_batches):
     import torch
 
     class ModelHarness:
@@ -297,12 +429,13 @@ def test_forward_only_micro_batches_restore_order_and_slice_masks(algorithm):
     inputs = [{'input_ids': [1] * length, 'sample_id': index}
               for index, length in enumerate([2, 5, 1, 4, 3])]
     model = ModelHarness()
-    options = {'micro_batch_size': 2}
+    options = {'micro_batch_size': micro_batch_size}
     if algorithm is not None:
         options.update(dynamic_batching=True, max_tokens_per_micro_batch=10, packing_algorithm=algorithm)
     outputs = TransformersModel.forward_only.__wrapped__(
         model, inputs=inputs, sampling_masks=torch.arange(5), disable_lora=True, task='embedding', **options)
-    assert len(model.calls) >= 3
+    if algorithm is None:
+        assert model.calls == expected_fixed_batches
     assert outputs['logps'].shape == (5, 5)
     assert outputs['logps'][:, 0].tolist() == list(range(5))
     assert outputs['routed_experts'][:, 0, 0, 0].tolist() == list(range(5))

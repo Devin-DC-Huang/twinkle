@@ -1398,10 +1398,9 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
     def _build_micro_batch_plan(self, inputs, config, optimizer_config):
         """Plan the local micro-batches; under data parallelism every rank agrees on the count.
 
-        The token-cost packing is the same kernel ``forward_backward`` uses. Model DP ranks hold
-        different sequence lengths, so uncoordinated plans would disagree on the micro-batch
-        count; the all-gather loop below raises the minimum count until every rank returns the
-        same number, and fails loudly when no common count exists.
+        Fixed plans are checked once, without splitting their batches further. Dynamic plans
+        can differ across ranks because of sequence lengths; the all-gather loop raises their
+        minimum count until every rank agrees, and fails when no common count exists.
         """
         processor = optimizer_config.processor
         assert isinstance(processor, InputProcessor), 'Set a correct `InputProcessor` before forwarding'
@@ -1442,6 +1441,10 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             counts = [state['micro_batch_count'] for state in states]
             if all(count == len(plan) for count in counts):
                 return plan
+            if not config.dynamic_batching:
+                raise ValueError(
+                    f'fixed micro-batch counts differ across model DP ranks ({counts}); distribute inputs so '
+                    'all ranks execute the same number of non-empty micro-batches.')
             min_micro_batches = max(counts)
             if any(min_micro_batches > state['input_count'] for state in states):
                 raise ValueError('model DP ranks cannot execute the same number of non-empty micro-batches; '

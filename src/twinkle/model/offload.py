@@ -11,6 +11,22 @@ def record_offload(strategy, *, model: bool, optimizer: bool) -> None:
     strategy._offloaded_optimizer = bool(optimizer)
 
 
+def release_caching_allocator() -> None:
+    """Return unused caching-allocator blocks to the driver.
+
+    Colocation can leave the parameters and optimizer resident. The backward peak is still
+    reserved by this process, and a separate vLLM process only observes it through
+    ``cudaMemGetInfo`` when it maps the KV cache. ``gc.collect`` drops tensors that are
+    unreachable but not yet collected, which is what makes the following release see them.
+    """
+    import gc
+
+    gc.collect()
+    from twinkle.utils.framework import Torch
+
+    Torch.empty_cache()
+
+
 def offload_record(strategy) -> Tuple[bool, bool]:
     return (
         bool(getattr(strategy, '_offloaded_model', False)),

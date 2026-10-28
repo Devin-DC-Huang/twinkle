@@ -383,8 +383,10 @@ class TrainableModel(ABC):
         concrete models carry the ``strategy`` / ``model`` / ``optimizer_group`` / ``_get_default_group``
         shape it reads. ``offload_model`` and ``offload_optimizer`` select which piece moves; both
         default on so existing callers still step the whole trainer aside. Passing both false leaves
-        the rank resident and records nothing for :meth:`reload_to_gpu`. A strategy with no offload
-        of its own (deepspeed, Megatron-FSDP) still refuses when a piece is requested.
+        the parameters and optimizer resident and records nothing for :meth:`reload_to_gpu`, but still
+        releases this rank's caching allocator: the colocated sampler is another process and cannot
+        use blocks this process is only reserving. Megatron-FSDP still refuses when a piece is requested,
+        because its parameter storage is not the DDP buckets this path knows how to move.
 
         ``@remote_function`` is what makes the handle reach the workers: under Ray the model on the
         driver is a proxy with no ``strategy`` of its own, so an undecorated method would run against
@@ -394,8 +396,9 @@ class TrainableModel(ABC):
         the engine and lets it allocate its KV cache.
         """
         if not offload_model and not offload_optimizer:
-            from twinkle.model.offload import record_offload
+            from twinkle.model.offload import record_offload, release_caching_allocator
             record_offload(self.strategy, model=False, optimizer=False)
+            release_caching_allocator()
             return
         optimizer = self._colocation_optimizer() if offload_optimizer else None
         if offload_model:
