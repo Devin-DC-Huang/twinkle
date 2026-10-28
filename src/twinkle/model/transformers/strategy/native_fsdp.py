@@ -163,6 +163,10 @@ class NativeFSDPStrategy(TransformerStrategyBase):
                 _ensure_moe_patched_if_needed(model, self.ep_fsdp_device_mesh)
                 _place_ep_experts_on_local_device(model, self.ep_fsdp_device_mesh)
             mp_policy = _build_mp_policy(self.mixed_precision)
+            logger.info(
+                "FSDP precision: parameter_storage_dtypes=%s, mixed_precision=%s, policy=%s",
+                sorted({str(param.dtype) for param in model.parameters()}),
+                self.mixed_precision, mp_policy)
             reshard_after_forward = self.fsdp_config.get('reshard_after_forward', True)
 
             if ep_enabled:
