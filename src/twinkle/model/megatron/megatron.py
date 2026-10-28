@@ -1078,6 +1078,15 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
             self.model = self.strategy.wrap_model(self.model)
             self._model_wrapped = True
 
+        # Dtypes may arrive as NAME strings: a remote (twinkle_client) caller's kwargs cross HTTP
+        # as JSON, where a torch.dtype object is not a value. Normalize names back to dtypes so
+        # local and remote callers share one spelling ('float32' == torch.float32).
+        for dtype_key in ('params_dtype', 'main_grads_dtype', 'main_params_dtype', 'exp_avg_dtype',
+                          'exp_avg_sq_dtype'):
+            dtype_value = kwargs.get(dtype_key)
+            if isinstance(dtype_value, str):
+                kwargs[dtype_key] = getattr(torch, dtype_value)
+
         # Check if requesting Megatron distributed optimizer
         if not optimizer_cls or optimizer_cls in ('MegatronOptimizer', 'default', 'Adam'):
             optimizer_config.optimizer = self._create_megatron_optimizer(**kwargs)  # noqa

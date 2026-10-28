@@ -18,7 +18,7 @@ from typing import Any
 
 from twinkle import get_logger
 from twinkle.hub.model_alias import MODEL_ID_ALIASES_ENV, build_model_alias_map
-from twinkle.patch.ray_serve import apply_ray_serve_patches, get_runtime_env_for_patches
+from twinkle.patch.ray_serve import apply_ray_serve_patches
 from twinkle.server.config import ServerConfig
 from twinkle.server.config.application_spec import ApplicationSpec
 from .builder_registry import get_builders, resolve_builder
@@ -27,16 +27,32 @@ from .env_propagation import build_propagated_env_vars
 logger = get_logger()
 
 
+def _worker_setup_hook() -> None:
+    """Ray ``worker_process_setup_hook``: apply the Serve patches, then the env-var hook.
+
+    Composes the two things every twinkle worker may need at process start: the Ray Serve
+    monkey-patches (proxy actors) and :func:`twinkle.utils.loader.run_worker_setup_hook`
+    (startup plugin registration, driven by ``TWINKLE_WORKER_SETUP_HOOK``). Keeping them in one
+    job-level hook is what makes the composition reach every worker process -- Ray only honours
+    ``worker_process_setup_hook`` at ``ray.init`` time, not per actor.
+    """
+    from twinkle.patch.ray_serve import _apply_patch_in_worker_process
+    from twinkle.utils.loader import run_worker_setup_hook
+
+    _apply_patch_in_worker_process()
+    run_worker_setup_hook()
+
+
 def build_ray_runtime_env() -> dict[str, Any]:
     """The ``runtime_env`` every Ray worker in a twinkle server needs.
 
     Bundles the Ray Serve monkey-patches (which must be re-applied inside worker processes such as the
-    Serve ProxyActor) with the telemetry/persistence env vars propagated from the driver. Shared by the
-    launcher's own ``ray.init`` and by any caller that starts a local Ray head before handing off to
-    :func:`launch_server` (e.g. swift's deploy recipe), so both seed worker processes identically rather
-    than each re-deriving the merge.
+    Serve ProxyActor) and the env-var worker setup hook with the telemetry/persistence env vars
+    propagated from the driver. Shared by the launcher's own ``ray.init`` and by any caller that starts
+    a local Ray head before handing off to :func:`launch_server` (e.g. swift's deploy recipe), so both
+    seed worker processes identically rather than each re-deriving the merge.
     """
-    runtime_env = get_runtime_env_for_patches()
+    runtime_env = {'worker_process_setup_hook': 'twinkle.server.launcher.server_launcher._worker_setup_hook'}
     propagated_env_vars = build_propagated_env_vars()
     if propagated_env_vars:
         merged_env_vars = dict(runtime_env.get('env_vars') or {})

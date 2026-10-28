@@ -324,7 +324,9 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin, DeltaSamp
 
         if 'input_ids' not in feat or multi_modal_data:
             if 'input_ids' in feat:
-                if len(feat['input_ids']) != len(response.prompt_token_ids):
+                if multi_modal_data:
+                    feat['input_ids'] = response.prompt_token_ids
+                elif len(feat['input_ids']) != len(response.prompt_token_ids):
                     raise RuntimeError(f'Input ids length {len(feat["input_ids"])} does not '
                                        f'match prompt_token_ids length {len(response.prompt_token_ids)}')
             else:
@@ -764,12 +766,17 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin, DeltaSamp
         lora_request = self._load_lora(adapter_path)
 
         prompt = list(state.engine_input_ids) if state is not None else feat['input_ids']
+        # Mirrors the batched sample() seam: the media bundle travels alongside the
+        # token ids, or the placeholders never expand and the model answers blind.
+        multi_modal_data = self._extract_multi_modal_data(state.media if state is not None else feat)
 
         yield from self._iter_in_loop(
             self.engine.generate_stream(
                 prompt=prompt,
                 sampling_params=sampling_params,
                 lora_request=lora_request,
+                multi_modal_data=multi_modal_data,
+                mm_processor_kwargs=feat.get('mm_processor_kwargs') if isinstance(feat, dict) else None,
             ))
 
     def sample_stream_to_queue(self, queue, inputs, sampling_params=None, adapter_name='', adapter_path=None):

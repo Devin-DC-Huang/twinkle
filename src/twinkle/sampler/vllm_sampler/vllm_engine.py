@@ -679,6 +679,8 @@ class VLLMEngine(BaseSamplerEngine):
                               priority: int = 0,
                               *,
                               disable_lora: bool = False,
+                              multi_modal_data: Optional[Dict[str, Any]] = None,
+                              mm_processor_kwargs: Optional[Dict[str, Any]] = None,
                               **kwargs):
         """Stream token deltas as they are generated.
 
@@ -701,6 +703,13 @@ class VLLMEngine(BaseSamplerEngine):
             prompt = TextPrompt(prompt=prompt)
         else:
             prompt = TokensPrompt(prompt_token_ids=prompt)
+        # Same attachment convention as sample(): multimodal payloads ride on the
+        # prompt object itself -- without them vLLM never expands the media
+        # placeholders and the model only sees the un-expanded prompt tokens.
+        if multi_modal_data:
+            prompt['multi_modal_data'] = multi_modal_data
+        if mm_processor_kwargs:
+            prompt['mm_processor_kwargs'] = mm_processor_kwargs
 
         if lora_request is not None and not self.enable_lora:
             lora_request = None
