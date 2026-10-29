@@ -184,9 +184,19 @@ class ScoreWorker:
         with open(path, 'a', encoding='utf-8') as stream:
             for sample, per_func in zip(samples, rewards):
                 resolved = _resolve(sample)
+                messages = list(getattr(resolved, 'messages', None) or [])
+                assistant = next((m for m in reversed(messages) if m.get('role') == 'assistant'), {})
+                prompt = getattr(resolved, 'prompt', None)
+                if prompt is None and messages:
+                    prompt = messages[:next((i for i, m in enumerate(messages) if m.get('role') == 'assistant'),
+                                            len(messages))]
                 stream.write(json.dumps({
                     'step': step,
-                    'prompt': getattr(resolved, 'prompt', None),
+                    'prompt': prompt,
                     'completion': resolved.decoded,
+                    'reasoning_content': assistant.get('reasoning_content'),
+                    'messages': messages,
+                    'completion_length': len(getattr(resolved, 'response_token_ids', None) or []),
+                    'truncated': bool(getattr(resolved, 'truncated', False)),
                     'rewards': per_func,
                 }, ensure_ascii=False) + '\n')
