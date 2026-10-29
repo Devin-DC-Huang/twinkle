@@ -8,6 +8,7 @@ under ``detail``.
 """
 
 from __future__ import annotations
+
 from typing import Literal
 
 from twinkle.protocol.types.errors import ErrorCategory
@@ -25,7 +26,7 @@ class TwinkleServerError(Exception):
 
     def __init__(
         self,
-        message: str = "",
+        message: str = '',
         *,
         error_code: int | None = None,
         category: ErrorCategory | None = None,
@@ -67,8 +68,8 @@ class ConfigError(TwinkleServerError):
         self.value = value
         self.allowed = list(allowed) if allowed is not None else None
         if message is None:
-            allowed_part = f", allowed: {self.allowed}" if self.allowed is not None else ""
-            message = f"Invalid value for {field}: {value!r}{allowed_part}"
+            allowed_part = f', allowed: {self.allowed}' if self.allowed is not None else ''
+            message = f'Invalid value for {field}: {value!r}{allowed_part}'
         super().__init__(message)
 
 
@@ -174,11 +175,9 @@ class FullModeBusyError(RequestRejectedError):
 
     def __init__(self, current_holder: str) -> None:
         self.current_holder = current_holder
-        super().__init__(
-            "This deployment runs in full-parameter (exclusive) mode and is already "
-            f"held by another training task ({current_holder}). Only one full-parameter "
-            "training task is allowed at a time; retry after it is released."
-        )
+        super().__init__('This deployment runs in full-parameter (exclusive) mode and is already '
+                         f'held by another training task ({current_holder}). Only one full-parameter '
+                         'training task is allowed at a time; retry after it is released.')
 
 
 class TrainingExpiredError(ResourceNotFoundError):
@@ -194,7 +193,7 @@ class ResourceReleaseError(TwinkleServerError, RuntimeError):
 
     error_code = 503
 
-    def __init__(self, message: str, *, phase: Literal["worker_death", "pg_removal"]):
+    def __init__(self, message: str, *, phase: Literal['worker_death', 'pg_removal']):
         super().__init__(message)
         self.phase = phase
 

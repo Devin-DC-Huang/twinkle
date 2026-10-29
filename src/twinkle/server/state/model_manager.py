@@ -8,8 +8,8 @@ in-process cache, so two workers connected to the same backend see one
 consistent view of the cluster's model registry without an extra coordination
 actor in front.
 """
-
 from __future__ import annotations
+
 import functools
 import time
 
@@ -23,7 +23,7 @@ from .replica_registry import ReplicaRegistry
 # picked up by ``model::*`` scans. The count is maintained atomically via
 # ``StateBackend.update_atomic`` so two concurrent adds with the same token
 # cannot both pass the limit check (the prior count-then-add race).
-_TOKEN_COUNT_PREFIX = "token_count::"
+_TOKEN_COUNT_PREFIX = 'token_count::'
 
 
 def _counter_delta_transform(existing: object, *, delta: int) -> int:
@@ -60,14 +60,14 @@ class ModelManager(BaseManager[ModelRecord]):
     """
 
     def __init__(self, backend: StateBackend, expiration_timeout: float, per_token_model_limit: int = 30) -> None:
-        super().__init__(backend, "model::", ModelRecord, expiration_timeout)
+        super().__init__(backend, 'model::', ModelRecord, expiration_timeout)
         self._per_token_model_limit = per_token_model_limit
         self._replicas = ReplicaRegistry(backend)
 
     # ----- Index Rebuild -------------------------------------------------- #
 
     def _token_count_key(self, token: str) -> str:
-        return f"{_TOKEN_COUNT_PREFIX}{token}"
+        return f'{_TOKEN_COUNT_PREFIX}{token}'
 
     async def rebuild_indexes(self) -> None:
         """Rebuild the per-token model counters from the persisted ``model::*`` records.
@@ -83,7 +83,7 @@ class ModelManager(BaseManager[ModelRecord]):
                 counts[record.token] = counts.get(record.token, 0) + 1
 
         # Reset any stale counters, then write the recomputed ones.
-        stale_keys = await self._backend.keys(f"{_TOKEN_COUNT_PREFIX}*")
+        stale_keys = await self._backend.keys(f'{_TOKEN_COUNT_PREFIX}*')
         for key in stale_keys:
             await self._backend.delete(key)
         for token, count in counts.items():
@@ -99,9 +99,9 @@ class ModelManager(BaseManager[ModelRecord]):
         total_max = sum(replicas.values())
         total_used = sum(loaded_per_replica.get(rid, 0) for rid in replicas)
         return {
-            "max_loras": total_max,
-            "used_loras": total_used,
-            "free_loras": max(0, total_max - total_used),
+            'max_loras': total_max,
+            'used_loras': total_used,
+            'free_loras': max(0, total_max - total_used),
         }
 
     # ----- Replica Registration ------------------------------------------ #
@@ -127,14 +127,10 @@ class ModelManager(BaseManager[ModelRecord]):
 
     async def get_training_records(self, namespace: str):
         from .training_records import TrainingRecord
-
-        keys = await self._backend.keys("model::*")
+        keys = await self._backend.keys('model::*')
         return [
-            TrainingRecord.model_validate(value)
-            for value in await self._backend.mget(keys)
-            if isinstance(value, dict)
-            and value.get("controller_epoch")
-            and value.get("training_namespace") == namespace
+            TrainingRecord.model_validate(value) for value in await self._backend.mget(keys) if isinstance(value, dict)
+            and value.get('controller_epoch') and value.get('training_namespace') == namespace
         ]
 
     async def touch_replica_last_seen(self, replica_id: str) -> None:
@@ -217,8 +213,7 @@ class ModelManager(BaseManager[ModelRecord]):
             # is the count that was already present before this add.
             await self._backend.update_atomic(key, functools.partial(_counter_delta_transform, delta=-1))
             raise ResourceQuotaExceededError(
-                f"Model quota exceeded for this token: {new_count - 1}/{self._per_token_model_limit} models"
-            )
+                f'Model quota exceeded for this token: {new_count - 1}/{self._per_token_model_limit} models')
 
         try:
             await super().add(model_id, record)

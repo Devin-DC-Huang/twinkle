@@ -1,10 +1,10 @@
 from __future__ import annotations
+
 import asyncio
+import json
 import random
 from collections.abc import Callable
 from typing import Any
-
-import json
 
 from twinkle.server.telemetry.metrics import get_state_backend_metrics
 from .base import ConcurrencyError, StateBackend
@@ -36,20 +36,20 @@ class RedisBackend(StateBackend):
     TTL is managed by Redis native EXPIRE mechanism.
     """
 
-    def __init__(self, redis_url: str, key_prefix: str = "") -> None:
+    def __init__(self, redis_url: str, key_prefix: str = '') -> None:
         if not _REDIS_AVAILABLE:
-            raise ImportError("redis package required. Install with: pip install redis")
+            raise ImportError('redis package required. Install with: pip install redis')
         self._client = aioredis.from_url(redis_url, decode_responses=True)
         self._prefix = key_prefix
         self._metrics = get_state_backend_metrics()
 
     def _make_key(self, key: str) -> str:
         """Add namespace prefix to key."""
-        return f"{self._prefix}{key}" if self._prefix else key
+        return f'{self._prefix}{key}' if self._prefix else key
 
     def _strip_prefix(self, key: str) -> str:
         """Remove namespace prefix from full key."""
-        return key[len(self._prefix) :] if self._prefix else key
+        return key[len(self._prefix):] if self._prefix else key
 
     async def set(self, key: str, value: Any, ttl: int | None = None) -> None:
         """Store key-value pair with optional TTL in seconds."""
@@ -164,11 +164,11 @@ class RedisBackend(StateBackend):
                 except WatchError as exc:
                     # redis-py also wraps a lost watched connection as WatchError.
                     # Once EXEC was sent, its outcome may be unknown, not aborted.
-                    transport_failure = isinstance(exc.__context__, (RedisConnectionError, RedisTimeoutError)) or (
-                        str(exc).startswith(("A ConnectionError occurred", "A TimeoutError occurred"))
-                    )
+                    transport_failure = isinstance(exc.__context__,
+                                                   (RedisConnectionError, RedisTimeoutError)) or (str(exc).startswith(
+                                                       ('A ConnectionError occurred', 'A TimeoutError occurred')))
                     if executing and transport_failure:
-                        raise RedisConnectionError("Atomic update outcome could not be confirmed") from exc
+                        raise RedisConnectionError('Atomic update outcome could not be confirmed') from exc
                     self._metrics.update_atomic_conflicts.inc()
                     backoff = min(
                         _UPDATE_ATOMIC_BASE_BACKOFF_SECONDS * (2**attempt),
@@ -184,7 +184,7 @@ class RedisBackend(StateBackend):
                     # Before EXEC there was no mutation, so reconnecting is safe.
                     await asyncio.sleep(0.05 * connection_failures)
         self._metrics.update_atomic_retries.observe(_UPDATE_ATOMIC_MAX_RETRIES)
-        raise ConcurrencyError(f"update_atomic exhausted {_UPDATE_ATOMIC_MAX_RETRIES} retries on key {key!r}")
+        raise ConcurrencyError(f'update_atomic exhausted {_UPDATE_ATOMIC_MAX_RETRIES} retries on key {key!r}')
 
     async def mget(self, keys: list[str]) -> list[Any | None]:
         """Batch-read via native Redis MGET — single round-trip."""

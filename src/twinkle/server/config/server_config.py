@@ -12,12 +12,11 @@ Top-level fields use their current names with no aliases for legacy names
 ``extra='forbid'`` so a YAML that uses a legacy field is rejected with the
 offending name pointed at.
 """
-
 from __future__ import annotations
-from pathlib import Path
-from typing import Any
 
+from pathlib import Path
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from typing import Any
 
 from twinkle.server.exceptions import ConfigParseError
 from .application_spec import ApplicationSpec, HttpOptions
@@ -31,7 +30,7 @@ from .training import TrainingConfig, TrainingModelConfig
 class ServerConfig(BaseModel):
     """Top-level server configuration aggregate root."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra='forbid')
 
     ray_namespace: str | None = None
     proxy_location: str | None = None
@@ -58,38 +57,34 @@ class ServerConfig(BaseModel):
 
         p = Path(path)
         if not p.exists():
-            raise FileNotFoundError(f"Config file not found: {p}")
+            raise FileNotFoundError(f'Config file not found: {p}')
         try:
             raw = OmegaConf.to_container(OmegaConf.load(p), resolve=True)
         except Exception as e:  # malformed YAML / OmegaConf parse failure
-            raise ConfigParseError(f"Malformed YAML in {p}: {e}") from e
+            raise ConfigParseError(f'Malformed YAML in {p}: {e}') from e
         if raw is None:
             raw = {}
         if not isinstance(raw, dict):
-            raise ConfigParseError(
-                f"Top-level YAML in {p} must be a mapping, got {type(raw).__name__}",
-            )
+            raise ConfigParseError(f'Top-level YAML in {p} must be a mapping, got {type(raw).__name__}', )
         return cls.model_validate(raw)
 
     # ---- cross-field validation ------------------------------------------ #
 
-    @model_validator(mode="after")
+    @model_validator(mode='after')
     def _validate_cross_field(self) -> ServerConfig:
-        if sum(app.import_path == "server" for app in self.applications) > 1:
-            raise ValueError("configure one gateway per server")
-        if self.persistence.mode == "redis" and not self.persistence.redis_url:
-            raise ValueError(
-                "persistence.redis_url is required when persistence.mode == 'redis'",
-            )
+        if sum(app.import_path == 'server' for app in self.applications) > 1:
+            raise ValueError('configure one gateway per server')
+        if self.persistence.mode == 'redis' and not self.persistence.redis_url:
+            raise ValueError("persistence.redis_url is required when persistence.mode == 'redis'", )
         if self.training_config.models:
-            static = [app for app in self.applications if app.import_path != "model"]
+            static = [app for app in self.applications if app.import_path != 'model']
             names = {app.name for app in static}
             for model in self.training_config.models:
                 if model.name in names:
-                    raise ValueError(f"training model name conflicts with application: {model.name}")
+                    raise ValueError(f'training model name conflicts with application: {model.name}')
                 path = model.route_prefix
-                if any(app.route_prefix.rstrip("/") == path for app in static):
-                    raise ValueError(f"training route conflicts with application: {path}")
+                if any(app.route_prefix.rstrip('/') == path for app in static):
+                    raise ValueError(f'training route conflicts with application: {path}')
         return self
 
     @property
@@ -98,12 +93,11 @@ class ServerConfig(BaseModel):
         return TrainingConfig(
             **self.resources.model_dump(),
             models=[
-                TrainingModelConfig.from_application(app) for app in self.applications if app.import_path == "model"
-            ],
-        )
+                TrainingModelConfig.from_application(app) for app in self.applications if app.import_path == 'model'
+            ])
 
     # ---- round-trip / serialization -------------------------------------- #
 
     def to_yaml_dict(self) -> dict[str, Any]:
         """Return a JSON-mode dict suitable for ``yaml.safe_dump`` / round-trip."""
-        return self.model_dump(mode="json")
+        return self.model_dump(mode='json')

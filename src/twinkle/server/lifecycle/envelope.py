@@ -6,8 +6,8 @@ Both the Submit_Endpoint and the Retrieve_Endpoint go through this function so a
 this mapping per endpoint is how a task that failed inside the Inline_Fast_Path
 window loses its payload.
 """
-
 from __future__ import annotations
+
 from typing import Any
 
 from twinkle.protocol.types.errors import ErrorCategory, ErrorPayload
@@ -35,7 +35,7 @@ def envelope_from_record(
     request_id: str,
     record: dict[str, Any] | None,
     *,
-    fallback_status: str = "pending",
+    fallback_status: str = 'pending',
 ) -> TaskEnvelope:
     """Map a stored ``FutureRecord`` dict to the wire ``TaskEnvelope``.
 
@@ -54,21 +54,21 @@ def envelope_from_record(
     distinguish them by ``status`` while reading one field.
     """
     record = record or {}
-    status = record.get("status", fallback_status)
+    status = record.get('status', fallback_status)
     common = dict(
-        queue_state=record.get("queue_state"),
-        queue_state_reason=record.get("queue_state_reason"),
+        queue_state=record.get('queue_state'),
+        queue_state_reason=record.get('queue_state_reason'),
     )
-    if status in ("failed", "cancelled"):
+    if status in ('failed', 'cancelled'):
         return TaskEnvelope(
             request_id=request_id,
             status=status,
-            error=error_payload_from_failure(record.get("failure"), request_id=request_id),
+            error=error_payload_from_failure(record.get('failure'), request_id=request_id),
             **common,
         )
     return TaskEnvelope(
         request_id=request_id,
         status=status,
-        result=record.get("result") if status == "completed" else None,
+        result=record.get('result') if status == 'completed' else None,
         **common,
     )

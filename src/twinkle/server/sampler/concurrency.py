@@ -1,7 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Coordinate sampling with changes to shared sampler state."""
-
 from __future__ import annotations
+
 import asyncio
 
 from twinkle.server.exceptions import BackendBusyError
@@ -25,9 +25,9 @@ class SamplerConcurrency:
 
     def check_available(self):
         if self._closed:
-            raise BackendBusyError("The sampler is shutting down.")
+            raise BackendBusyError('The sampler is shutting down.')
         if self._weights_error is not None:
-            raise BackendBusyError("A checkpoint write failed; the sampler is restarting.")
+            raise BackendBusyError('A checkpoint write failed; the sampler is restarting.')
 
     def invalidate_weights(self, error: Exception):
         self._weights_error = error

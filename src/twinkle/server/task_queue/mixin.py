@@ -5,8 +5,8 @@
 used for I/O and for engines such as vLLM that own their compute concurrency
 and continuous batching internally.
 """
-
 from __future__ import annotations
+
 import asyncio
 import time
 import uuid
@@ -63,7 +63,7 @@ class TaskQueueMixin:
     def _init_task_queue(
         self,
         config: TaskQueueConfig | None = None,
-        deployment_name: str = "",
+        deployment_name: str = '',
         *,
         enable_admission_gate: bool = False,
         on_backend_timeout: Callable[[], Coroutine[Any, Any, None]] | None = None,
@@ -87,10 +87,8 @@ class TaskQueueMixin:
         self._task_queue_config = config if config is not None else TaskQueueConfig()
         if self._task_queue_config.execution_timeout == 0:
             logger.warning(
-                "[TaskQueue] execution_timeout=0: a finite %.0fs bound has replaced unbounded waiting (deployment=%s).",
-                self._task_queue_config.effective_execution_timeout,
-                deployment_name or "unknown",
-            )
+                '[TaskQueue] execution_timeout=0: a finite %.0fs bound has replaced unbounded waiting '
+                '(deployment=%s).', self._task_queue_config.effective_execution_timeout, deployment_name or 'unknown')
         # The Inline_Fast_Path window must stay strictly under Long_Poll_Window: a
         # submit that peeks longer than a retrieve would wait makes no sense (D4).
         # Raised, not asserted -- `python -O` strips asserts and would drop this
@@ -99,13 +97,10 @@ class TaskQueueMixin:
         _window = long_poll_window()
         if _inline >= _window:
             raise ConfigError(
-                "inline_fast_path_timeout",
+                'inline_fast_path_timeout',
                 _inline,
-                message=(
-                    f"inline_fast_path_timeout ({_inline}s) must be < Long_Poll_Window "
-                    f"({_window}s); lower it or raise TWINKLE_LONG_POLL_TIMEOUT."
-                ),
-            )
+                message=(f'inline_fast_path_timeout ({_inline}s) must be < Long_Poll_Window '
+                         f'({_window}s); lower it or raise TWINKLE_LONG_POLL_TIMEOUT.'))
         self._deployment_name = deployment_name
         self._task_metrics = get_task_metrics(deployment_name) if deployment_name else None
         self._future_absolute_ttl = self._task_queue_config.absolute_future_ttl(collect_width)
@@ -161,16 +156,16 @@ class TaskQueueMixin:
         return await self._backend_gate.call(fn, *args, admit=admit, **kwargs)
 
     def _future_deadline(self) -> float:
-        ttl = getattr(self, "_future_absolute_ttl", self._task_queue_config.absolute_future_ttl(1))
+        ttl = getattr(self, '_future_absolute_ttl', self._task_queue_config.absolute_future_ttl(1))
         return time.time() + ttl
 
     @staticmethod
     def _queue_key(model_id: str | None, token: str | None) -> str:
         if model_id:
-            return f"model:{model_id}"
+            return f'model:{model_id}'
         if token:
-            return f"token:{token}"
-        return "default"
+            return f'token:{token}'
+        return 'default'
 
     async def _perform_preflight_checks(
         self,
@@ -193,27 +188,24 @@ class TaskQueueMixin:
             return
 
         if input_tokens > self._task_queue_config.max_input_tokens:
-            raise InputTokensExceededError(
-                f"Input tokens ({input_tokens}) exceed maximum allowed ({self._task_queue_config.max_input_tokens})"
-            )
+            raise InputTokensExceededError(f'Input tokens ({input_tokens}) exceed maximum allowed '
+                                           f'({self._task_queue_config.max_input_tokens})')
 
         if batch_size is not None and data_world_size is not None:
             if batch_size < data_world_size:
-                raise BatchSizeError(f"Batch size {batch_size} must be >= data world size {data_world_size}")
+                raise BatchSizeError(f'Batch size {batch_size} must be >= data world size {data_world_size}')
             if batch_size_multiple is not None:
                 required_multiple = data_world_size * batch_size_multiple
                 if batch_size % required_multiple != 0:
-                    raise BatchSizeError(
-                        f"Batch size {batch_size} must be divisible by {required_multiple} "
-                        f"so each data-parallel shard gets a multiple of "
-                        f"{batch_size_multiple} examples"
-                    )
+                    raise BatchSizeError(f'Batch size {batch_size} must be divisible by {required_multiple} '
+                                         f'so each data-parallel shard gets a multiple of '
+                                         f'{batch_size_multiple} examples')
 
         allowed, reason = await self._rate_limiter.check_and_record(token, input_tokens)
         if not allowed:
             if self._task_metrics:
-                self._task_metrics.rate_limit_rejections.inc(tags={"deployment": self._deployment_name})
-            raise RateLimitExceededError(f"Rate limit exceeded: {reason}")
+                self._task_metrics.rate_limit_rejections.inc(tags={'deployment': self._deployment_name})
+            raise RateLimitExceededError(f'Rate limit exceeded: {reason}')
 
     async def _schedule_task(
         self,
@@ -229,7 +221,7 @@ class TaskQueueMixin:
     ) -> dict[str, Any]:
         """Common enqueue path. Always persists status: the future record is the
         single delivery channel for both result and failure."""
-        request_id = request_id or f"req_{uuid.uuid4().hex}"
+        request_id = request_id or f'req_{uuid.uuid4().hex}'
 
         # Decision_Boundary: raises RequestRejectedError before any state write.
         await self._perform_preflight_checks(
@@ -248,8 +240,7 @@ class TaskQueueMixin:
             token=token,
             input_tokens=input_tokens,
             task_type=task_type,
-            created_at=time.monotonic(),
-        )
+            created_at=time.monotonic())
         await self._prepare_queued_task(task)
 
         if self._event_loop is None:
@@ -261,7 +252,7 @@ class TaskQueueMixin:
             if task.on_finished is not None and await self.state.get_future(request_id) is None:
                 await self._compute_worker.finish_task(task, False)
             raise
-        return {"request_id": request_id, "model_id": model_id}
+        return {'request_id': request_id, 'model_id': model_id}
 
     async def _prepare_queued_task(self, task: QueuedTask) -> None:
         """Optional owner admission, after preflight and before any future write."""
@@ -274,7 +265,7 @@ class TaskQueueMixin:
             TaskStatus.PENDING.value,
             model_id,
             queue_state=QueueState.ACTIVE.value,
-            replica_id=getattr(self, "replica_id", None),
+            replica_id=getattr(self, 'replica_id', None),
             absolute_deadline=self._future_deadline(),
             owner_token=task.token,
         )
@@ -288,11 +279,9 @@ class TaskQueueMixin:
                     TaskStatus.FAILED.value,
                     model_id,
                     failure=FutureFailureRecord(
-                        reason_code="orphaned_replica",
-                        attribution="server",
-                        message="Replica stopped before the task could be enqueued.",
-                    ),
-                )
+                        reason_code='orphaned_replica',
+                        attribution='server',
+                        message='Replica stopped before the task could be enqueued.'))
             finally:
                 await self._compute_worker.finish_task(task, False)
             raise
@@ -308,11 +297,9 @@ class TaskQueueMixin:
                 model_id,
                 queue_state=QueueState.ACTIVE.value,
             )
-            logger.info(
-                f"[TaskQueue] Task {request_id} queued, type={task.task_type or 'unknown'}, "
-                f"model_id={model_id}, queue_key={queue_key}, "
-                f"queue_depth={q.qsize()}, input_tokens={task.input_tokens}"
-            )
+            logger.info(f'[TaskQueue] Task {request_id} queued, type={task.task_type or "unknown"}, '
+                        f'model_id={model_id}, queue_key={queue_key}, '
+                        f'queue_depth={q.qsize()}, input_tokens={task.input_tokens}')
         finally:
             # Once q.put succeeds the sleeping worker must always be woken, even
             # if an acknowledgement or status write fails afterwards.
@@ -380,7 +367,7 @@ class TaskQueueMixin:
         Returns:
             {'request_id': str, 'model_id': str | None}
         """
-        request_id = request_id or f"req_{uuid.uuid4().hex}"
+        request_id = request_id or f'req_{uuid.uuid4().hex}'
 
         # Decision_Boundary: raises RequestRejectedError before any state write.
         await self._perform_preflight_checks(model_id=model_id, token=token, input_tokens=input_tokens)
@@ -394,29 +381,24 @@ class TaskQueueMixin:
                 input_tokens=input_tokens,
                 task_type=task_type,
                 created_at=time.monotonic(),
-                execution_scope=execution_scope,
-            ),
+                execution_scope=execution_scope),
             self._queue_key(model_id=model_id, token=token),
-            replica_id=getattr(self, "replica_id", None),
-            absolute_deadline=self._future_deadline(),
-        )
-        logger.info(
-            f"[TaskQueue] Task {request_id} started concurrently, type={task_type or 'unknown'}, "
-            f"model_id={model_id}, input_tokens={input_tokens}"
-        )
-        return {"request_id": request_id, "model_id": model_id}
+            replica_id=getattr(self, 'replica_id', None),
+            absolute_deadline=self._future_deadline())
+        logger.info(f'[TaskQueue] Task {request_id} started concurrently, type={task_type or "unknown"}, '
+                    f'model_id={model_id}, input_tokens={input_tokens}')
+        return {'request_id': request_id, 'model_id': model_id}
 
     # Poll cadence *inside* the Inline_Fast_Path window. Much smaller than the window
     # itself so a task that finishes early is noticed promptly; the window bound
     # (config.inline_fast_path_timeout) is what actually caps submit latency.
     _INLINE_FAST_PATH_POLL = 0.005
 
-    async def submit_concurrent_and_peek(
-        self, coro_factory: Callable[[], Coroutine], **schedule_kwargs
-    ) -> TaskEnvelope:
+    async def submit_concurrent_and_peek(self, coro_factory: Callable[[], Coroutine],
+                                         **schedule_kwargs) -> TaskEnvelope:
         """Concurrent compute submission with the existing Twinkle future envelope."""
         ref = await self.schedule_concurrent_task(coro_factory, **schedule_kwargs)
-        return await self._peek_terminal(ref["request_id"], fallback_status="pending")
+        return await self._peek_terminal(ref['request_id'], fallback_status='pending')
 
     async def _peek_terminal(self, request_id: str, *, fallback_status: str) -> TaskEnvelope:
         """Poll a record up to the Inline_Fast_Path window; return a terminal envelope
@@ -425,7 +407,7 @@ class TaskQueueMixin:
         record = None
         while time.monotonic() < deadline:
             record = await self.state.get_future(request_id)
-            if record is not None and record.get("status") in TERMINAL_STATUSES:
+            if record is not None and record.get('status') in TERMINAL_STATUSES:
                 return envelope_from_record(request_id, record)
             await asyncio.sleep(self._INLINE_FAST_PATH_POLL)
         return envelope_from_record(request_id, record, fallback_status=fallback_status)
@@ -451,9 +433,8 @@ class TaskQueueMixin:
         still non-terminal returns a non-terminal envelope carrying ``queue_state``.
         """
         ref = await self.schedule_task(
-            coro_factory, model_id=model_id, token=token, task_type=task_type, request_id=request_id, **schedule_kwargs
-        )
-        return await self._peek_terminal(ref["request_id"], fallback_status="pending")
+            coro_factory, model_id=model_id, token=token, task_type=task_type, request_id=request_id, **schedule_kwargs)
+        return await self._peek_terminal(ref['request_id'], fallback_status='pending')
 
     async def submit_background_and_peek(
         self,
@@ -470,7 +451,7 @@ class TaskQueueMixin:
         non-terminal fallback is ``running``.
         """
         ref = await self.schedule_background_task(coro_factory, model_id=model_id, task_type=task_type)
-        return await self._peek_terminal(ref["request_id"], fallback_status="running")
+        return await self._peek_terminal(ref['request_id'], fallback_status='running')
 
     async def schedule_background_task(
         self,
@@ -493,7 +474,7 @@ class TaskQueueMixin:
         """Fail and drop all queued tasks for a model. Thread-safe."""
         queue_key = self._queue_key(model_id=model_id, token=None)
         if self._event_loop is None:
-            logger.warning(f"[TaskQueue] fail_pending_tasks_for_model called without event loop: {queue_key}")
+            logger.warning(f'[TaskQueue] fail_pending_tasks_for_model called without event loop: {queue_key}')
             return
 
         def _schedule() -> None:
@@ -508,7 +489,7 @@ class TaskQueueMixin:
         if not task.cancelled():
             error = task.exception()
             if error is not None:
-                logger.error("Queue maintenance failed", exc_info=(type(error), error, error.__traceback__))
+                logger.error('Queue maintenance failed', exc_info=(type(error), error, error.__traceback__))
 
     async def shutdown_task_queue(self) -> None:
         """Gracefully shut down the compute queue and release resources."""
@@ -516,4 +497,4 @@ class TaskQueueMixin:
         await self._compute_worker.stop()
         await asyncio.gather(*self._queue_tasks, return_exceptions=True)
         self._backend_gate.shutdown()
-        logger.debug("[TaskQueue] Task queue shutdown complete")
+        logger.debug('[TaskQueue] Task queue shutdown complete')

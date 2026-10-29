@@ -7,6 +7,11 @@ from twinkle.data_format import InputFeature
 
 StopReason = Literal["length", "stop", "abort", "error"]
 
+#: Generation budget applied when ``max_tokens`` is left unset. The engines' own defaults for the
+#: unset case disagree -- vLLM caps an unspecified request at 16 tokens -- so the unset case is
+#: normalised here once, instead of each backend inheriting its engine's surprise.
+DEFAULT_MAX_TOKENS = 2048
+
 
 @dataclass
 class SamplingParams:
@@ -85,8 +90,7 @@ class SamplingParams:
             **kwargs,
         }
 
-        if self.max_tokens is not None:
-            kwargs["max_tokens"] = self.max_tokens
+        kwargs["max_tokens"] = DEFAULT_MAX_TOKENS if self.max_tokens is None else self.max_tokens
 
         if self.seed is not None:
             kwargs["seed"] = self.seed
@@ -135,8 +139,7 @@ class SamplingParams:
             **kwargs,
         }
 
-        if self.max_tokens is not None:
-            params["max_new_tokens"] = self.max_tokens
+        params["max_new_tokens"] = DEFAULT_MAX_TOKENS if self.max_tokens is None else self.max_tokens
 
         if self.seed is not None:
             params["sampling_seed"] = self.seed
@@ -172,7 +175,7 @@ class SamplingParams:
         if self.max_tokens is not None:
             gen_kwargs["max_new_tokens"] = self.max_tokens
         else:
-            gen_kwargs["max_new_tokens"] = 2048
+            gen_kwargs["max_new_tokens"] = DEFAULT_MAX_TOKENS
 
         if self.seed is not None:
             torch.manual_seed(self.seed)

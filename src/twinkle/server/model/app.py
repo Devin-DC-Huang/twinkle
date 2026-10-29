@@ -5,13 +5,13 @@ Unified model management application.
 Builds a single Ray Serve deployment (ModelManagement) that simultaneously handles
 both Tinker (/tinker/*) and Twinkle (/twinkle/*) model endpoints.
 """
-
 from __future__ import annotations
+
 import asyncio
 import importlib
-from typing import Any
 
 from fastapi import FastAPI, Request
+from typing import Any
 
 from twinkle import DeviceGroup, remote_class
 from twinkle.model.base import TrainableModel
@@ -31,18 +31,18 @@ from .twinkle_handlers import _register_model_twinkle_routes
 
 logger = get_logger()
 
-__all__ = ["ModelManagement", "build_model_app"]
+__all__ = ['ModelManagement', 'build_model_app']
 
 # Ctor kwargs consumed by the MultiLora wrappers' signatures but unknown to the
 # plain (full-parameter) model classes, where **kwargs flows into HF
 # ``from_pretrained``. Dropped when constructing a full-mode backend.
-_LORA_ONLY_CTOR_KWARGS = ("max_loras", "max_r", "max_length", "target_modules", "lora_config")
+_LORA_ONLY_CTOR_KWARGS = ('max_loras', 'max_r', 'max_length', 'target_modules', 'lora_config')
 
 
 def _make_mock_model(kw: dict[str, Any]) -> Any:
     from .backends.mock_model import TwinkleCompatMockModel
 
-    kw.pop("train_mode", None)  # mock backend behaves the same for lora/full
+    kw.pop('train_mode', None)  # mock backend behaves the same for lora/full
     return TwinkleCompatMockModel(**kw)
 
 
@@ -60,28 +60,25 @@ def _make_model_class(base: type) -> type:
     """
     from .backends.transformers_model import _TransformersTinkerCompatMixin
 
-    return remote_class()(type(f"TwinkleCompat{base.__name__}", (_TransformersTinkerCompatMixin, base), {}))
+    return remote_class()(type(f'TwinkleCompat{base.__name__}', (_TransformersTinkerCompatMixin, base), {}))
 
 
 def _make_transformers_model(kw: dict[str, Any]) -> Any:
-    train_mode = kw.pop("train_mode", "lora")
+    train_mode = kw.pop('train_mode', 'lora')
     # ``model_cls`` arrives as plain data and is resolved here, so the class object never reaches the
     # constructor -- it would either be rejected by the remote-class layer in safe mode
     # (``TWINKLE_TRUST_REMOTE_CODE=0``) or leak into every worker's constructor kwargs. The schema only
     # allows it for a LoRA-mode transformers deployment.
-    model_cls_spec = kw.pop("model_cls", None)
-    if train_mode == "full":
+    model_cls_spec = kw.pop('model_cls', None)
+    if train_mode == 'full':
         from .backends.transformers_model import TwinkleCompatFullTransformersModel
-
         for key in _LORA_ONLY_CTOR_KWARGS:
             kw.pop(key, None)
         return TwinkleCompatFullTransformersModel(**kw)
-    from .backends.transformers_model import (
-        TwinkleCompatSpectralHybridTransformersModel,
-        TwinkleCompatTransformersModel,
-    )
+    from .backends.transformers_model import (TwinkleCompatSpectralHybridTransformersModel,
+                                              TwinkleCompatTransformersModel)
 
-    if train_mode == "hybrid":
+    if train_mode == 'hybrid':
         return TwinkleCompatSpectralHybridTransformersModel(**kw)
     if model_cls_spec is not None:
         return _make_model_class(_resolve_model_cls(model_cls_spec))(**kw)
@@ -89,15 +86,13 @@ def _make_transformers_model(kw: dict[str, Any]) -> Any:
 
 
 def _make_megatron_model(kw: dict[str, Any]) -> Any:
-    train_mode = kw.pop("train_mode", "lora")
-    if train_mode == "full":
+    train_mode = kw.pop('train_mode', 'lora')
+    if train_mode == 'full':
         from .backends.megatron_model import TwinkleCompatFullMegatronModel
-
         for key in _LORA_ONLY_CTOR_KWARGS:
             kw.pop(key, None)
         return TwinkleCompatFullMegatronModel(**kw)
     from .backends.megatron_model import TwinkleCompatMegatronModel
-
     return TwinkleCompatMegatronModel(**kw)
 
 
@@ -111,7 +106,7 @@ def _require_trusted_imports(spec: str) -> None:
     (``TWINKLE_TRUST_REMOTE_CODE=0``) would promise more than it delivers.
     """
     if not trust_remote_code():
-        raise ValueError(f"import spec {spec!r} requires TWINKLE_TRUST_REMOTE_CODE != 0")
+        raise ValueError(f'import spec {spec!r} requires TWINKLE_TRUST_REMOTE_CODE != 0')
 
 
 def _resolve_model_loader(spec: str, model_id: str) -> Any:
@@ -123,18 +118,17 @@ def _resolve_model_loader(spec: str, model_id: str) -> Any:
     ``ModelLoaderProtocol`` object, or ``None`` to keep the generic AutoConfig/AutoModel path.
     """
     _require_trusted_imports(spec)
-    module_name, _, attr = spec.partition(":")
+    module_name, _, attr = spec.partition(':')
     if not attr:
-        raise ValueError(f'model_loader must be a "module:callable" import spec naming a loader factory, got {spec!r}')
+        raise ValueError(
+            f'model_loader must be a "module:callable" import spec naming a loader factory, got {spec!r}')
     factory = getattr(importlib.import_module(module_name), attr)
     loader = factory(model_id)
     # Fail here, not at first use inside the model constructor: a misspelled factory that returns
     # something else would otherwise surface as an opaque AttributeError deep in the backend.
-    if loader is not None and not callable(getattr(loader, "build_config", None)):
-        raise TypeError(
-            f"model_loader factory {spec!r} returned {loader!r}, which is neither None nor a "
-            "ModelLoaderProtocol (missing callable build_config)"
-        )
+    if loader is not None and not callable(getattr(loader, 'build_config', None)):
+        raise TypeError(f'model_loader factory {spec!r} returned {loader!r}, which is neither None nor a '
+                        'ModelLoaderProtocol (missing callable build_config)')
     return loader
 
 
@@ -147,22 +141,22 @@ def _resolve_model_cls(spec: str) -> type:
     ``swift.dev.model.multi_lora_sentence_transformer_model:MultiLoraSentenceTransformerModel``.
     """
     _require_trusted_imports(spec)
-    module_name, _, attr = spec.partition(":")
+    module_name, _, attr = spec.partition(':')
     if not attr:
         raise ValueError(f'model_cls must be a "module:attr" import spec naming a model class, got {spec!r}')
     obj = getattr(importlib.import_module(module_name), attr)
     if not (isinstance(obj, type) and issubclass(obj, TrainableModel)):
-        raise TypeError(f"model_cls must name a TrainableModel subclass, got {spec!r} -> {obj!r}")
+        raise TypeError(f'model_cls must name a TrainableModel subclass, got {spec!r} -> {obj!r}')
     return obj
 
 
 # Single validate-then-dispatch selector for the model backend.
 MODEL_SELECTOR = BackendSelector(
-    "backend",
+    'backend',
     {
-        "mock": _make_mock_model,
-        "transformers": _make_transformers_model,
-        "megatron": _make_megatron_model,
+        'mock': _make_mock_model,
+        'transformers': _make_transformers_model,
+        'megatron': _make_megatron_model,
     },
 )
 
@@ -178,68 +172,64 @@ class ModelManagement(TrainingRuntime, TaskQueueMixin):
     - Per-user rate limiting via TaskQueueMixin
     """
 
-    async def __init__(
-        self,
-        model_id: str,
-        nproc_per_node: int,
-        device_group: dict[str, Any],
-        device_mesh: dict[str, Any],
-        backend: str,
-        queue_config: TaskQueueConfig | None = None,
-        data_plane_url: str | None = None,
-        **kwargs,
-    ):
+    async def __init__(self,
+                       model_id: str,
+                       nproc_per_node: int,
+                       device_group: dict[str, Any],
+                       device_mesh: dict[str, Any],
+                       backend: str,
+                       queue_config: TaskQueueConfig | None = None,
+                       data_plane_url: str | None = None,
+                       **kwargs):
         self.backend = backend
         self.device_group = DeviceGroup(**device_group)
-        self.training_context = TrainingRuntimeContext.model_validate(kwargs.pop("training_context"))
-        await self.initialize_training_runtime(
-            self.training_context, kwargs.pop("placement_group"), kwargs.pop("allocation_devices")
-        )
+        self.training_context = TrainingRuntimeContext.model_validate(kwargs.pop('training_context'))
+        await self.initialize_training_runtime(self.training_context, kwargs.pop('placement_group'),
+                                               kwargs.pop('allocation_devices'))
         self.device_mesh = init_twinkle_runtime(
-            is_mock=(backend == "mock"),
+            is_mock=(backend == 'mock'),
             nproc_per_node=nproc_per_node,
             device_group=self.device_group,
             device_mesh_dict=device_mesh,
         )
         self.replica_id = self.training_context.instance_id
-        self.max_loras = kwargs.get("max_loras", 5)
+        self.max_loras = kwargs.get('max_loras', 5)
         self.base_model = model_id
         # ``train_mode`` selects LoRA multi-tenant (default) or exclusive
         # full-parameter training. Popped here so the underlying model
         # constructor never receives it; re-injected into ctor_kwargs so the
         # backend builder can pick the full vs LoRA wrapper class.
-        self.train_mode = kwargs.pop("train_mode", "lora")
+        self.train_mode = kwargs.pop('train_mode', 'lora')
         # ``model_loader`` arrives as an import spec (plain data across the Ray boundary); resolve it to
         # the loader object here, in the replica, right before construction. ``None`` (unset, or no
         # family matched) leaves the generic AutoConfig/AutoModel path untouched.
-        model_loader_spec = kwargs.pop("model_loader", None)
+        model_loader_spec = kwargs.pop('model_loader', None)
 
         ctor_kwargs: dict[str, Any] = {
-            "model_id": model_id,
-            "remote_group": self.device_group.name,
-            "instance_id": self.replica_id,
-            "train_mode": self.train_mode,
+            'model_id': model_id,
+            'remote_group': self.device_group.name,
+            'instance_id': self.replica_id,
+            'train_mode': self.train_mode,
             **kwargs,
         }
         if model_loader_spec is not None:
-            ctor_kwargs["model_loader"] = _resolve_model_loader(model_loader_spec, model_id)
+            ctor_kwargs['model_loader'] = _resolve_model_loader(model_loader_spec, model_id)
         if self.device_mesh is not None:
-            ctor_kwargs["device_mesh"] = self.device_mesh
+            ctor_kwargs['device_mesh'] = self.device_mesh
         self.model = MODEL_SELECTOR.construct(backend, ctor_kwargs)
         await self.wait_for_training_workers()
 
         self.state: ServerState = get_server_state()
         from twinkle.server.data_plane import DataPlaneProxy
-
         self.data_plane = DataPlaneProxy(data_plane_url)
         self._replica_registered = False
         self._model_unhealthy = False
         self._health_probe_task: asyncio.Task | None = None
 
-        actors = getattr(self.model, "_actors", None)
+        actors = getattr(self.model, '_actors', None)
         self._init_task_queue(
             queue_config,
-            deployment_name="Model",
+            deployment_name='Model',
             enable_admission_gate=True,
             on_backend_timeout=self._probe_after_timeout,
             collect_width=len(actors) if actors else 1,
@@ -277,16 +267,16 @@ class ModelManagement(TrainingRuntime, TaskQueueMixin):
         try:
             result = await self.call_backend(self.model.ping, admit=False)
             if result is True:
-                return {"healthy": not self._model_unhealthy, "detail": "model actors alive"}
+                return {'healthy': not self._model_unhealthy, 'detail': 'model actors alive'}
             self._model_unhealthy = True
-            return {"healthy": False, "detail": f"unexpected ping result: {result}"}
+            return {'healthy': False, 'detail': f'unexpected ping result: {result}'}
         except Exception as e:
             self._model_unhealthy = True
-            return {"healthy": False, "detail": f"model actor unreachable: {e}"}
+            return {'healthy': False, 'detail': f'model actor unreachable: {e}'}
 
     async def check_model_health(self) -> dict:
         """Run one coalesced actor probe outside the event loop."""
-        current = getattr(self, "_health_probe_task", None)
+        current = getattr(self, '_health_probe_task', None)
         if current is None or current.done():
             self._health_probe_task = asyncio.create_task(self._run_model_health_probe())
         return await asyncio.shield(self._health_probe_task)
@@ -301,7 +291,7 @@ class ModelManagement(TrainingRuntime, TaskQueueMixin):
     @property
     def is_full_mode(self) -> bool:
         """True when this deployment runs exclusive full-parameter training."""
-        return self.train_mode == "full"
+        return self.train_mode == 'full'
 
     def resolve_model_adapter_name(self, adapter_name: str | None) -> str | None:
         """Map a per-tenant adapter name to the name the model expects.
@@ -310,21 +300,19 @@ class ModelManagement(TrainingRuntime, TaskQueueMixin):
         optimizer group; in LoRA mode the per-tenant adapter name is used as-is.
         """
         if self.is_full_mode:
-            return ""
+            return ''
         return adapter_name
 
 
-def build_model_app(
-    model_id: str,
-    nproc_per_node: int,
-    device_group: dict[str, Any],
-    device_mesh: dict[str, Any],
-    deploy_options: dict[str, Any],
-    backend: str,
-    queue_config: TaskQueueConfig | None = None,
-    data_plane_url: str | None = None,
-    **kwargs,
-):
+def build_model_app(model_id: str,
+                    nproc_per_node: int,
+                    device_group: dict[str, Any],
+                    device_mesh: dict[str, Any],
+                    deploy_options: dict[str, Any],
+                    backend: str,
+                    queue_config: TaskQueueConfig | None = None,
+                    data_plane_url: str | None = None,
+                    **kwargs):
     """Build a unified model management application for distributed training.
 
     Supports both Tinker (polling-style) and Twinkle (synchronous) clients.
@@ -358,13 +346,13 @@ def build_model_app(
     async def _on_shutdown(servable: Any) -> None:
         await servable.shutdown()
 
-    app = build_deployment_app("Model", register_routes, on_shutdown=_on_shutdown, attach_replica_id_header=True)
+    app = build_deployment_app('Model', register_routes, on_shutdown=_on_shutdown, attach_replica_id_header=True)
 
     return bind_deployment(
         app,
         ModelManagement,
         deploy_options,
-        deployment_name="ModelManagement",
+        deployment_name='ModelManagement',
         bind_args=(model_id, nproc_per_node, device_group, device_mesh, backend, queue_config, data_plane_url),
         bind_kwargs=kwargs,
     )

@@ -14,11 +14,10 @@ satisfies ``DataParallelDeployment`` (it is the one with ``data_world_size``).
 cleanup middleware via ``attach_cleanup_middleware=False``; the gate below is what makes
 that fact visible statically instead of only via that boolean.
 """
-
 from __future__ import annotations
-from typing import Any, Protocol, runtime_checkable
 
 from fastapi import Request
+from typing import Any, Protocol, runtime_checkable
 
 from twinkle.server.config.task_queue import TaskQueueConfig
 from twinkle.server.lifecycle.envelope import TaskEnvelope
@@ -33,17 +32,23 @@ class QueuedDeployment(Protocol):
     replica_id: str
 
     @property
-    def task_queue_config(self) -> TaskQueueConfig: ...
+    def task_queue_config(self) -> TaskQueueConfig:
+        ...
 
-    async def _on_request_start(self, request: Request) -> str: ...
+    async def _on_request_start(self, request: Request) -> str:
+        ...
 
-    def assert_resource_exists(self, resource_id: str | None) -> None: ...
+    def assert_resource_exists(self, resource_id: str | None) -> None:
+        ...
 
-    async def _peek_terminal(self, request_id: str, *, fallback_status: str) -> TaskEnvelope: ...
+    async def _peek_terminal(self, request_id: str, *, fallback_status: str) -> TaskEnvelope:
+        ...
 
-    async def submit_and_peek(self, *args: Any, **kwargs: Any) -> TaskEnvelope: ...
+    async def submit_and_peek(self, *args: Any, **kwargs: Any) -> TaskEnvelope:
+        ...
 
-    async def call_backend(self, fn: Any, /, *args: Any, admit: bool = True, **kwargs: Any) -> Any: ...
+    async def call_backend(self, fn: Any, /, *args: Any, admit: bool = True, **kwargs: Any) -> Any:
+        ...
 
 
 @runtime_checkable
@@ -51,4 +56,5 @@ class DataParallelDeployment(QueuedDeployment, Protocol):
     """A queued deployment that also shards a batch across data-parallel ranks."""
 
     @property
-    def data_world_size(self) -> int: ...
+    def data_world_size(self) -> int:
+        ...

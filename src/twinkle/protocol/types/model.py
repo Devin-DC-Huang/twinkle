@@ -17,11 +17,10 @@ the task is enqueued. That is only safe because dynamic parameters have a declar
 home -- the passthrough regions -- so strictness never blocks a legitimate
 user-supplied argument.
 """
-
 from __future__ import annotations
-from typing import Any, Optional, Union
 
 from pydantic import Field, JsonValue, field_validator, model_validator
+from typing import Any, Dict, List, Optional, Union
 
 from .base import ResponseModel, StrictRequest, backend_kwarg, backend_only, passthrough
 from .component import DataRef
@@ -71,7 +70,7 @@ class LrStepRequest(AdapterRequest):
 
     # ``OptimizerParamScheduler.step(increment=...)``; the transformers scheduler has
     # no equivalent knob.
-    increment: int | None = backend_only("megatron", default=None, ge=0)
+    increment: int | None = backend_only('megatron', default=None, ge=0)
 
 
 class ClipGradNormRequest(AdapterRequest):
@@ -123,8 +122,8 @@ class _InlineForwardBase(TrainingRequest):
     micro_batch_size: int | None = backend_kwarg(default=None, ge=1)
     gradient_accumulation_steps: int | None = backend_kwarg(default=None, ge=1)
     # Read only by the transformers backend.
-    sampling_masks: JsonValue | None = backend_only("transformers", default=None)
-    router_replay_action: str | None = backend_only("transformers", default=None)
+    sampling_masks: JsonValue | None = backend_only('transformers', default=None)
+    router_replay_action: str | None = backend_only('transformers', default=None)
     # Loss inputs (``advantages`` / ``old_logps`` / ``ref_outputs`` / ...). Their key
     # set is decided by the configured Loss, so they get a declared dict rather than
     # top-level fields; the flattening in ``backend_kwargs`` keeps the backend call
@@ -205,10 +204,10 @@ class DataPlaneForwardOnlyRequest(TrainingRequest):
     output_ref: DataRef | None = None
     output_fields: dict[str, str] = Field(default_factory=dict)
 
-    @model_validator(mode="after")
+    @model_validator(mode='after')
     def validate_output(self) -> DataPlaneForwardOnlyRequest:
         if (self.output_ref is None) != (len(self.output_fields) == 0):
-            raise ValueError("output_ref and output_fields must be configured together")
+            raise ValueError('output_ref and output_fields must be configured together')
         return self
 
 
@@ -279,22 +278,22 @@ class SaveRequest(TrainingRequest):
     save_optimizer: bool = False
     is_sampler: bool = False  # If True, delete existing sampler weights before saving
     consumed_train_samples: int | None = backend_kwarg(default=None, ge=0)
-    merge_lora: bool | None = backend_only("megatron", default=None)
+    merge_lora: bool | None = backend_only('megatron', default=None)
 
 
 class LoadRequest(TrainingRequest):
     name: str
     load_optimizer: bool = False
-    no_load_optim: bool | None = backend_only("megatron", default=None)
-    no_load_rng: bool | None = backend_only("megatron", default=None)
-    strict: bool | None = backend_only("transformers", default=None)
+    no_load_optim: bool | None = backend_only('megatron', default=None)
+    no_load_rng: bool | None = backend_only('megatron', default=None)
+    strict: bool | None = backend_only('transformers', default=None)
 
 
 class ResumeFromCheckpointRequest(TrainingRequest):
     """Body of ``POST /twinkle/resume_from_checkpoint``."""
 
     name: str
-    adapter_name: str = ""
+    adapter_name: str = ''
     resume_only_model: bool = False
 
 
@@ -320,7 +319,7 @@ class UploadToHubRequest(StrictRequest):
     hub_model_id: str
     hub_token: str | None = None
 
-    @field_validator("checkpoint_dir", mode="before")
+    @field_validator('checkpoint_dir', mode='before')
     @classmethod
     def extract_checkpoint_dir(cls, v):
         """Accept a ``save`` response dict and take its twinkle path.
@@ -329,9 +328,9 @@ class UploadToHubRequest(StrictRequest):
         wrong-shaped dict is a 422 naming the missing key instead of a 500.
         """
         if isinstance(v, dict):
-            if "twinkle_path" not in v:
+            if 'twinkle_path' not in v:
                 raise ValueError("checkpoint_dir dict must contain 'twinkle_path'")
-            return v["twinkle_path"]
+            return v['twinkle_path']
         return v
 
 
@@ -342,13 +341,11 @@ class UploadToHubRequest(StrictRequest):
 
 class OkResponse(ResponseModel):
     """Response for endpoints whose underlying method returns None."""
-
-    status: str = "ok"
+    status: str = 'ok'
 
 
 class ModelResult(ResponseModel):
     """Generic result wrapper; ``ModelResult`` is the retained historical public name."""
-
     result: Any
 
 
@@ -357,50 +354,42 @@ class ModelResult(ResponseModel):
 
 class ForwardResponse(ResponseModel):
     """Response for /forward and /forward_only endpoints (returns ModelOutput)."""
-
     result: Any
 
 
 class ForwardBackwardResponse(ResponseModel):
     """Response for /forward_backward endpoint (returns ModelOutput)."""
-
     result: Any
 
 
 class CalculateLossResponse(ResponseModel):
     """Response for /calculate_loss endpoint (returns float)."""
-
     result: float
 
 
 class ClipGradNormResponse(ResponseModel):
     """Response for /clip_grad_norm endpoint (returns float as str)."""
-
     result: str
 
 
 class GetTrainConfigsResponse(ResponseModel):
     """Response for /get_train_configs endpoint (returns str)."""
-
     result: str
 
 
 class CalculateMetricResponse(ResponseModel):
     """Response for /calculate_metric endpoint (returns Dict)."""
-
     result: dict[str, Any]
 
 
 class SaveResponse(ResponseModel):
     """Response for /save endpoint (returns twinkle path + checkpoint dir)."""
-
     twinkle_path: str
     checkpoint_dir: str | None = None
 
 
 class TrainingProgressResponse(ResponseModel):
     """Response for /resume_from_checkpoint endpoint."""
-
     result: dict[str, Any]
 
 
@@ -430,6 +419,5 @@ class TrainingHandleResponse(ResponseModel):
 
 class CreateResponse(ResponseModel):
     """Response for /create endpoint."""
-
-    status: str = "ok"
+    status: str = 'ok'
     training_handles: bool = False

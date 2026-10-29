@@ -1,6 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Task queue configuration."""
-
 from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -33,7 +32,7 @@ class TaskQueueConfig(BaseModel):
             Must remain < Long_Poll_Window.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra='forbid')
 
     rps_limit: float = Field(default=100.0, ge=0)
     tps_limit: float = Field(default=16000.0, ge=0)

@@ -2,15 +2,13 @@
 """
 Shared helpers and base classes for backend model implementations.
 """
-
+import numpy as np
 import re
+import torch
 from collections.abc import Mapping
 from numbers import Number
-from typing import Any
-
-import numpy as np
-import torch
 from tinker import types
+from typing import Any, List
 
 from twinkle import DeviceMesh, remote_function
 from twinkle.server.model.tinker_datum import datum_to_input_feature, extract_rl_features_for_loss
@@ -91,6 +89,7 @@ def to_cpu_safe_output(obj: Any) -> Any:
 
 
 def clean_metrics(metrics: dict) -> dict:
+
     def _to_float(v):
         if isinstance(v, (float, int, Number, np.generic, str)):
             try:
@@ -116,9 +115,9 @@ def clean_metrics(metrics: dict) -> dict:
             if s:
                 try:
                     head, unit = s.split(maxsplit=1)
-                    cleaned[f"{key}/{unit}"] = float(head)
+                    cleaned[f'{key}/{unit}'] = float(head)
                 except Exception:
-                    m = re.match(r"^([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)", s)
+                    m = re.match(r'^([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)', s)
                     if m:
                         cleaned[key] = float(m.group(1))
 
@@ -131,11 +130,11 @@ class TwinkleCompatModelBase:
     @staticmethod
     def _normalize_ref_outputs(kwargs: dict) -> None:
         """Convert HTTP/Ray-serialized reference logps to one padded tensor."""
-        ref_outputs = kwargs.get("ref_outputs")
+        ref_outputs = kwargs.get('ref_outputs')
         if not isinstance(ref_outputs, dict):
             return
 
-        logps = ref_outputs.get("logps")
+        logps = ref_outputs.get('logps')
         if not isinstance(logps, (list, tuple)) or not logps or isinstance(logps[0], torch.Tensor):
             return
 
@@ -147,8 +146,7 @@ class TwinkleCompatModelBase:
                 rows.append(item)
 
         from twinkle.utils import pad_and_stack_tensors
-
-        ref_outputs["logps"] = pad_and_stack_tensors(
+        ref_outputs['logps'] = pad_and_stack_tensors(
             [torch.as_tensor(row, dtype=torch.float32) for row in rows],
             pad_value=0.0,
             concat=False,
@@ -160,24 +158,23 @@ class TwinkleCompatModelBase:
     def _tinker_setup_loss(self, loss_fn: str, inputs, adapter_name: str, kwargs: dict):
         """Set up loss function based on loss_fn; pops DPO/GRPO-specific params from kwargs in-place."""
         is_dpo = validate_tinker_loss(loss_fn, inputs)
-        if loss_fn == "cross_entropy":
-            self.set_loss("CrossEntropyLoss", adapter_name=adapter_name)
-        elif loss_fn == "importance_sampling":
+        if loss_fn == 'cross_entropy':
+            self.set_loss('CrossEntropyLoss', adapter_name=adapter_name)
+        elif loss_fn == 'importance_sampling':
             if is_dpo:
-                beta = kwargs.pop("dpo_beta", 0.1)
-                loss_type = kwargs.pop("dpo_loss_type", "sigmoid")
-                sft_weight = kwargs.pop("dpo_sft_weight", 0.0)
+                beta = kwargs.pop('dpo_beta', 0.1)
+                loss_type = kwargs.pop('dpo_loss_type', 'sigmoid')
+                sft_weight = kwargs.pop('dpo_sft_weight', 0.0)
                 self.set_loss(
-                    "DPOLoss", adapter_name=adapter_name, beta=beta, loss_type=loss_type, sft_weight=sft_weight
-                )
+                    'DPOLoss', adapter_name=adapter_name, beta=beta, loss_type=loss_type, sft_weight=sft_weight)
                 # Only add DPOMetric if not already present for this adapter
                 self._ensure_dpo_metric(adapter_name, beta)
             else:
-                epsilon = kwargs.pop("epsilon", 0.2)
-                grpo_beta = kwargs.pop("beta", 0.0)
-                self.set_loss("GRPOLoss", adapter_name=adapter_name, epsilon=epsilon, beta=grpo_beta)
+                epsilon = kwargs.pop('epsilon', 0.2)
+                grpo_beta = kwargs.pop('beta', 0.0)
+                self.set_loss('GRPOLoss', adapter_name=adapter_name, epsilon=epsilon, beta=grpo_beta)
 
-    @remote_function(dispatch="all", collect="none")
+    @remote_function(dispatch='all', collect='none')
     def preflight_loss_inputs(self, *, inputs, adapter_name: str = None, loss_fn: str = None, **kwargs) -> None:
         """Validate the full, unsliced batch on every rank before any forward.
 
@@ -196,13 +193,13 @@ class TwinkleCompatModelBase:
         adapter_name = adapter_name or self._get_default_group()
         if loss_fn is not None:
             loss_values = extract_rl_features_for_loss(inputs)
-            loss_values.pop("ref_outputs", None)
+            loss_values.pop('ref_outputs', None)
             self._tinker_setup_loss(loss_fn, inputs, adapter_name, kwargs)
             inputs = datum_to_input_feature(inputs, self.get_template(adapter_name))
             loss_values.update(kwargs)
         else:
             loss_values = kwargs
-        loss = getattr(self.optimizer_group.get(adapter_name), "loss_instance", None)
+        loss = getattr(self.optimizer_group.get(adapter_name), 'loss_instance', None)
         if loss is not None:
             loss.validate_inputs(inputs, **loss_values)
 
@@ -212,13 +209,12 @@ class TwinkleCompatModelBase:
         This prevents duplicate metric accumulation across training steps.
         """
         from twinkle.metric.dpo import DPOMetric
-
         optimizer_config = self.optimizer_group[adapter_name]
         # Check if DPOMetric already exists in training metrics
         for metric in optimizer_config.train_status.metrics:
             if isinstance(metric, DPOMetric):
                 return
-        self.add_metric("DPOMetric", adapter_name=adapter_name, beta=beta)
+        self.add_metric('DPOMetric', adapter_name=adapter_name, beta=beta)
 
     def _apply_ref_outputs(self, loss_values: dict, loss_kwargs: dict, adapter_name: str) -> None:
         """Pop ref_outputs from loss_values into loss_kwargs and propagate to train_status.
@@ -226,17 +222,17 @@ class TwinkleCompatModelBase:
         DPOMetric reads ref_outputs from train_status.forward_kwargs during accumulate_metrics,
         so it must be set here before the subsequent loss calculation.
         """
-        if "ref_outputs" not in loss_values:
+        if 'ref_outputs' not in loss_values:
             return
-        ref_outputs_dict = loss_values.pop("ref_outputs")
-        loss_kwargs["ref_outputs"] = ref_outputs_dict
-        self.optimizer_group[adapter_name].train_status.forward_kwargs["ref_outputs"] = ref_outputs_dict
+        ref_outputs_dict = loss_values.pop('ref_outputs')
+        loss_kwargs['ref_outputs'] = ref_outputs_dict
+        self.optimizer_group[adapter_name].train_status.forward_kwargs['ref_outputs'] = ref_outputs_dict
 
     def _tinker_build_output(self, inputs, outputs, return_full_logprobs: bool = False):
         """Extract logits/logps from model outputs and build per-datum output list."""
-        seq_lens = [feature.loss_fn_inputs["target_tokens"].to_torch().long().view(-1).numel() for feature in inputs]
-        logits = self._tensor_output_to_rows(outputs.get("logits"), seq_lens, kind="logits")
-        logps = self._tensor_output_to_rows(outputs.get("logps"), seq_lens, kind="logps")
+        seq_lens = [feature.loss_fn_inputs['target_tokens'].to_torch().long().view(-1).numel() for feature in inputs]
+        logits = self._tensor_output_to_rows(outputs.get('logits'), seq_lens, kind='logits')
+        logps = self._tensor_output_to_rows(outputs.get('logps'), seq_lens, kind='logps')
         if logits is None and logps is None:
             # non-last PP stage: no outputs produced, collector will discard this
             return []
@@ -268,11 +264,10 @@ class TwinkleCompatModelBase:
             if isinstance(value, list) and value and isinstance(value[0], (list, tuple)):
                 flat = [s for item in value for s in (item if isinstance(item[0], (list, tuple)) else [item])]
                 from twinkle.utils import pad_and_stack_tensors
-
                 tensors = [
-                    pad_and_stack_tensors(
-                        [torch.tensor(s, dtype=torch.float32) for s in flat], pad_value=0.0, concat=False
-                    )
+                    pad_and_stack_tensors([torch.tensor(s, dtype=torch.float32) for s in flat],
+                                          pad_value=0.0,
+                                          concat=False)
                 ]
             else:
                 tensors = [torch.as_tensor(value, dtype=torch.float32)]
@@ -283,13 +278,13 @@ class TwinkleCompatModelBase:
 
         rows = []
         for tensor in tensors:
-            chunk_rows = TwinkleCompatModelBase._tensor_chunk_to_rows(tensor, seq_lens[len(rows) :], kind=kind)
+            chunk_rows = TwinkleCompatModelBase._tensor_chunk_to_rows(tensor, seq_lens[len(rows):], kind=kind)
             rows.extend(chunk_rows)
         return rows
 
     @staticmethod
     def _normalize_single_row_tensor(tensor: torch.Tensor, *, kind: str) -> torch.Tensor:
-        if kind == "logits":
+        if kind == 'logits':
             if tensor.dim() >= 3 and tensor.shape[0] == 1:
                 return tensor.squeeze(0)
             return tensor
@@ -307,7 +302,7 @@ class TwinkleCompatModelBase:
         for seq_len in seq_lens:
             if offset + seq_len > tensor.shape[0]:
                 break
-            split_rows.append(tensor[offset : offset + seq_len])
+            split_rows.append(tensor[offset:offset + seq_len])
             offset += seq_len
             if offset == tensor.shape[0]:
                 break
@@ -318,7 +313,7 @@ class TwinkleCompatModelBase:
         if tensor.dim() == 0 or len(seq_lens) <= 1:
             return [TwinkleCompatModelBase._normalize_single_row_tensor(tensor, kind=kind)]
 
-        if kind == "logps":
+        if kind == 'logps':
             while tensor.dim() > 1 and tensor.shape[0] == 1:
                 tensor = tensor.squeeze(0)
             if tensor.dim() >= 2:
@@ -332,7 +327,7 @@ class TwinkleCompatModelBase:
                 return packed_rows
             return [tensor]
 
-        if kind == "logits":
+        if kind == 'logits':
             if tensor.dim() >= 3 and tensor.shape[0] == 1:
                 packed_rows = TwinkleCompatModelBase._split_packed_tensor(tensor.squeeze(0), seq_lens)
                 if packed_rows is not None:
@@ -349,15 +344,13 @@ class TwinkleCompatModelBase:
                 return packed_rows
             return [tensor]
 
-        raise ValueError(f"Unsupported tensor output kind: {kind}")
+        raise ValueError(f'Unsupported tensor output kind: {kind}')
 
     @staticmethod
-    def _get_forward_output(
-        inputs: list[types.Datum],
-        logits: list[torch.Tensor] | None,
-        logps: list[torch.Tensor] | None,
-        return_full_logprobs: bool = False,
-    ) -> list[dict]:
+    def _get_forward_output(inputs: list[types.Datum],
+                            logits: list[torch.Tensor] | None,
+                            logps: list[torch.Tensor] | None,
+                            return_full_logprobs: bool = False) -> list[dict]:
         """Convert raw logits to the expected output format with logprobs and elementwise_loss.
 
         When return_full_logprobs is True (forward_only / reference pass), logprobs is returned
@@ -370,29 +363,28 @@ class TwinkleCompatModelBase:
         """
         if logps is not None:
             if len(logps) != len(inputs):
-                raise ValueError(f"Expected {len(inputs)} logps rows, got {len(logps)}")
+                raise ValueError(f'Expected {len(inputs)} logps rows, got {len(logps)}')
             device = logps[0].device
         elif logits is not None:
             if len(logits) != len(inputs):
-                raise ValueError(f"Expected {len(inputs)} logits rows, got {len(logits)}")
+                raise ValueError(f'Expected {len(inputs)} logits rows, got {len(logits)}')
             device = logits[0].device
         else:
-            raise ValueError("At least one of logits or logps must be provided.")
+            raise ValueError('At least one of logits or logps must be provided.')
         results = []
         if logits is None:
             logits = [None] * len(inputs)
         if logps is None:
             logps = [None] * len(inputs)
-        for feature, logit, feature_logps in zip(inputs, logits, logps, strict=False):
-            labels = feature.loss_fn_inputs["target_tokens"].to_torch().long().view(-1).to(device)
-            weights = feature.loss_fn_inputs["weights"].to_torch().view(-1).to(device)
+        for feature, logit, feature_logps in zip(inputs, logits, logps):
+            labels = feature.loss_fn_inputs['target_tokens'].to_torch().long().view(-1).to(device)
+            weights = feature.loss_fn_inputs['weights'].to_torch().view(-1).to(device)
 
             seq_len = labels.numel()  # original unpadded length
 
             if feature_logps is None:
-                assert logit is not None, "logit must not be None when logps is None"
+                assert logit is not None, 'logit must not be None when logps is None'
                 from twinkle.utils.torch_utils import selective_log_softmax
-
                 feature_logits = logit[:seq_len, :]
                 token_log_probs_orig = selective_log_softmax(feature_logits, labels)
                 if return_full_logprobs:
@@ -401,7 +393,6 @@ class TwinkleCompatModelBase:
                     padded_len = logit.shape[0]
                     if padded_len > seq_len:
                         import torch.nn.functional as F
-
                         token_log_probs_full = F.pad(token_log_probs_orig, (0, padded_len - seq_len), value=0.0)
                     else:
                         token_log_probs_full = token_log_probs_orig
@@ -418,10 +409,8 @@ class TwinkleCompatModelBase:
             token_log_probs_orig = token_log_probs_orig.to(weights.device)
             elementwise_loss = -token_log_probs_orig * weights
 
-            results.append(
-                {
-                    "logprobs": types.TensorData.from_torch(token_log_probs_full.cpu()),
-                    "elementwise_loss": types.TensorData.from_torch(elementwise_loss.cpu()),
-                }
-            )
+            results.append({
+                'logprobs': types.TensorData.from_torch(token_log_probs_full.cpu()),
+                'elementwise_loss': types.TensorData.from_torch(elementwise_loss.cpu())
+            })
         return results

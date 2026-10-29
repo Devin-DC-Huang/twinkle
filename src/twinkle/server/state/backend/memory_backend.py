@@ -1,21 +1,21 @@
 from __future__ import annotations
+
+import ray
 import time
 from collections.abc import Callable
 from fnmatch import fnmatch
 from typing import Any
 
-import ray
-
 from .base import StateBackend
 
-_ACTOR_NAME_PREFIX = "twinkle_state_actor"
+_ACTOR_NAME_PREFIX = 'twinkle_state_actor'
 
 
 def _actor_name(key_prefix: str) -> str:
     """Namespace the detached actor by ``key_prefix`` so multiple Twinkle
     deployments sharing one Ray cluster do not collide.
     """
-    return _ACTOR_NAME_PREFIX if not key_prefix else f"{_ACTOR_NAME_PREFIX}::{key_prefix}"
+    return _ACTOR_NAME_PREFIX if not key_prefix else f'{_ACTOR_NAME_PREFIX}::{key_prefix}'
 
 
 @ray.remote
@@ -123,13 +123,11 @@ class RayActorBackend(StateBackend):
     persistence mode literal for this backend is still ``"memory"``.)
     """
 
-    def __init__(self, key_prefix: str = "", namespace: str | None = None) -> None:
+    def __init__(self, key_prefix: str = '', namespace: str | None = None) -> None:
         if not ray.is_initialized():
-            raise RuntimeError(
-                "RayActorBackend requires an initialized Ray runtime — call "
-                'ray.init() first, switch persistence to "redis", or rely on '
-                "the deployment launcher to start Ray."
-            )
+            raise RuntimeError('RayActorBackend requires an initialized Ray runtime — call '
+                               'ray.init() first, switch persistence to "redis", or rely on '
+                               'the deployment launcher to start Ray.')
         name = _actor_name(key_prefix)
         try:
             self._actor = ray.get_actor(name, namespace=namespace)
@@ -138,10 +136,9 @@ class RayActorBackend(StateBackend):
                 self._actor = _StateActor.options(
                     name=name,
                     namespace=namespace,
-                    lifetime="detached",
+                    lifetime='detached',
                     max_restarts=-1 if namespace else 0,
-                    max_task_retries=0,
-                ).remote()
+                    max_task_retries=0).remote()
             except ValueError:
                 # Lost the create race against another worker — the actor is
                 # now resolvable.

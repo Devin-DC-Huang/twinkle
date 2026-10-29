@@ -13,16 +13,15 @@ caller and only does ``executor.submit(functools.partial(fn, ...))``. It never w
 invisible to the AST scan in ``test_no_direct_backend_call.py`` and needs no exemption
 entry.
 """
-
 from __future__ import annotations
+
 import asyncio
 import contextlib
 import functools
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any
-
 from ray.exceptions import GetTimeoutError
+from typing import Any
 
 from twinkle.server.exceptions import BackendBusyError
 
@@ -39,14 +38,14 @@ class BackendGate:
     """
 
     def __init__(self, *, enable_admission_gate: bool = False) -> None:
-        self._executor = ThreadPoolExecutor(thread_name_prefix="twinkle-backend")
-        self._probe_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="twinkle-backend-probe")
+        self._executor = ThreadPoolExecutor(thread_name_prefix='twinkle-backend')
+        self._probe_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='twinkle-backend-probe')
         self._admission: asyncio.Lock | None = asyncio.Lock() if enable_admission_gate else None
         self._poisoned = asyncio.Event()
 
     async def _acquire(self, gate: asyncio.Lock) -> None:
         if self._poisoned.is_set():
-            raise BackendBusyError("This replica is waiting for a timed-out backend call to exit.")
+            raise BackendBusyError('This replica is waiting for a timed-out backend call to exit.')
         if not gate.locked():
             await gate.acquire()
         else:
@@ -68,14 +67,14 @@ class BackendGate:
                     acquire_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await acquire_task
-                raise BackendBusyError("This replica is waiting for a timed-out backend call to exit.")
+                raise BackendBusyError('This replica is waiting for a timed-out backend call to exit.')
             poison_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await poison_task
             await acquire_task
         if self._poisoned.is_set():
             gate.release()
-            raise BackendBusyError("This replica is waiting for a timed-out backend call to exit.")
+            raise BackendBusyError('This replica is waiting for a timed-out backend call to exit.')
 
     async def call(self, fn: Callable[..., Any], /, *args: Any, admit: bool = True, **kwargs: Any) -> Any:
         """Run one backend call outside the event loop.
@@ -102,6 +101,7 @@ class BackendGate:
         if gate is not None:
 
             def release_gate(_future) -> None:
+
                 def release() -> None:
                     self._poisoned.clear()
                     if gate.locked():

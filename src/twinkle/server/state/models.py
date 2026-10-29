@@ -1,23 +1,23 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
-import time
-from datetime import UTC, datetime, timezone
-from typing import Any, Literal
 
+import time
+from datetime import datetime, timezone
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from typing import Any, Literal
 
 
 def _now_iso() -> str:
     # UTC-aware so _parse_timestamp (which reads timestamps back as UTC) agrees with
     # it and with time.time(); a naive local string would be misread as UTC and skew
     # every expiry comparison by the host's UTC offset.
-    return datetime.now(UTC).isoformat()
+    return datetime.now(timezone.utc).isoformat()
 
 
 class RuntimeContext(BaseModel):
     """Allocation identity passed to a worker; never a client request payload."""
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra='forbid')
 
     namespace: str
     registry_name: str
@@ -65,7 +65,7 @@ class FutureFailureRecord(BaseModel):
 
     reason_code: str
     message: str
-    attribution: Literal["user", "server"]
+    attribution: Literal['user', 'server']
     details: list[dict[str, Any]] | None = None
     diagnostic: str | None = None
 
@@ -87,13 +87,13 @@ class FutureRecord(BaseModel):
     created_at: str = Field(default_factory=_now_iso)
     updated_at: str = Field(default_factory=_now_iso)
 
-    @model_validator(mode="after")
+    @model_validator(mode='after')
     def result_and_failure_match_status(self) -> FutureRecord:
-        is_failure = self.status in ("failed", "cancelled")
+        is_failure = self.status in ('failed', 'cancelled')
         if is_failure and self.failure is None:
-            raise ValueError(f"{self.status} future requires failure")
+            raise ValueError(f'{self.status} future requires failure')
         if is_failure and self.result is not None:
-            raise ValueError(f"{self.status} future cannot carry result")
+            raise ValueError(f'{self.status} future cannot carry result')
         if not is_failure and self.failure is not None:
-            raise ValueError(f"{self.status} future cannot carry failure")
+            raise ValueError(f'{self.status} future cannot carry failure')
         return self

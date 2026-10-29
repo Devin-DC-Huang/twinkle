@@ -5,8 +5,8 @@ This module is a public-contract carrier imported across packages (Twinkle_Serve
 reverse-imports ``twinkle.protocol.types``); per the naming rulings in ``base.py`` it
 therefore intentionally carries **no** underscore prefix.
 """
-
 from __future__ import annotations
+
 from enum import StrEnum
 from typing import Any, Optional
 
@@ -17,12 +17,12 @@ from .errors import ErrorPayload, QueueState
 class TaskStatus(StrEnum):
     """Canonical task states shared by the wire envelope and server execution."""
 
-    PENDING = "pending"
-    QUEUED = "queued"
-    RUNNING = "running"
-    COMPLETED = "completed"
-    FAILED = "failed"
-    CANCELLED = "cancelled"
+    PENDING = 'pending'
+    QUEUED = 'queued'
+    RUNNING = 'running'
+    COMPLETED = 'completed'
+    FAILED = 'failed'
+    CANCELLED = 'cancelled'
 
 
 TERMINAL_STATUSES = frozenset({TaskStatus.COMPLETED.value, TaskStatus.FAILED.value, TaskStatus.CANCELLED.value})

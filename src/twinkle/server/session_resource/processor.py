@@ -5,8 +5,8 @@ Processor Lifecycle Manager Mixin for Twinkle Server.
 Adds a global per-token processor limit to session resources.
 Sessions are tracked via session ID; processors expire when their session expires.
 """
-
 from __future__ import annotations
+
 from abc import abstractmethod
 
 from twinkle.utils.logger import get_logger
@@ -30,7 +30,7 @@ class ProcessorManagerMixin(SessionResourceMixin):
     """
 
     # Set resource type for logging
-    _resource_type = "Processor"
+    _resource_type = 'Processor'
 
     def _init_processor_manager(
         self,
@@ -61,7 +61,7 @@ class ProcessorManagerMixin(SessionResourceMixin):
             return False
         try:
             renewed = await self.state.renew_processor_quota(
-                info["token"],
+                info['token'],
                 resource_id,
                 lease_seconds=self._processor_quota_lease_seconds,
             )
@@ -69,10 +69,10 @@ class ProcessorManagerMixin(SessionResourceMixin):
             # Keep the local processor during a transient backend outage. Once the
             # backend recovers, a lost/expired reservation returns False and the
             # countdown loop removes the unaccounted local resource.
-            logger.warning("[ProcessorManager] Failed to renew quota lease for %s: %r", resource_id, exc)
+            logger.warning('[ProcessorManager] Failed to renew quota lease for %s: %r', resource_id, exc)
             return True
         if not renewed:
-            logger.warning("[ProcessorManager] Quota lease for %s was lost; expiring local processor", resource_id)
+            logger.warning('[ProcessorManager] Quota lease for %s was lost; expiring local processor', resource_id)
         return renewed
 
     async def _on_resource_expired(self, resource_id: str) -> None:

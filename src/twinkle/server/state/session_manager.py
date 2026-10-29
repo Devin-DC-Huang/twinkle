@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
+
 import functools
 import time
 
@@ -21,7 +22,7 @@ def _session_touch_transform(existing: dict | None, *, now: float) -> dict | Non
     if existing is None:
         return None
     updated = dict(existing)
-    updated["last_heartbeat"] = now
+    updated['last_heartbeat'] = now
     return updated
 
 
@@ -33,7 +34,7 @@ class SessionManager(BaseManager[SessionRecord]):
     """
 
     def __init__(self, backend: StateBackend, expiration_timeout: float) -> None:
-        super().__init__(backend, "session::", SessionRecord, expiration_timeout)
+        super().__init__(backend, 'session::', SessionRecord, expiration_timeout)
 
     # ----- Session-specific operations -----
 
@@ -55,7 +56,7 @@ class SessionManager(BaseManager[SessionRecord]):
         except ConcurrencyError as e:
             # touch() is per-heartbeat best-effort — losing one round under
             # contention is recoverable as soon as the next heartbeat arrives.
-            logger.warning("SessionManager.touch dropped due to contention: %s", e)
+            logger.warning('SessionManager.touch dropped due to contention: %s', e)
             return False
         return result is not None
 

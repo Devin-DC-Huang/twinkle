@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
+
 import functools
 import math
 import re
@@ -10,14 +11,8 @@ from typing import Any
 
 from twinkle.server.config.persistence import PersistenceConfig
 from twinkle.server.exceptions import ResourceNotFoundError, ResourceQuotaExceededError
-from twinkle.server.telemetry.correlation import (
-    BASE_MODEL,
-    MODEL_ID,
-    REPLICA_ID,
-    SAMPLING_SESSION_ID,
-    SESSION_ID,
-    TOKEN_ID,
-)
+from twinkle.server.telemetry.correlation import (BASE_MODEL, MODEL_ID, REPLICA_ID, SAMPLING_SESSION_ID, SESSION_ID,
+                                                  TOKEN_ID)
 from twinkle.server.telemetry.tracing import traced_operation
 from twinkle.utils.logger import get_logger
 from .backend import StateBackend
@@ -33,7 +28,7 @@ from .training_store import TrainingSequences, TrainingStore
 
 logger = get_logger()
 
-_PROCESSOR_QUOTA_PREFIX = "processor_quota::"
+_PROCESSOR_QUOTA_PREFIX = 'processor_quota::'
 
 
 def _clean_processor_reservations(existing: Any, *, now: float) -> dict[str, dict[str, Any]]:
@@ -44,7 +39,7 @@ def _clean_processor_reservations(existing: Any, *, now: float) -> dict[str, dic
     for processor_id, reservation in existing.items():
         if not isinstance(processor_id, str) or not isinstance(reservation, dict):
             continue
-        expires_at = reservation.get("lease_expires_at")
+        expires_at = reservation.get('lease_expires_at')
         if isinstance(expires_at, (int, float)) and float(expires_at) > now:
             active[processor_id] = dict(reservation)
     return active
@@ -62,8 +57,8 @@ def _reserve_processor_transform(
     reservations = _clean_processor_reservations(existing, now=now)
     if processor_id in reservations or len(reservations) < limit:
         reservations[processor_id] = {
-            "session_id": session_id,
-            "lease_expires_at": now + lease_seconds,
+            'session_id': session_id,
+            'lease_expires_at': now + lease_seconds,
         }
     return reservations
 
@@ -78,7 +73,7 @@ def _renew_processor_transform(
     reservations = _clean_processor_reservations(existing, now=now)
     reservation = reservations.get(processor_id)
     if reservation is not None:
-        reservation["lease_expires_at"] = now + lease_seconds
+        reservation['lease_expires_at'] = now + lease_seconds
     return reservations
 
 
@@ -122,14 +117,13 @@ class ServerState:
     """
 
     def __init__(
-        self,
-        backend: StateBackend | None = None,
-        persistence_config: PersistenceConfig | None = None,
-        expiration_timeout: float = 86400.0,  # 24 hours in seconds
-        cleanup_interval: float = 3600.0,  # 1 hour in seconds
-        per_token_model_limit: int = 30,
-        metrics_update_interval: float = 15.0,
-    ) -> None:
+            self,
+            backend: StateBackend | None = None,
+            persistence_config: PersistenceConfig | None = None,
+            expiration_timeout: float = 86400.0,  # 24 hours in seconds
+            cleanup_interval: float = 3600.0,  # 1 hour in seconds
+            per_token_model_limit: int = 30,
+            metrics_update_interval: float = 15.0) -> None:
         if backend is not None:
             self._backend: StateBackend = backend
         else:
@@ -150,17 +144,17 @@ class ServerState:
         # the leader publishes, while keeping the coordinator itself free
         # of any telemetry dependency.
         _managers = {
-            "sessions": self._session_mgr,
-            "models": self._model_mgr,
-            "sampling_sessions": self._sampling_mgr,
-            "futures": self._future_mgr,
+            'sessions': self._session_mgr,
+            'models': self._model_mgr,
+            'sampling_sessions': self._sampling_mgr,
+            'futures': self._future_mgr,
         }
         self._count_publisher = ResourceCountPublisher(
             [
-                ("active_sessions", self._session_mgr),
-                ("active_models", self._model_mgr),
-                ("active_sampling_sessions", self._sampling_mgr),
-                ("active_futures", self._future_mgr),
+                ('active_sessions', self._session_mgr),
+                ('active_models', self._model_mgr),
+                ('active_sampling_sessions', self._sampling_mgr),
+                ('active_futures', self._future_mgr),
             ],
             interval=float(metrics_update_interval),
         )
@@ -206,8 +200,7 @@ class ServerState:
             sessions=self.sessions,
             futures=self.futures,
             sequences=self.training_sequences,
-            expiration_timeout=self.expiration_timeout,
-        )
+            expiration_timeout=self.expiration_timeout)
 
     # ----- Session Management -----
 
@@ -220,15 +213,15 @@ class ServerState:
         Returns:
             The session_id for the created session.
         """
-        session_id = payload.get("session_id") or f"session_{uuid.uuid4().hex}"
+        session_id = payload.get('session_id') or f'session_{uuid.uuid4().hex}'
         with traced_operation(
-            "server_state.create_session",
-            attrs={SESSION_ID: session_id},
+                'server_state.create_session',
+                attrs={SESSION_ID: session_id},
         ):
             record = SessionRecord(
-                tags=list(payload.get("tags") or []),
-                user_metadata=payload.get("user_metadata") or {},
-                sdk_version=payload.get("sdk_version"),
+                tags=list(payload.get('tags') or []),
+                user_metadata=payload.get('user_metadata') or {},
+                sdk_version=payload.get('sdk_version'),
             )
             await self._session_mgr.add(session_id, record)
             return session_id
@@ -254,14 +247,12 @@ class ServerState:
 
     # ----- Model Registration -----
 
-    async def register_model(
-        self,
-        payload: dict[str, Any],
-        token: str,
-        model_id: str | None = None,
-        replica_id: str | None = None,
-        session_id: str | None = None,
-    ) -> str:
+    async def register_model(self,
+                             payload: dict[str, Any],
+                             token: str,
+                             model_id: str | None = None,
+                             replica_id: str | None = None,
+                             session_id: str | None = None) -> str:
         """Register a new model with the server state.
 
         Args:
@@ -275,30 +266,27 @@ class ServerState:
         Returns:
             The model_id for the registered model.
         """
-        _time = datetime.now().strftime("%Y%m%d_%H%M%S")
-        _model_id: str = (
-            model_id
-            or payload.get("model_id")
-            or f"{_time}-{payload.get('base_model', 'model')}-{uuid.uuid4().hex[:8]}"
-        )
-        _model_id = re.sub(r"[^\w\-]", "_", _model_id)
+        _time = datetime.now().strftime('%Y%m%d_%H%M%S')
+        _model_id: str = model_id or payload.get(
+            'model_id') or f"{_time}-{payload.get('base_model', 'model')}-{uuid.uuid4().hex[:8]}"
+        _model_id = re.sub(r'[^\w\-]', '_', _model_id)
 
         with traced_operation(
-            "server_state.register_model",
-            attrs={
-                MODEL_ID: _model_id,
-                BASE_MODEL: payload.get("base_model"),
-                REPLICA_ID: replica_id,
-                TOKEN_ID: token,
-                SESSION_ID: session_id or payload.get("session_id"),
-            },
+                'server_state.register_model',
+                attrs={
+                    MODEL_ID: _model_id,
+                    BASE_MODEL: payload.get('base_model'),
+                    REPLICA_ID: replica_id,
+                    TOKEN_ID: token,
+                    SESSION_ID: session_id or payload.get('session_id'),
+                },
         ):
             record = ModelRecord(
-                session_id=session_id or payload.get("session_id"),
-                model_seq_id=payload.get("model_seq_id"),
-                base_model=payload.get("base_model"),
-                user_metadata=payload.get("user_metadata") or {},
-                lora_config=payload.get("lora_config"),
+                session_id=session_id or payload.get('session_id'),
+                model_seq_id=payload.get('model_seq_id'),
+                base_model=payload.get('base_model'),
+                user_metadata=payload.get('user_metadata') or {},
+                lora_config=payload.get('lora_config'),
                 token=token,
                 replica_id=replica_id,
             )
@@ -328,8 +316,8 @@ class ServerState:
             max_loras: Maximum number of LoRA adapters the replica can hold.
         """
         with traced_operation(
-            "server_state.register_replica",
-            attrs={REPLICA_ID: replica_id},
+                'server_state.register_replica',
+                attrs={REPLICA_ID: replica_id},
         ):
             await self._model_mgr.register_replica(replica_id, max_loras)
 
@@ -356,7 +344,7 @@ class ServerState:
 
     @staticmethod
     def _processor_quota_key(token: str) -> str:
-        return f"{_PROCESSOR_QUOTA_PREFIX}{token}"
+        return f'{_PROCESSOR_QUOTA_PREFIX}{token}'
 
     @staticmethod
     def _processor_quota_ttl(lease_seconds: float) -> int:
@@ -388,7 +376,7 @@ class ServerState:
             ttl=self._processor_quota_ttl(lease_seconds),
         )
         if not isinstance(reservations, dict) or processor_id not in reservations:
-            raise ResourceQuotaExceededError(f"Per-user processor quota ({limit}) reached for token {token[:8]}...")
+            raise ResourceQuotaExceededError(f'Per-user processor quota ({limit}) reached for token {token[:8]}...')
 
     async def renew_processor_quota(
         self,
@@ -422,7 +410,7 @@ class ServerState:
     async def sweep_processor_quotas(self, *, lease_seconds: float = 30.0) -> None:
         """Remove expired leases from every persisted processor quota map."""
         now = time.time()
-        keys = await self._backend.keys(f"{_PROCESSOR_QUOTA_PREFIX}*")
+        keys = await self._backend.keys(f'{_PROCESSOR_QUOTA_PREFIX}*')
         for key in keys:
             await self._backend.update_atomic(
                 key,
@@ -442,22 +430,21 @@ class ServerState:
         Returns:
             The sampling_session_id.
         """
-        _sampling_session_id: str = (
-            sampling_session_id or payload.get("sampling_session_id") or f"sampling_{uuid.uuid4().hex}"
-        )
+        _sampling_session_id: str = sampling_session_id or payload.get(
+            'sampling_session_id') or f'sampling_{uuid.uuid4().hex}'
         with traced_operation(
-            "server_state.create_sampling_session",
-            attrs={
-                SAMPLING_SESSION_ID: _sampling_session_id,
-                SESSION_ID: payload.get("session_id"),
-                BASE_MODEL: payload.get("base_model"),
-            },
+                'server_state.create_sampling_session',
+                attrs={
+                    SAMPLING_SESSION_ID: _sampling_session_id,
+                    SESSION_ID: payload.get('session_id'),
+                    BASE_MODEL: payload.get('base_model'),
+                },
         ):
             record = SamplingSessionRecord(
-                session_id=payload.get("session_id"),
-                seq_id=payload.get("sampling_session_seq_id"),
-                base_model=payload.get("base_model"),
-                model_path=payload.get("model_path"),
+                session_id=payload.get('session_id'),
+                seq_id=payload.get('sampling_session_seq_id'),
+                base_model=payload.get('base_model'),
+                model_path=payload.get('model_path'),
             )
             await self._sampling_mgr.add(_sampling_session_id, record)
             return _sampling_session_id
@@ -478,7 +465,7 @@ class ServerState:
         record = await self._future_mgr.get(request_id)
         owner = record.owner_token if record is not None else None
         if owner is not None and owner != token:
-            raise ResourceNotFoundError("Unknown future")
+            raise ResourceNotFoundError('Unknown future')
 
     async def claim_seq(self, dedup_key: str, request_id: str, ttl: int | None) -> str | None:
         """Idempotency claim for a client seq_id.
@@ -497,9 +484,8 @@ class ServerState:
         preflight rejected it) so a retry can be admitted rather than see a phantom."""
         await self._backend.delete(dedup_key)
 
-    async def claim_training_seq(
-        self, training_id: str, stream: str, sequence: int, request_id: str, retention: float
-    ) -> str | None:
+    async def claim_training_seq(self, training_id: str, stream: str, sequence: int, request_id: str,
+                                 retention: float) -> str | None:
         return await self.training_sequences.claim(training_id, stream, sequence, request_id, retention)
 
     async def release_training_seq(self, training_id: str, stream: str, sequence: int, request_id: str) -> None:
@@ -518,8 +504,8 @@ class ServerState:
         """
         status = await self._future_mgr.cancel_if_pending(request_id)
         if status is None:
-            return {"cancelled": False, "state": "not_found"}
-        return {"cancelled": status == "cancelled", "state": status}
+            return {'cancelled': False, 'state': 'not_found'}
+        return {'cancelled': status == 'cancelled', 'state': status}
 
     async def store_future_status(
         self,
@@ -636,15 +622,13 @@ _DEFAULT_PER_TOKEN_MODEL_LIMIT = 30
 _DEFAULT_METRICS_UPDATE_INTERVAL = 15.0
 
 
-def get_server_state(
-    cache_key: str = "twinkle_server_state",
-    backend: StateBackend | None = None,
-    persistence_config: PersistenceConfig | None = None,
-    expiration_timeout: float | None = None,
-    cleanup_interval: float | None = None,
-    per_token_model_limit: int | None = None,
-    metrics_update_interval: float | None = None,
-) -> ServerState:
+def get_server_state(cache_key: str = 'twinkle_server_state',
+                     backend: StateBackend | None = None,
+                     persistence_config: PersistenceConfig | None = None,
+                     expiration_timeout: float | None = None,
+                     cleanup_interval: float | None = None,
+                     per_token_model_limit: int | None = None,
+                     metrics_update_interval: float | None = None) -> ServerState:
     """Return a process-local :class:`ServerState` bound directly to the backend.
 
     Within one process the same ``cache_key`` returns the same cached instance
@@ -680,7 +664,6 @@ def get_server_state(
     # launcher-propagated env (so a non-gateway worker honours the operator's
     # YAML instead of the hardcoded default), else the module default.
     from twinkle.server.config.application_spec import ServerStateArgs
-
     env_policy = ServerStateArgs.from_env() or ServerStateArgs()
 
     def _resolve(explicit, env_value, default):
@@ -692,12 +675,10 @@ def get_server_state(
 
     expiration_timeout = _resolve(expiration_timeout, env_policy.expiration_timeout, _DEFAULT_EXPIRATION_TIMEOUT)
     cleanup_interval = _resolve(cleanup_interval, env_policy.cleanup_interval, _DEFAULT_CLEANUP_INTERVAL)
-    per_token_model_limit = _resolve(
-        per_token_model_limit, env_policy.per_token_model_limit, _DEFAULT_PER_TOKEN_MODEL_LIMIT
-    )
-    metrics_update_interval = _resolve(
-        metrics_update_interval, env_policy.metrics_update_interval, _DEFAULT_METRICS_UPDATE_INTERVAL
-    )
+    per_token_model_limit = _resolve(per_token_model_limit, env_policy.per_token_model_limit,
+                                     _DEFAULT_PER_TOKEN_MODEL_LIMIT)
+    metrics_update_interval = _resolve(metrics_update_interval, env_policy.metrics_update_interval,
+                                       _DEFAULT_METRICS_UPDATE_INTERVAL)
 
     state = ServerState(
         backend=backend,
@@ -709,13 +690,9 @@ def get_server_state(
     )
     _PROCESS_STATE_CACHE[cache_key] = state
     logger.info(
-        "ServerState policy in effect: per_token_model_limit=%s expiration_timeout=%s "
-        "cleanup_interval=%s metrics_update_interval=%s (resolution: explicit>env>default)",
-        per_token_model_limit,
-        expiration_timeout,
-        cleanup_interval,
-        metrics_update_interval,
-    )
+        'ServerState policy in effect: per_token_model_limit=%s expiration_timeout=%s '
+        'cleanup_interval=%s metrics_update_interval=%s (resolution: explicit>env>default)', per_token_model_limit,
+        expiration_timeout, cleanup_interval, metrics_update_interval)
     # Cleanup task is started by the deployment's FastAPI ``lifespan`` hook
     # via ``await state.start_cleanup_task()`` — that's the single async
     # entry point each worker has, so we don't need any sync-context

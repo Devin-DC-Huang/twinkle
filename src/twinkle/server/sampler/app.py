@@ -5,14 +5,13 @@ Unified sampler management application.
 Builds a single Ray Serve deployment (SamplerManagement) that simultaneously handles
 both Tinker (/tinker/asample) and Twinkle (/twinkle/*) sampler endpoints.
 """
-
 from __future__ import annotations
+
 import asyncio
 import os
-from typing import Any
-
 from fastapi import FastAPI, Request
 from ray import serve
+from typing import Any
 
 from twinkle import DeviceGroup
 from twinkle.server.config.backend_dispatch import BackendSelector
@@ -75,14 +74,14 @@ def _make_torch_sampler(kw: dict[str, Any]) -> Any:
 
 # Single validate-then-dispatch selector for the sampler backend.
 SAMPLER_SELECTOR = BackendSelector(
-    "sampler_type",
+    'sampler_type',
     {
-        "mock": _make_mock_sampler,
-        "vllm": _make_vllm_sampler,
-        "vllm_async": _make_vllm_async_sampler,
-        "sglang": _make_sglang_sampler,
-        "sglang_async": _make_sglang_async_sampler,
-        "torch": _make_torch_sampler,
+        'mock': _make_mock_sampler,
+        'vllm': _make_vllm_sampler,
+        'vllm_async': _make_vllm_async_sampler,
+        'sglang': _make_sglang_sampler,
+        'sglang_async': _make_sglang_async_sampler,
+        'torch': _make_torch_sampler,
     },
 )
 
@@ -107,34 +106,31 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
     - Template configuration for trajectory encoding
     """
 
-    async def __init__(
-        self,
-        model_id: str,
-        nproc_per_node: int,
-        device_group: dict[str, Any],
-        device_mesh: dict[str, Any],
-        sampler_type: str,
-        engine_args: dict[str, Any] | None = None,
-        queue_config: TaskQueueConfig | None = None,
-        data_plane_url: str | None = None,
-        template: dict[str, Any] | None = None,
-        **kwargs,
-    ):
+    async def __init__(self,
+                       model_id: str,
+                       nproc_per_node: int,
+                       device_group: dict[str, Any],
+                       device_mesh: dict[str, Any],
+                       sampler_type: str,
+                       engine_args: dict[str, Any] | None = None,
+                       queue_config: TaskQueueConfig | None = None,
+                       data_plane_url: str | None = None,
+                       template: dict[str, Any] | None = None,
+                       **kwargs):
         self.request_runtime = SamplerRuntime(self)
         self.device_group = DeviceGroup(**device_group)
-        context = kwargs.pop("sampling_context", None)
+        context = kwargs.pop('sampling_context', None)
         if context is not None:
             context = RuntimeContext.model_validate(context)
             from twinkle.infra._ray.ray_helper import RayHelper
             from twinkle.infra._ray.resource_manager import ResourceManager
-
-            os.environ["TWINKLE_RAY_NAMESPACE"] = context.namespace
-            os.environ["TWINKLE_RAY_REGISTRY_NAME"] = context.registry_name
-            RayHelper.resource_manager = ResourceManager.from_allocation(
-                self.device_group, kwargs.pop("placement_group"), kwargs.pop("allocation_devices")
-            )
+            os.environ['TWINKLE_RAY_NAMESPACE'] = context.namespace
+            os.environ['TWINKLE_RAY_REGISTRY_NAME'] = context.registry_name
+            RayHelper.resource_manager = ResourceManager.from_allocation(self.device_group,
+                                                                         kwargs.pop('placement_group'),
+                                                                         kwargs.pop('allocation_devices'))
         self.device_mesh = init_twinkle_runtime(
-            is_mock=(sampler_type == "mock"),
+            is_mock=(sampler_type == 'mock'),
             nproc_per_node=nproc_per_node,
             device_group=self.device_group,
             device_mesh_dict=device_mesh,
@@ -147,31 +143,33 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
             self.replica_id = serve.get_replica_context().replica_id.unique_id
 
         sampler_kwargs: dict[str, Any] = {
-            "model_id": model_id,
-            "remote_group": self.device_group.name,
-            "instance_id": self.replica_id,
+            'model_id': model_id,
+            'remote_group': self.device_group.name,
+            'instance_id': self.replica_id,
         }
-        if sampler_type != "mock":
+        if sampler_type != 'mock':
             sampler_kwargs.update(
                 engine_args=engine_args or {},
                 device_mesh=self.device_mesh,
-                **{k: v for k, v in kwargs.items() if k not in ("engine_args",)},
+                **{
+                    k: v
+                    for k, v in kwargs.items() if k not in ('engine_args', )
+                },
             )
         else:
             sampler_kwargs.update(kwargs)
         self.sampler = _construct_sampler_backend(sampler_type, sampler_kwargs, data_plane_url)
-        actors = getattr(self.sampler, "_actors", ())
+        actors = getattr(self.sampler, '_actors', ())
         await asyncio.gather(*(actor.__ray_ready__.remote() for actor in actors))
 
         self.state: ServerState = get_server_state()
         from twinkle.server.data_plane import DataPlaneProxy
-
         self.data_plane = DataPlaneProxy(data_plane_url)
 
-        actors = getattr(self.sampler, "_actors", None)
+        actors = getattr(self.sampler, '_actors', None)
         self._init_task_queue(
             queue_config,
-            deployment_name="Sampler",
+            deployment_name='Sampler',
             collect_width=len(actors) if actors else 1,
         )
         # ComputeWorker bounds the client future. Keep collecting the actual
@@ -185,23 +183,22 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
         # (see the handler), which keeps that crude fallback from clobbering an explicitly chosen one.
         # Runs after _init_task_queue: call_backend needs the BackendGate it installs.
         self._template_pinned = False
-        if template and hasattr(self.sampler, "set_template"):
+        if template and hasattr(self.sampler, 'set_template'):
             template_kwargs = dict(template)
-            template_cls = template_kwargs.pop("template_cls", None)
+            template_cls = template_kwargs.pop('template_cls', None)
             if template_cls is None:
                 raise ValueError(
                     "template must carry a 'template_cls' key naming the template class; got keys: "
-                    f"{sorted(template_kwargs) or 'none'}"
-                )
+                    f'{sorted(template_kwargs) or "none"}')
             await self.call_backend(self.sampler.set_template, template_cls, **template_kwargs)
             self._template_pinned = True
-        if sampler_type != "mock" and not self._template_pinned:
+        if sampler_type != 'mock' and not self._template_pinned:
             await self.call_backend(self.sampler.set_template, get_template_for_model(model_id), model_id=model_id)
 
     async def shutdown(self) -> None:
         self.sampling_guard.close()
         try:
-            cancel_all = getattr(self.sampler, "abort_all_inflight", None)
+            cancel_all = getattr(self.sampler, 'abort_all_inflight', None)
             if callable(cancel_all):
                 await self.call_backend(cancel_all, admit=False)
         finally:
@@ -237,19 +234,17 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
         return get_token_from_request(request)
 
 
-def build_sampler_app(
-    model_id: str,
-    nproc_per_node: int,
-    device_group: dict[str, Any],
-    device_mesh: dict[str, Any],
-    deploy_options: dict[str, Any],
-    sampler_type: str,
-    engine_args: dict[str, Any] | None = None,
-    queue_config: TaskQueueConfig | None = None,
-    data_plane_url: str | None = None,
-    template: dict[str, Any] | None = None,
-    **kwargs,
-):
+def build_sampler_app(model_id: str,
+                      nproc_per_node: int,
+                      device_group: dict[str, Any],
+                      device_mesh: dict[str, Any],
+                      deploy_options: dict[str, Any],
+                      sampler_type: str,
+                      engine_args: dict[str, Any] | None = None,
+                      queue_config: TaskQueueConfig | None = None,
+                      data_plane_url: str | None = None,
+                      template: dict[str, Any] | None = None,
+                      **kwargs):
     """Build a unified sampler application for text generation inference.
 
     Supports both Tinker (polling-style /tinker/asample) and
@@ -282,14 +277,14 @@ def build_sampler_app(
     # Build the FastAPI app + middleware stack + routes via the shared scaffold,
     # then bind the Ray Serve deployment. The Sampler passes its FastAPI
     # title/description/version through ``fastapi_kwargs``.
-    managed = kwargs.get("sampling_context") is not None
+    managed = kwargs.get('sampling_context') is not None
 
     def register_routes(app: FastAPI, get_self: Any) -> None:
         if managed:
 
             def managed_self():
                 # Internal compute URLs must not bypass the controller's tickets.
-                raise RequestRejectedError("Sampling requests must use the stable sampler endpoint")
+                raise RequestRejectedError('Sampling requests must use the stable sampler endpoint')
 
             dependency = managed_self
         else:
@@ -298,12 +293,12 @@ def build_sampler_app(
         _register_twinkle_sampler_routes(app, dependency)
 
     app = build_deployment_app(
-        "Sampler",
+        'Sampler',
         register_routes,
         fastapi_kwargs={
-            "title": "Unified Sampler",
-            "description": "REST API for distributed text generation inference (Tinker + Twinkle)",
-            "version": "1.0.0",
+            'title': 'Unified Sampler',
+            'description': 'REST API for distributed text generation inference (Tinker + Twinkle)',
+            'version': '1.0.0',
         },
         attach_replica_id_header=True,
         on_shutdown=lambda servable: servable.shutdown(),
@@ -313,20 +308,12 @@ def build_sampler_app(
         app,
         SamplerManagement,
         deploy_options,
-        deployment_name="SamplerManagement",
-        bind_args=(
-            model_id,
-            nproc_per_node,
-            device_group,
-            device_mesh,
-            sampler_type,
-            engine_args,
-            queue_config,
-            data_plane_url,
-        ),
+        deployment_name='SamplerManagement',
+        bind_args=(model_id, nproc_per_node, device_group, device_mesh, sampler_type, engine_args, queue_config,
+                   data_plane_url),
         # ``template`` is an explicit named parameter, so it is not in ``kwargs``; forward it explicitly
         # or the pinned-template branch in ``SamplerManagement.__init__`` never runs.
-        bind_kwargs={**kwargs, "template": template},
+        bind_kwargs={**kwargs, 'template': template},
     )
 
 

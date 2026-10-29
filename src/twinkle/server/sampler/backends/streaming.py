@@ -4,10 +4,9 @@
 Kept independent of the HTTP runtime so backend workers do not import FastAPI
 or depend on the mock backend. Both consumers import this defining module.
 """
-
 from __future__ import annotations
 
-STREAM_SENTINEL = "__STREAM_END__"
+STREAM_SENTINEL = '__STREAM_END__'
 
 
 class StreamPublisher:
@@ -27,7 +26,7 @@ class StreamPublisher:
             self.connected = False
 
 
-def stream_to_queue(sampler, queue, inputs, sampling_params=None, adapter_name="", adapter_path=None):
+def stream_to_queue(sampler, queue, inputs, sampling_params=None, adapter_name='', adapter_path=None):
     """Drain and close the generator even when its HTTP consumer disconnects."""
     from contextlib import ExitStack
 
@@ -35,7 +34,7 @@ def stream_to_queue(sampler, queue, inputs, sampling_params=None, adapter_name="
     generation = sampler.sample_stream(inputs, sampling_params, adapter_name, adapter_path)
     with ExitStack() as cleanup:
         cleanup.callback(publisher.put, STREAM_SENTINEL)
-        close = getattr(generation, "close", None)
+        close = getattr(generation, 'close', None)
         if close is not None:
             cleanup.callback(close)
         try:

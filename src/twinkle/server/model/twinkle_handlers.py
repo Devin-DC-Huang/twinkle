@@ -9,14 +9,13 @@ the handler submits work and returns immediately, and the client's Client_Future
 resolves the envelope to a terminal state. ``self_fn`` is injected via FastAPI Depends to
 obtain the ModelManagement instance at request time.
 """
-
 from __future__ import annotations
-from collections.abc import Callable
-from functools import partial
-from typing import TYPE_CHECKING
 
 import torch
+from collections.abc import Callable
 from fastapi import Depends, FastAPI, HTTPException, Request
+from functools import partial
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .app import ModelManagement
@@ -26,12 +25,8 @@ from twinkle.protocol.serialize import deserialize_object
 from twinkle.server.checkpoint import create_checkpoint_manager
 from twinkle.server.exceptions import RequestRejectedError
 from twinkle.server.lifecycle.submit import backend_kwargs, input_metrics, run_submit, to_backend_inputs
-from twinkle.server.model.data_plane_inputs import (
-    data_plane_request_shape,
-    merge_forward_kwargs,
-    resolve_data_plane_model_inputs,
-    select_output_rows,
-)
+from twinkle.server.model.data_plane_inputs import (data_plane_request_shape, merge_forward_kwargs,
+                                                    resolve_data_plane_model_inputs, select_output_rows)
 from twinkle.server.validation import BackendCapability
 from twinkle.utils.logger import get_logger
 
@@ -51,7 +46,7 @@ def _tokens_only_metrics(self, body):
 def _data_plane_metrics(self, body):
     """Scheduling metrics derived from DataRef shape for *_from_data_plane endpoints."""
     input_tokens, batch_size = data_plane_request_shape(body)
-    return {"input_tokens": input_tokens, "batch_size": batch_size, "data_world_size": self.data_world_size}
+    return {'input_tokens': input_tokens, 'batch_size': batch_size, 'data_world_size': self.data_world_size}
 
 
 def _register_model_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]) -> None:
@@ -61,74 +56,71 @@ def _register_model_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelMana
     replica instance. It is wired in via Depends so it is resolved lazily at request time.
     """
 
-    @app.get("/healthz")
+    @app.get('/healthz')
     async def model_healthz(
-        request: Request,
-        self: ModelManagement = Depends(self_fn),
+            request: Request,
+            self: ModelManagement = Depends(self_fn),
     ) -> dict:
         """Deep health probe: pings underlying model actors to verify liveness."""
         result = await self.check_model_health()
-        if self._model_unhealthy or not result["healthy"]:
+        if self._model_unhealthy or not result['healthy']:
             from fastapi.responses import JSONResponse
-
             return JSONResponse(status_code=503, content=result)
         return result
 
-    @app.post("/twinkle/create", response_model=types.CreateResponse)
-    async def create(
-        request: Request, body: types.CreateRequest, self: ModelManagement = Depends(self_fn)
-    ) -> types.CreateResponse:
-        raise RequestRejectedError("Training lifecycle operations must use the catalog endpoint")
+    @app.post('/twinkle/create', response_model=types.CreateResponse)
+    async def create(request: Request, body: types.CreateRequest,
+                     self: ModelManagement = Depends(self_fn)) -> types.CreateResponse:
+        raise RequestRejectedError('Training lifecycle operations must use the catalog endpoint')
 
     # ------------------------------------------------------------------ #
     # Inline data / forward family
     # ------------------------------------------------------------------ #
 
-    @app.post("/twinkle/forward", response_model=types.TaskEnvelope)
-    async def forward(
-        request: Request, body: types.ForwardRequest, self: ModelManagement = Depends(self_fn)
-    ) -> types.TaskEnvelope:
+    @app.post('/twinkle/forward', response_model=types.TaskEnvelope)
+    async def forward(request: Request, body: types.ForwardRequest,
+                      self: ModelManagement = Depends(self_fn)) -> types.TaskEnvelope:
+
         async def _call(self, body, adapter_name, token):
             ret = await self.call_backend(
                 self.model.forward,
                 inputs=to_backend_inputs(body.inputs),
                 adapter_name=self.resolve_model_adapter_name(adapter_name),
-                **backend_kwargs(body),
-            )
-            return {"result": ret}
+                **backend_kwargs(body))
+            return {'result': ret}
 
         return await run_submit(
             self,
             request,
             body,
-            task_type="forward",
+            task_type='forward',
             backend_call=_call,
             metrics=_dp_metrics,
-            capability=BackendCapability.Forward,
-        )
+            capability=BackendCapability.Forward)
 
-    @app.post("/twinkle/forward_only", response_model=types.TaskEnvelope)
+    @app.post('/twinkle/forward_only', response_model=types.TaskEnvelope)
     async def forward_only(
-        request: Request, body: types.ForwardOnlyRequest, self: ModelManagement = Depends(self_fn)
-    ) -> types.TaskEnvelope:
+        request: Request, body: types.ForwardOnlyRequest,
+        self: ModelManagement = Depends(self_fn)) -> types.TaskEnvelope:
+
         async def _call(self, body, adapter_name, token):
             ret = await self.call_backend(
                 self.model.forward_only,
                 inputs=to_backend_inputs(body.inputs),
                 adapter_name=self.resolve_model_adapter_name(adapter_name),
-                **backend_kwargs(body),
-            )
-            return {"result": ret}
+                **backend_kwargs(body))
+            return {'result': ret}
 
         return await run_submit(
-            self, request, body, task_type="forward_only", backend_call=_call, metrics=_tokens_only_metrics
-        )
+            self, request, body, task_type='forward_only', backend_call=_call, metrics=_tokens_only_metrics)
 
-    @app.post("/twinkle/forward_backward", response_model=types.TaskEnvelope)
+    @app.post('/twinkle/forward_backward', response_model=types.TaskEnvelope)
     async def forward_backward(
-        request: Request, body: types.ForwardBackwardTaskRequest, self: ModelManagement = Depends(self_fn)
-    ) -> types.TaskEnvelope:
+        request: Request, body: types.ForwardBackwardTaskRequest,
+        self: ModelManagement = Depends(self_fn)) -> types.TaskEnvelope:
+
         async def _call(self, body, adapter_name, token):
+
             def first_element(data):
                 while isinstance(data, list):
                     if len(data) == 0:
@@ -143,67 +135,61 @@ def _register_model_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelMana
                         inputs[key] = torch.tensor(inputs[key])
             kwargs = backend_kwargs(body)
             resolved_adapter_name = self.resolve_model_adapter_name(adapter_name)
-            preflight = getattr(self.model, "preflight_loss_inputs", None)
-            if preflight is not None and any(key in kwargs for key in ("old_logps", "ref_logps", "advantages")):
+            preflight = getattr(self.model, 'preflight_loss_inputs', None)
+            if preflight is not None and any(key in kwargs for key in ('old_logps', 'ref_logps', 'advantages')):
                 # Full, unsliced batch on every rank: a loss alignment error must
                 # fail all ranks before any of them enters its backward collective.
                 await self.call_backend(preflight, inputs=all_inputs, adapter_name=resolved_adapter_name, **kwargs)
             elif preflight is None:
                 logger.warning(
-                    "Backend %s has no preflight_loss_inputs; a loss alignment error can still deadlock the DP peers.",
-                    type(self.model).__name__,
-                )
+                    'Backend %s has no preflight_loss_inputs; a loss alignment error can still deadlock the DP peers.',
+                    type(self.model).__name__)
             ret = await self.call_backend(
-                self.model.forward_backward, inputs=all_inputs, adapter_name=resolved_adapter_name, **kwargs
-            )
-            return {"result": ret}
+                self.model.forward_backward, inputs=all_inputs, adapter_name=resolved_adapter_name, **kwargs)
+            return {'result': ret}
 
         return await run_submit(
-            self, request, body, task_type="forward_backward", backend_call=_call, metrics=_dp_metrics
-        )
+            self, request, body, task_type='forward_backward', backend_call=_call, metrics=_dp_metrics)
 
-    @app.post("/twinkle/calculate_loss", response_model=types.TaskEnvelope)
+    @app.post('/twinkle/calculate_loss', response_model=types.TaskEnvelope)
     async def calculate_loss(
-        request: Request, body: types.AdapterRequest, self: ModelManagement = Depends(self_fn)
-    ) -> types.TaskEnvelope:
+        request: Request, body: types.AdapterRequest, self: ModelManagement = Depends(self_fn)) -> types.TaskEnvelope:
+
         async def _call(self, body, adapter_name, token):
             ret = await self.call_backend(
                 self.model.calculate_loss,
                 adapter_name=self.resolve_model_adapter_name(adapter_name),
-                **backend_kwargs(body),
-            )
-            return {"result": ret}
+                **backend_kwargs(body))
+            return {'result': ret}
 
         return await run_submit(
             self,
             request,
             body,
-            task_type="calculate_loss",
+            task_type='calculate_loss',
             backend_call=_call,
-            capability=BackendCapability.CalculateLoss,
-        )
+            capability=BackendCapability.CalculateLoss)
 
-    @app.post("/twinkle/backward", response_model=types.TaskEnvelope)
-    async def backward(
-        request: Request, body: types.AdapterRequest, self: ModelManagement = Depends(self_fn)
-    ) -> types.TaskEnvelope:
+    @app.post('/twinkle/backward', response_model=types.TaskEnvelope)
+    async def backward(request: Request, body: types.AdapterRequest,
+                       self: ModelManagement = Depends(self_fn)) -> types.TaskEnvelope:
+
         async def _call(self, body, adapter_name, token):
             await self.call_backend(
-                self.model.backward, adapter_name=self.resolve_model_adapter_name(adapter_name), **backend_kwargs(body)
-            )
+                self.model.backward, adapter_name=self.resolve_model_adapter_name(adapter_name), **backend_kwargs(body))
 
         return await run_submit(
-            self, request, body, task_type="backward", backend_call=_call, capability=BackendCapability.Backward
-        )
+            self, request, body, task_type='backward', backend_call=_call, capability=BackendCapability.Backward)
 
     # ------------------------------------------------------------------ #
     # Data-plane forward family (DataRef inputs; response only enters the contract)
     # ------------------------------------------------------------------ #
 
-    @app.post("/twinkle/forward_from_data_plane", response_model=types.TaskEnvelope)
+    @app.post('/twinkle/forward_from_data_plane', response_model=types.TaskEnvelope)
     async def forward_from_data_plane(
-        request: Request, body: types.DataPlaneForwardRequest, self: ModelManagement = Depends(self_fn)
-    ) -> types.TaskEnvelope:
+        request: Request, body: types.DataPlaneForwardRequest,
+        self: ModelManagement = Depends(self_fn)) -> types.TaskEnvelope:
+
         async def _call(self, body, adapter_name, token):
             raw_inputs, field_kwargs = await resolve_data_plane_model_inputs(body, self.data_plane)
             kwargs = merge_forward_kwargs(backend_kwargs(body), field_kwargs)
@@ -211,24 +197,23 @@ def _register_model_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelMana
                 self.model.forward,
                 inputs=to_backend_inputs(raw_inputs),
                 adapter_name=self.resolve_model_adapter_name(adapter_name),
-                **kwargs,
-            )
-            return {"result": ret}
+                **kwargs)
+            return {'result': ret}
 
         return await run_submit(
             self,
             request,
             body,
-            task_type="forward_from_data_plane",
+            task_type='forward_from_data_plane',
             backend_call=_call,
             metrics=_data_plane_metrics,
-            capability=BackendCapability.Forward,
-        )
+            capability=BackendCapability.Forward)
 
-    @app.post("/twinkle/forward_only_from_data_plane", response_model=types.TaskEnvelope)
+    @app.post('/twinkle/forward_only_from_data_plane', response_model=types.TaskEnvelope)
     async def forward_only_from_data_plane(
-        request: Request, body: types.DataPlaneForwardOnlyRequest, self: ModelManagement = Depends(self_fn)
-    ) -> types.TaskEnvelope:
+        request: Request, body: types.DataPlaneForwardOnlyRequest,
+        self: ModelManagement = Depends(self_fn)) -> types.TaskEnvelope:
+
         async def _call(self, body, adapter_name, token):
             raw_inputs, field_kwargs = await resolve_data_plane_model_inputs(body, self.data_plane)
             inputs = to_backend_inputs(raw_inputs)
@@ -237,210 +222,203 @@ def _register_model_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelMana
                 self.model.forward_only,
                 inputs=inputs,
                 adapter_name=self.resolve_model_adapter_name(adapter_name),
-                **kwargs,
-            )
+                **kwargs)
             if body.output_ref is not None:
                 rows = select_output_rows(ret, batch_size=len(inputs), output_fields=body.output_fields)
                 output_ref = await self.data_plane.append(body.output_ref, rows)
-                return {"result": output_ref.model_dump()}
-            return {"result": ret}
+                return {'result': output_ref.model_dump()}
+            return {'result': ret}
 
         return await run_submit(
             self,
             request,
             body,
-            task_type="forward_only_from_data_plane",
+            task_type='forward_only_from_data_plane',
             backend_call=_call,
-            metrics=_data_plane_metrics,
-        )
+            metrics=_data_plane_metrics)
 
-    @app.post("/twinkle/forward_backward_from_data_plane", response_model=types.TaskEnvelope)
+    @app.post('/twinkle/forward_backward_from_data_plane', response_model=types.TaskEnvelope)
     async def forward_backward_from_data_plane(
-        request: Request, body: types.DataPlaneForwardRequest, self: ModelManagement = Depends(self_fn)
-    ) -> types.TaskEnvelope:
+        request: Request, body: types.DataPlaneForwardRequest,
+        self: ModelManagement = Depends(self_fn)) -> types.TaskEnvelope:
+
         async def _call(self, body, adapter_name, token):
             raw_inputs, field_kwargs = await resolve_data_plane_model_inputs(body, self.data_plane)
             kwargs = merge_forward_kwargs(backend_kwargs(body), field_kwargs)
             inputs = to_backend_inputs(raw_inputs)
             resolved_adapter_name = self.resolve_model_adapter_name(adapter_name)
-            preflight = getattr(self.model, "preflight_loss_inputs", None)
-            if preflight is not None and any(key in kwargs for key in ("old_logps", "ref_logps", "advantages")):
+            preflight = getattr(self.model, 'preflight_loss_inputs', None)
+            if preflight is not None and any(key in kwargs for key in ('old_logps', 'ref_logps', 'advantages')):
                 await self.call_backend(preflight, inputs=inputs, adapter_name=resolved_adapter_name, **kwargs)
             elif preflight is None:
                 logger.warning(
-                    "Backend %s has no preflight_loss_inputs; a loss alignment error can still deadlock the DP peers.",
-                    type(self.model).__name__,
-                )
+                    'Backend %s has no preflight_loss_inputs; a loss alignment error can still deadlock the DP peers.',
+                    type(self.model).__name__)
             ret = await self.call_backend(
-                self.model.forward_backward, inputs=inputs, adapter_name=resolved_adapter_name, **kwargs
-            )
-            return {"result": ret}
+                self.model.forward_backward, inputs=inputs, adapter_name=resolved_adapter_name, **kwargs)
+            return {'result': ret}
 
         return await run_submit(
             self,
             request,
             body,
-            task_type="forward_backward_from_data_plane",
+            task_type='forward_backward_from_data_plane',
             backend_call=_call,
-            metrics=_data_plane_metrics,
-        )
+            metrics=_data_plane_metrics)
 
     # ------------------------------------------------------------------ #
     # Optimizer / control plane
     # ------------------------------------------------------------------ #
 
-    @app.post("/twinkle/clip_grad_norm", response_model=types.TaskEnvelope)
+    @app.post('/twinkle/clip_grad_norm', response_model=types.TaskEnvelope)
     async def clip_grad_norm(
-        request: Request, body: types.ClipGradNormRequest, self: ModelManagement = Depends(self_fn)
-    ) -> types.TaskEnvelope:
+        request: Request, body: types.ClipGradNormRequest,
+        self: ModelManagement = Depends(self_fn)) -> types.TaskEnvelope:
+
         async def _call(self, body, adapter_name, token):
             ret = await self.call_backend(
                 self.model.clip_grad_norm,
                 max_grad_norm=body.max_grad_norm,
                 norm_type=body.norm_type,
                 adapter_name=self.resolve_model_adapter_name(adapter_name),
-                **backend_kwargs(body),
-            )
-            return {"result": str(ret)}
+                **backend_kwargs(body))
+            return {'result': str(ret)}
 
-        return await run_submit(self, request, body, task_type="clip_grad_norm", backend_call=_call)
+        return await run_submit(self, request, body, task_type='clip_grad_norm', backend_call=_call)
 
-    @app.post("/twinkle/step", response_model=types.TaskEnvelope)
-    async def step(
-        request: Request, body: types.StepRequest, self: ModelManagement = Depends(self_fn)
-    ) -> types.TaskEnvelope:
+    @app.post('/twinkle/step', response_model=types.TaskEnvelope)
+    async def step(request: Request, body: types.StepRequest,
+                   self: ModelManagement = Depends(self_fn)) -> types.TaskEnvelope:
+
         async def _call(self, body, adapter_name, token):
             await self.call_backend(
-                self.model.step, adapter_name=self.resolve_model_adapter_name(adapter_name), **backend_kwargs(body)
-            )
+                self.model.step, adapter_name=self.resolve_model_adapter_name(adapter_name), **backend_kwargs(body))
 
-        return await run_submit(self, request, body, task_type="step", backend_call=_call)
+        return await run_submit(self, request, body, task_type='step', backend_call=_call)
 
-    @app.post("/twinkle/zero_grad", response_model=types.TaskEnvelope)
-    async def zero_grad(
-        request: Request, body: types.AdapterRequest, self: ModelManagement = Depends(self_fn)
-    ) -> types.TaskEnvelope:
+    @app.post('/twinkle/zero_grad', response_model=types.TaskEnvelope)
+    async def zero_grad(request: Request, body: types.AdapterRequest,
+                        self: ModelManagement = Depends(self_fn)) -> types.TaskEnvelope:
+
         async def _call(self, body, adapter_name, token):
             await self.call_backend(
-                self.model.zero_grad, adapter_name=self.resolve_model_adapter_name(adapter_name), **backend_kwargs(body)
-            )
+                self.model.zero_grad,
+                adapter_name=self.resolve_model_adapter_name(adapter_name),
+                **backend_kwargs(body))
 
-        return await run_submit(self, request, body, task_type="zero_grad", backend_call=_call)
+        return await run_submit(self, request, body, task_type='zero_grad', backend_call=_call)
 
-    @app.post("/twinkle/lr_step", response_model=types.TaskEnvelope)
-    async def lr_step(
-        request: Request, body: types.LrStepRequest, self: ModelManagement = Depends(self_fn)
-    ) -> types.TaskEnvelope:
+    @app.post('/twinkle/lr_step', response_model=types.TaskEnvelope)
+    async def lr_step(request: Request, body: types.LrStepRequest,
+                      self: ModelManagement = Depends(self_fn)) -> types.TaskEnvelope:
+
         async def _call(self, body, adapter_name, token):
             await self.call_backend(
-                self.model.lr_step, adapter_name=self.resolve_model_adapter_name(adapter_name), **backend_kwargs(body)
-            )
+                self.model.lr_step, adapter_name=self.resolve_model_adapter_name(adapter_name), **backend_kwargs(body))
 
-        return await run_submit(self, request, body, task_type="lr_step", backend_call=_call)
+        return await run_submit(self, request, body, task_type='lr_step', backend_call=_call)
 
-    @app.post("/twinkle/clip_grad_and_step", response_model=types.TaskEnvelope)
+    @app.post('/twinkle/clip_grad_and_step', response_model=types.TaskEnvelope)
     async def clip_grad_and_step(
-        request: Request, body: types.ClipGradAndStepRequest, self: ModelManagement = Depends(self_fn)
-    ) -> types.TaskEnvelope:
+        request: Request, body: types.ClipGradAndStepRequest,
+        self: ModelManagement = Depends(self_fn)) -> types.TaskEnvelope:
+
         async def _call(self, body, adapter_name, token):
             await self.call_backend(
                 self.model.clip_grad_and_step,
                 max_grad_norm=body.max_grad_norm,
                 norm_type=body.norm_type,
                 adapter_name=self.resolve_model_adapter_name(adapter_name),
-                **backend_kwargs(body),
-            )
+                **backend_kwargs(body))
 
-        return await run_submit(self, request, body, task_type="clip_grad_and_step", backend_call=_call)
+        return await run_submit(self, request, body, task_type='clip_grad_and_step', backend_call=_call)
 
-    @app.post("/twinkle/get_train_configs", response_model=types.TaskEnvelope)
+    @app.post('/twinkle/get_train_configs', response_model=types.TaskEnvelope)
     async def get_train_configs(
-        request: Request, body: types.AdapterRequest, self: ModelManagement = Depends(self_fn)
-    ) -> types.TaskEnvelope:
+        request: Request, body: types.AdapterRequest, self: ModelManagement = Depends(self_fn)) -> types.TaskEnvelope:
+
         async def _call(self, body, adapter_name, token):
             ret = await self.call_backend(
                 self.model.get_train_configs,
                 adapter_name=self.resolve_model_adapter_name(adapter_name),
-                **backend_kwargs(body),
-            )
-            return {"result": ret}
+                **backend_kwargs(body))
+            return {'result': ret}
 
-        return await run_submit(self, request, body, task_type="get_train_configs", backend_call=_call)
+        return await run_submit(self, request, body, task_type='get_train_configs', backend_call=_call)
 
-    @app.post("/twinkle/set_loss", response_model=types.TaskEnvelope)
-    async def set_loss(
-        request: Request, body: types.SetLossRequest, self: ModelManagement = Depends(self_fn)
-    ) -> types.TaskEnvelope:
+    @app.post('/twinkle/set_loss', response_model=types.TaskEnvelope)
+    async def set_loss(request: Request, body: types.SetLossRequest,
+                       self: ModelManagement = Depends(self_fn)) -> types.TaskEnvelope:
+
         async def _call(self, body, adapter_name, token):
             await self.call_backend(
                 self.model.set_loss,
                 body.loss_cls,
                 adapter_name=self.resolve_model_adapter_name(adapter_name),
-                **backend_kwargs(body),
-            )
+                **backend_kwargs(body))
 
-        return await run_submit(self, request, body, task_type="set_loss", backend_call=_call)
+        return await run_submit(self, request, body, task_type='set_loss', backend_call=_call)
 
-    @app.post("/twinkle/set_optimizer", response_model=types.TaskEnvelope)
+    @app.post('/twinkle/set_optimizer', response_model=types.TaskEnvelope)
     async def set_optimizer(
-        request: Request, body: types.SetOptimizerRequest, self: ModelManagement = Depends(self_fn)
-    ) -> types.TaskEnvelope:
+        request: Request, body: types.SetOptimizerRequest,
+        self: ModelManagement = Depends(self_fn)) -> types.TaskEnvelope:
+
         async def _call(self, body, adapter_name, token):
             await self.call_backend(
                 self.model.set_optimizer,
                 body.optimizer_cls,
                 adapter_name=self.resolve_model_adapter_name(adapter_name),
-                **backend_kwargs(body),
-            )
+                **backend_kwargs(body))
 
-        return await run_submit(self, request, body, task_type="set_optimizer", backend_call=_call)
+        return await run_submit(self, request, body, task_type='set_optimizer', backend_call=_call)
 
-    @app.post("/twinkle/set_lr_scheduler", response_model=types.TaskEnvelope)
+    @app.post('/twinkle/set_lr_scheduler', response_model=types.TaskEnvelope)
     async def set_lr_scheduler(
-        request: Request, body: types.SetLrSchedulerRequest, self: ModelManagement = Depends(self_fn)
-    ) -> types.TaskEnvelope:
+        request: Request, body: types.SetLrSchedulerRequest,
+        self: ModelManagement = Depends(self_fn)) -> types.TaskEnvelope:
+
         async def _call(self, body, adapter_name, token):
             await self.call_backend(
                 self.model.set_lr_scheduler,
                 body.scheduler_cls,
                 adapter_name=self.resolve_model_adapter_name(adapter_name),
-                **backend_kwargs(body),
-            )
+                **backend_kwargs(body))
 
-        return await run_submit(self, request, body, task_type="set_lr_scheduler", backend_call=_call)
+        return await run_submit(self, request, body, task_type='set_lr_scheduler', backend_call=_call)
 
-    @app.post("/twinkle/set_template", response_model=types.TaskEnvelope)
+    @app.post('/twinkle/set_template', response_model=types.TaskEnvelope)
     async def set_template(
-        request: Request, body: types.SetTemplateRequest, self: ModelManagement = Depends(self_fn)
-    ) -> types.TaskEnvelope:
+        request: Request, body: types.SetTemplateRequest,
+        self: ModelManagement = Depends(self_fn)) -> types.TaskEnvelope:
+
         async def _call(self, body, adapter_name, token):
             await self.call_backend(
                 self.model.set_template,
                 body.template_cls,
                 adapter_name=self.resolve_model_adapter_name(adapter_name),
-                **backend_kwargs(body),
-            )
+                **backend_kwargs(body))
 
-        return await run_submit(self, request, body, task_type="set_template", backend_call=_call)
+        return await run_submit(self, request, body, task_type='set_template', backend_call=_call)
 
-    @app.post("/twinkle/set_processor", response_model=types.TaskEnvelope)
+    @app.post('/twinkle/set_processor', response_model=types.TaskEnvelope)
     async def set_processor(
-        request: Request, body: types.SetProcessorRequest, self: ModelManagement = Depends(self_fn)
-    ) -> types.TaskEnvelope:
+        request: Request, body: types.SetProcessorRequest,
+        self: ModelManagement = Depends(self_fn)) -> types.TaskEnvelope:
+
         async def _call(self, body, adapter_name, token):
             await self.call_backend(
                 self.model.set_processor,
                 body.processor_cls,
                 adapter_name=self.resolve_model_adapter_name(adapter_name),
-                **backend_kwargs(body),
-            )
+                **backend_kwargs(body))
 
-        return await run_submit(self, request, body, task_type="set_processor", backend_call=_call)
+        return await run_submit(self, request, body, task_type='set_processor', backend_call=_call)
 
-    @app.post("/twinkle/add_metric", response_model=types.TaskEnvelope)
-    async def add_metric(
-        request: Request, body: types.AddMetricRequest, self: ModelManagement = Depends(self_fn)
-    ) -> types.TaskEnvelope:
+    @app.post('/twinkle/add_metric', response_model=types.TaskEnvelope)
+    async def add_metric(request: Request, body: types.AddMetricRequest,
+                         self: ModelManagement = Depends(self_fn)) -> types.TaskEnvelope:
+
         async def _call(self, body, adapter_name, token):
             metric_cls = deserialize_object(body.metric_cls)
             await self.call_backend(
@@ -448,70 +426,68 @@ def _register_model_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelMana
                 metric_cls,
                 is_training=body.is_training,
                 adapter_name=self.resolve_model_adapter_name(adapter_name),
-                **backend_kwargs(body),
-            )
+                **backend_kwargs(body))
 
-        return await run_submit(self, request, body, task_type="add_metric", backend_call=_call)
+        return await run_submit(self, request, body, task_type='add_metric', backend_call=_call)
 
-    @app.post("/twinkle/apply_patch", response_model=types.TaskEnvelope)
+    @app.post('/twinkle/apply_patch', response_model=types.TaskEnvelope)
     async def apply_patch(
-        request: Request, body: types.ApplyPatchRequest, self: ModelManagement = Depends(self_fn)
-    ) -> types.TaskEnvelope:
+        request: Request, body: types.ApplyPatchRequest,
+        self: ModelManagement = Depends(self_fn)) -> types.TaskEnvelope:
+
         async def _call(self, body, adapter_name, token):
             patch_cls = deserialize_object(body.patch_cls)
             await self.call_backend(
                 self.model.apply_patch,
                 patch_cls,
                 adapter_name=self.resolve_model_adapter_name(adapter_name),
-                **backend_kwargs(body),
-            )
+                **backend_kwargs(body))
 
-        return await run_submit(self, request, body, task_type="apply_patch", backend_call=_call)
+        return await run_submit(self, request, body, task_type='apply_patch', backend_call=_call)
 
-    @app.post("/twinkle/calculate_metric", response_model=types.TaskEnvelope)
+    @app.post('/twinkle/calculate_metric', response_model=types.TaskEnvelope)
     async def calculate_metric(
-        request: Request, body: types.CalculateMetricRequest, self: ModelManagement = Depends(self_fn)
-    ) -> types.TaskEnvelope:
+        request: Request, body: types.CalculateMetricRequest,
+        self: ModelManagement = Depends(self_fn)) -> types.TaskEnvelope:
+
         async def _call(self, body, adapter_name, token):
             ret = await self.call_backend(
                 self.model.calculate_metric,
                 is_training=body.is_training,
                 adapter_name=self.resolve_model_adapter_name(adapter_name),
-                **backend_kwargs(body),
-            )
-            return {"result": ret}
+                **backend_kwargs(body))
+            return {'result': ret}
 
-        return await run_submit(self, request, body, task_type="calculate_metric", backend_call=_call)
+        return await run_submit(self, request, body, task_type='calculate_metric', backend_call=_call)
 
     # ------------------------------------------------------------------ #
     # Checkpoint I/O (need the caller token)
     # ------------------------------------------------------------------ #
 
-    @app.post("/twinkle/save", response_model=types.TaskEnvelope)
-    async def save(
-        request: Request, body: types.SaveRequest, self: ModelManagement = Depends(self_fn)
-    ) -> types.TaskEnvelope:
+    @app.post('/twinkle/save', response_model=types.TaskEnvelope)
+    async def save(request: Request, body: types.SaveRequest,
+                   self: ModelManagement = Depends(self_fn)) -> types.TaskEnvelope:
+
         async def _call(self, body, adapter_name, token):
-            checkpoint_manager = create_checkpoint_manager(token, client_type="twinkle")
+            checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
             save_weights = partial(
                 self.call_backend,
                 self.model.save,
                 adapter_name=self.resolve_model_adapter_name(adapter_name),
                 save_optimizer=body.save_optimizer,
-                **backend_kwargs(body),
-            )
+                **backend_kwargs(body))
             save_checkpoint = checkpoint_manager.save_sampler if body.is_sampler else checkpoint_manager.save_training
             twinkle_path, checkpoint_dir = await save_checkpoint(adapter_name, body.name, save_weights)
-            return {"twinkle_path": twinkle_path, "checkpoint_dir": checkpoint_dir}
+            return {'twinkle_path': twinkle_path, 'checkpoint_dir': checkpoint_dir}
 
-        return await run_submit(self, request, body, task_type="save", backend_call=_call)
+        return await run_submit(self, request, body, task_type='save', backend_call=_call)
 
-    @app.post("/twinkle/load", response_model=types.TaskEnvelope)
-    async def load(
-        request: Request, body: types.LoadRequest, self: ModelManagement = Depends(self_fn)
-    ) -> types.TaskEnvelope:
+    @app.post('/twinkle/load', response_model=types.TaskEnvelope)
+    async def load(request: Request, body: types.LoadRequest,
+                   self: ModelManagement = Depends(self_fn)) -> types.TaskEnvelope:
+
         async def _call(self, body, adapter_name, token):
-            checkpoint_manager = create_checkpoint_manager(token, client_type="twinkle")
+            checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
             resolved = checkpoint_manager.resolve_load_path(body.name)
             await self.call_backend(
                 self.model.load,
@@ -520,73 +496,62 @@ def _register_model_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelMana
                 adapter_name=self.resolve_model_adapter_name(adapter_name),
                 load_optimizer=body.load_optimizer,
                 token=token,
-                **backend_kwargs(body),
-            )
+                **backend_kwargs(body))
 
-        return await run_submit(self, request, body, task_type="load", backend_call=_call)
+        return await run_submit(self, request, body, task_type='load', backend_call=_call)
 
-    @app.post("/twinkle/resume_from_checkpoint", response_model=types.TaskEnvelope)
+    @app.post('/twinkle/resume_from_checkpoint', response_model=types.TaskEnvelope)
     async def resume_from_checkpoint(
-        request: Request, body: types.ResumeFromCheckpointRequest, self: ModelManagement = Depends(self_fn)
-    ) -> types.TaskEnvelope:
+        request: Request, body: types.ResumeFromCheckpointRequest,
+        self: ModelManagement = Depends(self_fn)) -> types.TaskEnvelope:
+
         async def _call(self, body, adapter_name, token):
-            checkpoint_manager = create_checkpoint_manager(token, client_type="twinkle")
+            checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
             checkpoint_dir = checkpoint_manager.resolve_checkpoint_dir(body.name)
             ret = await self.call_backend(
                 self.model.resume_from_checkpoint,
                 checkpoint_dir,
                 resume_only_model=body.resume_only_model,
-                adapter_name=self.resolve_model_adapter_name(adapter_name),
-            )
-            return {"result": ret}
+                adapter_name=self.resolve_model_adapter_name(adapter_name))
+            return {'result': ret}
 
-        return await run_submit(self, request, body, task_type="resume", backend_call=_call)
+        return await run_submit(self, request, body, task_type='resume', backend_call=_call)
 
     # ------------------------------------------------------------------ #
     # Adapter lifecycle (create / drop the adapter itself: no resource assert)
     # ------------------------------------------------------------------ #
 
-    @app.post("/twinkle/remove_adapter", response_model=types.TaskEnvelope)
+    @app.post('/twinkle/remove_adapter', response_model=types.TaskEnvelope)
     async def remove_adapter(
-        request: Request, body: types.AdapterRequest, self: ModelManagement = Depends(self_fn)
-    ) -> types.TaskEnvelope:
-        raise RequestRejectedError("Training lifecycle operations must use the catalog endpoint")
+        request: Request, body: types.AdapterRequest, self: ModelManagement = Depends(self_fn)) -> types.TaskEnvelope:
+        raise RequestRejectedError('Training lifecycle operations must use the catalog endpoint')
 
-    @app.post("/twinkle/add_adapter_to_model", response_model=types.TaskEnvelope)
+    @app.post('/twinkle/add_adapter_to_model', response_model=types.TaskEnvelope)
     async def add_adapter_to_model(
-        request: Request,
-        body: types.AddAdapterRequest,
-        self: ModelManagement = Depends(self_fn),
+            request: Request,
+            body: types.AddAdapterRequest,
+            self: ModelManagement = Depends(self_fn),
     ) -> types.TaskEnvelope:
-        # This endpoint creates the adapter, so it cannot use the standard resource
-        # assertion. The Decision_Boundary left checks (train_mode 400 / full-mode
-        # 409) run here, before any state write, raising RequestRejectedError
-        # subclasses (zero future writes).
-        #
-        # Raised, not asserted: a missing adapter_name is decidable from the request body
-        # alone, so it owes the caller a real 400. A bare `assert` would surface as a 500
-        # ('the server broke') and would vanish entirely under `python -O`, letting an
-        # empty adapter_name through to the backend.
-        raise RequestRejectedError("Training lifecycle operations must use the catalog endpoint")
+        raise RequestRejectedError('Training lifecycle operations must use the catalog endpoint')
 
     # ------------------------------------------------------------------ #
     # Hub upload (pure I/O -> background task; state-tracked via Retrieve_Endpoint)
     # ------------------------------------------------------------------ #
 
-    @app.post("/twinkle/upload_to_hub", response_model=types.TaskEnvelope)
+    @app.post('/twinkle/upload_to_hub', response_model=types.TaskEnvelope)
     async def upload_to_hub(
-        request: Request,
-        body: types.UploadToHubRequest,
-        self: ModelManagement = Depends(self_fn),
+            request: Request,
+            body: types.UploadToHubRequest,
+            self: ModelManagement = Depends(self_fn),
     ) -> types.TaskEnvelope:
         token = await self._on_request_start(request)
 
         async def _task():
-            checkpoint_manager = create_checkpoint_manager(token, client_type="twinkle")
-            if body.checkpoint_dir.startswith("twinkle://"):
+            checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
+            if body.checkpoint_dir.startswith('twinkle://'):
                 parsed = checkpoint_manager.parse_twinkle_path(body.checkpoint_dir)
                 if not parsed:
-                    raise ValueError(f"Invalid twinkle path format: {body.checkpoint_dir}")
+                    raise ValueError(f'Invalid twinkle path format: {body.checkpoint_dir}')
                 checkpoint_dir = checkpoint_manager.resolve_checkpoint_dir(body.checkpoint_dir)
             else:
                 # A raw local path is still confined to this token's directory: without the check an
@@ -595,9 +560,8 @@ def _register_model_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelMana
 
                 from twinkle.server.checkpoint.paths import ensure_inside
 
-                checkpoint_dir = str(
-                    ensure_inside(checkpoint_manager.training_run_manager.get_base_dir(), Path(body.checkpoint_dir))
-                )
+                checkpoint_dir = str(ensure_inside(
+                    checkpoint_manager.training_run_manager.get_base_dir(), Path(body.checkpoint_dir)))
             await self.call_backend(
                 self.model.upload_to_hub,
                 checkpoint_dir=checkpoint_dir,
@@ -606,4 +570,4 @@ def _register_model_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelMana
                 async_upload=False,
             )
 
-        return await self.submit_background_and_peek(_task, task_type="upload_to_hub")
+        return await self.submit_background_and_peek(_task, task_type='upload_to_hub')

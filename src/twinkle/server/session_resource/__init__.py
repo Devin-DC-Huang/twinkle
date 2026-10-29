@@ -10,4 +10,4 @@ session-driven expiration of session-bound resources.
 from .base import SessionResourceMixin
 from .processor import ProcessorManagerMixin
 
-__all__ = ["ProcessorManagerMixin", "SessionResourceMixin"]
+__all__ = ['ProcessorManagerMixin', 'SessionResourceMixin']

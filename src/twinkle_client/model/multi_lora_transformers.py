@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import itertools
 import logging
 import threading
@@ -17,16 +18,16 @@ from twinkle_client.exceptions import TwinkleHTTPError
 from twinkle_client.http import ClientTransport
 from twinkle_client.http.context import capture_transport
 
-logger = logging.getLogger("twinkle_client")
+logger = logging.getLogger('twinkle_client')
 
 
 def _data_refs(inputs: DataRef | list[DataRef]) -> list[dict[str, Any]]:
     """Encode one or more opaque references for a DataPlane model endpoint."""
     refs = [inputs] if isinstance(inputs, DataRef) else list(inputs)
     if not refs:
-        raise ValueError("at least one DataRef is required")
+        raise ValueError('at least one DataRef is required')
     if not all(isinstance(item, DataRef) for item in refs):
-        raise TypeError("data-plane model inputs must contain only DataRef values")
+        raise TypeError('data-plane model inputs must contain only DataRef values')
     return [item.model_dump() for item in refs]
 
 
@@ -52,10 +53,10 @@ class MultiLoraTransformersModel:
         """Initialize a model wrapper bound to one immutable request identity."""
         self._transport = capture_transport(transport)
 
-        if "://" in model_id:
-            model_id = model_id.split("://")[1]
+        if '://' in model_id:
+            model_id = model_id.split('://')[1]
         self.model_id = model_id
-        self.server_url = f"{self._transport.context.base_url}/model/{model_id}/twinkle"
+        self.server_url = f'{self._transport.context.base_url}/model/{model_id}/twinkle'
         self.adapter_name = None
         self._training_ids: dict[str, str] = {}
         self._creating: set[str] = set()
@@ -86,42 +87,40 @@ class MultiLoraTransformersModel:
         with self._create_lock:
             if self._created:
                 return
-            response = self._transport.post(f"{self.server_url}/create", json_data={"training_handles": True})
-            if response.json().get("training_handles") is not True:
-                raise RuntimeError("Server does not support training handles; upgrade Twinkle server and SDK together.")
+            response = self._transport.post(f'{self.server_url}/create', json_data={'training_handles': True})
+            if response.json().get('training_handles') is not True:
+                raise RuntimeError('Server does not support training handles; upgrade Twinkle server and SDK together.')
             self._created = True
 
-    _SEQUENCED_ENDPOINTS = frozenset(
-        {
-            "forward_backward",
-            "forward_backward_from_data_plane",
-            "backward",
-            "step",
-            "lr_step",
-            "clip_grad_and_step",
-        }
-    )
+    _SEQUENCED_ENDPOINTS = frozenset({
+        'forward_backward',
+        'forward_backward_from_data_plane',
+        'backward',
+        'step',
+        'lr_step',
+        'clip_grad_and_step',
+    })
 
     def _training_values(self, values: dict[str, Any]) -> dict[str, Any]:
         """Choose the label and its handle together, under one lock."""
         with self._training_lock:
-            name = values.get("adapter_name", self.adapter_name)
-            training_id = values.get("training_id") or self._training_ids.get(name)
+            name = values.get('adapter_name', self.adapter_name)
+            training_id = values.get('training_id') or self._training_ids.get(name)
         if training_id is None:
-            raise RuntimeError("Create this training with add_adapter_to_model on this object before using it.")
-        return {**values, "adapter_name": name, "training_id": training_id}
+            raise RuntimeError('Create this training with add_adapter_to_model on this object before using it.')
+        return {**values, 'adapter_name': name, 'training_id': training_id}
 
     def _submit(self, endpoint: str, model_cls, response_cls, **values):
         """Validate once, then send with a stable handle and retry identity."""
         if issubclass(model_cls, model_types.TrainingRequest):
             values = self._training_values(values)
         if endpoint in self._SEQUENCED_ENDPOINTS:
-            if "seq_id" in values:
-                raise TypeError("seq_id is managed by the client")
-            values["seq_id"] = self._next_seq_id()
+            if 'seq_id' in values:
+                raise TypeError('seq_id is managed by the client')
+            values['seq_id'] = self._next_seq_id()
         body = build_request(model_cls, **values)
         self._ensure_created()
-        response = self._transport.post_model(f"{self.server_url}/{endpoint}", body)
+        response = self._transport.post_model(f'{self.server_url}/{endpoint}', body)
         return self._await_task(response, response_cls)
 
     def _await_task(self, response, model_cls):
@@ -132,7 +131,6 @@ class MultiLoraTransformersModel:
         Keeps every public method's synchronous signature unchanged.
         """
         from twinkle_client._future import resolve_response
-
         return resolve_response(response, model_cls, transport=self._transport)
 
     def _next_seq_id(self) -> int:
@@ -160,26 +158,25 @@ class MultiLoraTransformersModel:
             from peft import LoraConfig
 
             config = LoraConfig(**config)
-        save_dir = kwargs.pop("save_dir", None)
+        save_dir = kwargs.pop('save_dir', None)
         if save_dir:
             save_dir = Path(save_dir).expanduser().resolve().as_posix()
         with self._training_lock:
             if adapter_name in self._creating:
-                raise RuntimeError("A training with this adapter_name is already being created on this object.")
+                raise RuntimeError('A training with this adapter_name is already being created on this object.')
             if adapter_name in self._training_ids:
-                raise RuntimeError("A training with this adapter_name already exists on this object; release it first.")
+                raise RuntimeError('A training with this adapter_name already exists on this object; release it first.')
             self._creating.add(adapter_name)
         try:
             result = self._submit(
-                "add_adapter_to_model",
+                'add_adapter_to_model',
                 model_types.AddAdapterRequest,
                 model_types.TrainingHandleResponse,
                 client_create_id=uuid.uuid4().hex,
                 adapter_name=adapter_name,
                 config=config,
                 save_dir=save_dir,
-                **kwargs,
-            )
+                **kwargs)
             with self._training_lock:
                 self._training_ids[adapter_name] = result.training_id
                 self.adapter_name = adapter_name
@@ -193,7 +190,7 @@ class MultiLoraTransformersModel:
         with self._training_lock:
             training_id = self._training_ids.get(name)
         try:
-            self._submit("remove_adapter", model_types.AdapterRequest, None, adapter_name=name, training_id=training_id)
+            self._submit('remove_adapter', model_types.AdapterRequest, None, adapter_name=name, training_id=training_id)
         except TwinkleHTTPError as exc:
             if exc.status_code == 404:
                 self._forget_training(name, training_id)
@@ -215,37 +212,34 @@ class MultiLoraTransformersModel:
 
     def forward(self, inputs: Any, **kwargs) -> model_types.ForwardResponse:
         """Execute forward pass on inline model inputs."""
-        return self._submit("forward", model_types.ForwardRequest, model_types.ForwardResponse, inputs=inputs, **kwargs)
+        return self._submit('forward', model_types.ForwardRequest, model_types.ForwardResponse, inputs=inputs, **kwargs)
 
     def forward_only(self, inputs: Any, **kwargs) -> model_types.ForwardResponse:
         """Execute forward pass without gradient computation on inline inputs."""
         return self._submit(
-            "forward_only", model_types.ForwardOnlyRequest, model_types.ForwardResponse, inputs=inputs, **kwargs
-        )
+            'forward_only', model_types.ForwardOnlyRequest, model_types.ForwardResponse, inputs=inputs, **kwargs)
 
     def forward_backward(self, inputs: Any, **kwargs) -> model_types.ForwardBackwardResponse:
         """Execute combined forward and backward pass on inline inputs."""
         return self._submit(
-            "forward_backward",
+            'forward_backward',
             model_types.ForwardBackwardTaskRequest,
             model_types.ForwardBackwardResponse,
             inputs=inputs,
-            **kwargs,
-        )
+            **kwargs)
 
     def calculate_loss(self, **kwargs) -> model_types.CalculateLossResponse:
         """Calculate loss from model outputs."""
-        return self._submit("calculate_loss", model_types.AdapterRequest, model_types.CalculateLossResponse, **kwargs)
+        return self._submit('calculate_loss', model_types.AdapterRequest, model_types.CalculateLossResponse, **kwargs)
 
     def get_train_configs(self, **kwargs) -> model_types.GetTrainConfigsResponse:
         """Get training configs."""
-        return self._submit(
-            "get_train_configs", model_types.AdapterRequest, model_types.GetTrainConfigsResponse, **kwargs
-        )
+        return self._submit('get_train_configs', model_types.AdapterRequest, model_types.GetTrainConfigsResponse,
+                            **kwargs)
 
     def backward(self, **kwargs) -> None:
         """Execute backward pass."""
-        self._submit("backward", model_types.AdapterRequest, None, **kwargs)
+        self._submit('backward', model_types.AdapterRequest, None, **kwargs)
 
     # ------------------------------------------------------------------ #
     # Data-plane forward family
@@ -261,14 +255,13 @@ class MultiLoraTransformersModel:
     ) -> model_types.ForwardResponse:
         """Execute forward using rows referenced from the server DataPlane."""
         return self._submit(
-            "forward_from_data_plane",
+            'forward_from_data_plane',
             model_types.DataPlaneForwardRequest,
             model_types.ForwardResponse,
             input_refs=_data_refs(inputs),
             input_field=input_field,
             kwarg_fields=kwarg_fields or {},
-            **kwargs,
-        )
+            **kwargs)
 
     def forward_only_from_data_plane(
         self,
@@ -282,7 +275,7 @@ class MultiLoraTransformersModel:
     ) -> model_types.ForwardResponse | DataRef:
         """Execute forward-only using DataPlane rows and optionally append outputs."""
         result = self._submit(
-            "forward_only_from_data_plane",
+            'forward_only_from_data_plane',
             model_types.DataPlaneForwardOnlyRequest,
             model_types.ForwardResponse,
             input_refs=_data_refs(inputs),
@@ -290,8 +283,7 @@ class MultiLoraTransformersModel:
             kwarg_fields=kwarg_fields or {},
             output_ref=output_ref.model_dump() if output_ref is not None else None,
             output_fields=output_fields or {},
-            **kwargs,
-        )
+            **kwargs)
         if output_ref is not None:
             return DataRef(**result.result)
         return result
@@ -306,14 +298,13 @@ class MultiLoraTransformersModel:
     ) -> model_types.ForwardBackwardResponse:
         """Execute forward/backward using rows referenced from the server DataPlane."""
         return self._submit(
-            "forward_backward_from_data_plane",
+            'forward_backward_from_data_plane',
             model_types.DataPlaneForwardRequest,
             model_types.ForwardBackwardResponse,
             input_refs=_data_refs(inputs),
             input_field=input_field,
             kwarg_fields=kwarg_fields or {},
-            **kwargs,
-        )
+            **kwargs)
 
     # ------------------------------------------------------------------ #
     # Optimizer / scheduler steps
@@ -321,39 +312,38 @@ class MultiLoraTransformersModel:
 
     def step(self, **kwargs) -> None:
         """Execute optimizer step."""
-        self._submit("step", model_types.StepRequest, None, **kwargs)
+        self._submit('step', model_types.StepRequest, None, **kwargs)
 
     def zero_grad(self, **kwargs) -> None:
         """Zero out gradients."""
-        self._submit("zero_grad", model_types.AdapterRequest, None, **kwargs)
+        self._submit('zero_grad', model_types.AdapterRequest, None, **kwargs)
 
     def lr_step(self, **kwargs) -> None:
         """Execute learning rate scheduler step."""
-        self._submit("lr_step", model_types.LrStepRequest, None, **kwargs)
+        self._submit('lr_step', model_types.LrStepRequest, None, **kwargs)
 
-    def clip_grad_norm(
-        self, max_grad_norm: float = 1.0, norm_type: int = 2, **kwargs
-    ) -> model_types.ClipGradNormResponse:
+    def clip_grad_norm(self,
+                       max_grad_norm: float = 1.0,
+                       norm_type: int = 2,
+                       **kwargs) -> model_types.ClipGradNormResponse:
         """Clip gradient norm."""
         return self._submit(
-            "clip_grad_norm",
+            'clip_grad_norm',
             model_types.ClipGradNormRequest,
             model_types.ClipGradNormResponse,
             max_grad_norm=max_grad_norm,
             norm_type=norm_type,
-            **kwargs,
-        )
+            **kwargs)
 
     def clip_grad_and_step(self, max_grad_norm: float = 1.0, norm_type: int = 2, **kwargs) -> None:
         """Clip gradient norm and execute optimizer step in one call."""
         self._submit(
-            "clip_grad_and_step",
+            'clip_grad_and_step',
             model_types.ClipGradAndStepRequest,
             None,
             max_grad_norm=max_grad_norm,
             norm_type=norm_type,
-            **kwargs,
-        )
+            **kwargs)
 
     # ------------------------------------------------------------------ #
     # Plugin setters
@@ -361,15 +351,15 @@ class MultiLoraTransformersModel:
 
     def set_loss(self, loss_cls: str, **kwargs) -> None:
         """Set the loss function."""
-        self._submit("set_loss", model_types.SetLossRequest, None, loss_cls=loss_cls, **kwargs)
+        self._submit('set_loss', model_types.SetLossRequest, None, loss_cls=loss_cls, **kwargs)
 
     def set_optimizer(self, optimizer_cls: str, **kwargs) -> None:
         """Set the optimizer."""
-        self._submit("set_optimizer", model_types.SetOptimizerRequest, None, optimizer_cls=optimizer_cls, **kwargs)
+        self._submit('set_optimizer', model_types.SetOptimizerRequest, None, optimizer_cls=optimizer_cls, **kwargs)
 
     def set_lr_scheduler(self, scheduler_cls: str, **kwargs) -> None:
         """Set the learning rate scheduler."""
-        self._submit("set_lr_scheduler", model_types.SetLrSchedulerRequest, None, scheduler_cls=scheduler_cls, **kwargs)
+        self._submit('set_lr_scheduler', model_types.SetLrSchedulerRequest, None, scheduler_cls=scheduler_cls, **kwargs)
 
     def set_template(self, template_cls: str, **kwargs) -> None:
         """Set the template for data processing.
@@ -379,31 +369,29 @@ class MultiLoraTransformersModel:
         effect. A caller that passes it explicitly still reaches the template
         constructor through the passthrough region.
         """
-        self._submit("set_template", model_types.SetTemplateRequest, None, template_cls=template_cls, **kwargs)
+        self._submit('set_template', model_types.SetTemplateRequest, None, template_cls=template_cls, **kwargs)
 
     def set_processor(self, processor_cls: str, **kwargs) -> None:
         """Set the input processor."""
-        self._submit("set_processor", model_types.SetProcessorRequest, None, processor_cls=processor_cls, **kwargs)
+        self._submit('set_processor', model_types.SetProcessorRequest, None, processor_cls=processor_cls, **kwargs)
 
     def add_metric(self, metric_cls: str, is_training: bool | None = None, **kwargs) -> None:
         """Add a metric to the model."""
         self._submit(
-            "add_metric", model_types.AddMetricRequest, None, metric_cls=metric_cls, is_training=is_training, **kwargs
-        )
+            'add_metric', model_types.AddMetricRequest, None, metric_cls=metric_cls, is_training=is_training, **kwargs)
 
     def apply_patch(self, patch_cls: str, **kwargs) -> None:
         """Apply a patch to the model."""
-        self._submit("apply_patch", model_types.ApplyPatchRequest, None, patch_cls=patch_cls, **kwargs)
+        self._submit('apply_patch', model_types.ApplyPatchRequest, None, patch_cls=patch_cls, **kwargs)
 
     def calculate_metric(self, is_training: bool = True, **kwargs) -> model_types.CalculateMetricResponse:
         """Calculate metrics from model outputs."""
         return self._submit(
-            "calculate_metric",
+            'calculate_metric',
             model_types.CalculateMetricRequest,
             model_types.CalculateMetricResponse,
             is_training=is_training,
-            **kwargs,
-        )
+            **kwargs)
 
     # ------------------------------------------------------------------ #
     # Checkpoint I/O
@@ -411,22 +399,21 @@ class MultiLoraTransformersModel:
 
     def save(self, name: str, **kwargs) -> model_types.SaveResponse:
         """Save model checkpoint."""
-        return self._submit("save", model_types.SaveRequest, model_types.SaveResponse, name=name, **kwargs)
+        return self._submit('save', model_types.SaveRequest, model_types.SaveResponse, name=name, **kwargs)
 
     def load(self, name: str, **kwargs) -> None:
         """Load model checkpoint."""
-        self._submit("load", model_types.LoadRequest, None, name=name, **kwargs)
+        self._submit('load', model_types.LoadRequest, None, name=name, **kwargs)
 
     def resume_from_checkpoint(self, name: str, *, resume_only_model: bool = False, **kwargs) -> dict[str, Any]:
         """Resume weights (and optionally optimizer state) from a checkpoint."""
         progress = self._submit(
-            "resume_from_checkpoint",
+            'resume_from_checkpoint',
             model_types.ResumeFromCheckpointRequest,
             model_types.TrainingProgressResponse,
             name=name,
             resume_only_model=resume_only_model,
-            **kwargs,
-        )
+            **kwargs)
         return progress.result
 
     def upload_to_hub(
@@ -445,13 +432,12 @@ class MultiLoraTransformersModel:
             hub_model_id: The hub model id.
             hub_token: The hub token (optional).
         """
-        logger.info("[upload_to_hub] submitting upload, waiting for completion...")
+        logger.info('[upload_to_hub] submitting upload, waiting for completion...')
         self._submit(
-            "upload_to_hub",
+            'upload_to_hub',
             model_types.UploadToHubRequest,
             None,
             checkpoint_dir=checkpoint_dir,
             hub_model_id=hub_model_id,
-            hub_token=hub_token,
-        )
-        logger.info("[upload_to_hub] upload completed successfully.")
+            hub_token=hub_token)
+        logger.info('[upload_to_hub] upload completed successfully.')

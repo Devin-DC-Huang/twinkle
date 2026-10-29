@@ -4,8 +4,8 @@
 Coroutine factories, asyncio tasks, and callbacks belong here. Public task and
 queue state enums live in twinkle.protocol.types and are shared by SDK/server.
 """
-
 from __future__ import annotations
+
 import asyncio
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
@@ -14,7 +14,6 @@ from dataclasses import dataclass, field
 @dataclass
 class ExecutionScope:
     """Completion witnesses for an operation, independent of its client future."""
-
     jobs: set[asyncio.Task] = field(default_factory=set)
     request_ids: set[str] = field(default_factory=set)
 
@@ -33,7 +32,6 @@ class ExecutionScope:
 @dataclass
 class QueuedTask:
     """Dataclass representing a task waiting in the compute queue."""
-
     request_id: str
     coro_factory: Callable[[], Coroutine]
     model_id: str | None
